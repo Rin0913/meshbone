@@ -21,7 +21,7 @@ routing daemon, and a public node needs exactly one forwarded UDP port.
 | **hub** | A node other nodes can dial (`HOST:PORT`). Hubs link to every node and relay between them. A hub holds no authority over the mesh. |
 | **client** | A node behind NAT. It stays linked to every hub, sends through the one with the best ping, and moves to another within seconds if that hub dies. |
 | **simple client** | A phone or any device that only runs plain WireGuard. It gets a standard config (file or QR code) and uses a single hub. |
-| **admin** | Any node holding `admin.key`. Every directory entry is signed with that key, so only admin nodes can add, change or revoke nodes. |
+| **admin** | Whoever has the admin key. Every directory entry is signed with it, directly on a node that stores `admin.key`, or through a short-lived token made in the browser. |
 | **subnet** | A network behind a node, announced into the mesh. |
 | **cluster IP** | An address held by several nodes at once (anycast). Every hub holds two: the mesh map and the metrics endpoint. |
 
@@ -116,11 +116,37 @@ Served on port 7948, reachable only from inside the mesh.
 | `/traffic` | Per-link traffic graphs with a time range |
 | `/api/nodes`, `/api/topology`, `/api/traffic` | Read-only JSON; `/api/nodes` filters by `label`, `role`, `name` |
 | `http://10.253.253.2:7948/metrics` on every hub | Prometheus text format |
-| `http://10.253.253.1:7948/admin` | Management page. A hub redirects to an admin node, where it asks for the password |
+| `http://10.253.253.1:7948/admin` | Management page, on every node (see below) |
 
 Traffic is counted per link by the hub at one end. Traffic between two clients
 shows up on both of their links to the hub that relayed it; there is no
 per-pair matrix.
+
+## Managing from any node
+
+Changes to the mesh are signed. There are two ways to be allowed to sign:
+
+- **A node that holds `admin.key`** signs directly. Its management page asks for
+  the page password; its command line just works.
+- **Any other node**, hubs included, shows a sign-in page that asks for the admin
+  key itself. The key stays in the browser: the page uses it once to sign a
+  token for a session key that exists only on that node, valid for the minutes
+  you choose (at most 12 hours), from your address only. The node then signs
+  your changes with the session key, and every node accepts them because the
+  token carries the admin key's signature. Nothing but the token is sent.
+
+So the management page works through the cluster IP on whichever hub answers,
+no machine has to stay up for the mesh to be manageable, and the admin key can
+live in a password manager instead of on a server. On a terminal, admin
+commands on a node without `admin.key` ask for the key instead.
+
+What a token session cannot do: show a simple client's config a second time
+(the device key is only kept where `admin.key` is), hand out `--admin`, or
+change the page password.
+
+A node that is already compromised when you sign in can serve a page that
+steals the key. The token protects against everything else: someone listening
+on the way, and a node compromised later.
 
 ## Updating
 

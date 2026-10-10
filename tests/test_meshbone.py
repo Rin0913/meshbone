@@ -73,13 +73,16 @@ m.loosen_rp_filter = lambda: None
 m.PARALLEL = 1
 m.VERIFY_WAIT = 0
 m.CONFIRM_WAIT = 0
-m.secrets.token_urlsafe = lambda n: "s3cret"
+real_token = m.secrets.token_urlsafe
+m.secrets.token_urlsafe = lambda n: "s3cret" if n == 16 else real_token(n)  # the first page password
 m.shutil.which = lambda x: "/usr/sbin/" + x
+m.SESSIONS = os.path.join(root, "sessions")
 D = lambda n: os.path.join(root, n)
 
 
 def use(n):
     m.DIR = D(n)
+    m.SESSIONS = D(n) + ".sessions"  # every machine has its own
     return m
 
 
@@ -359,7 +362,7 @@ for cmd in (
     lambda: m.cmd_set(S("c", cost=5)),
     lambda: m.cmd_approve(A(name="c", verify=True)),
 ):
-    expect_exit(cmd, "admin.key")
+    expect_exit(cmd, "no admin key")
 evil = m.state()
 victim = P["c"]
 stolen = copy.deepcopy(evil["nodes"][victim])
@@ -432,7 +435,7 @@ with quiet:
 use("a")
 assert m.live(m.load())[P["d"]]["endpoint"] == "d.example:40000"
 use("d")
-expect_exit(lambda: m.cmd_set(S("c", cost=1)), "admin.key")
+expect_exit(lambda: m.cmd_set(S("c", cost=1)), "no admin key")
 
 # --- subnets, cluster IPs
 sync("c", "d")
@@ -454,8 +457,8 @@ assert m.load()[P["c"]]["cost"] == 9  # g's LAN does not block later edits of c
 
 # --- management page: only on admin nodes, password can be changed
 use("a")
-st, body, _, extra = G("/admin")  # a hub cannot sign changes: it sends the browser on to an admin node
-assert st.startswith("307") and f"Location: http://{IP['adm']}:7948/admin" in extra
+st, body, _, extra = G("/admin")  # a node without the admin key asks for it - in the browser, as a token
+assert st == "200 OK" and b"id=login" in body and b"admin key" in body
 use("adm")
 R = lambda method="GET", pw="s3cret", body=b"": m.respond(
     method, "/admin", {"authorization": "Basic " + base64.b64encode(b"admin:" + pw.encode()).decode()}, body
@@ -574,11 +577,15 @@ assert (
     and b"PrivateKey" in body
     and m.respond("GET", "/admin/simple?name=phone", {}, b"")[0].startswith("401")
 )
-st, body, ctype, extra = m.respond("GET", "/admin/simple?name=phone&hub=d&download=1", AUTH, b"")
-assert body.decode() == again and "phone.conf" in extra
+body = m.respond("GET", "/admin/simple?name=phone&hub=d", AUTH, b"")[1]
+assert (
+    base64.b64encode(again.encode()) in body and b'download="phone.conf"' in body
+)  # the download is in the page itself
 assert m.respond("GET", "/admin/simple?name=c", AUTH, b"")[0].startswith("404")
 use("a")
-assert m.respond("GET", "/admin/simple?name=phone", AUTH, b"")[0].startswith("307")  # a hub has no admin.key
+assert (
+    b"id=login" in m.respond("GET", "/admin/simple?name=phone", AUTH, b"")[1]
+)  # a hub has no admin.key and no session
 use("adm")
 body = R(
     "POST", "correct-horse", form(csrf=csrf("correct-horse"), action="invite", name="tablet", simple=1, labels="mobile")
@@ -588,6 +595,87 @@ use("adm")
 assert b"QR / config" in R(pw="correct-horse")[1]
 use("home")
 assert m.respond("GET", "/admin/simple?name=tablet", AUTH, b"")[0] == "200 OK"  # the other admin can show it too
+
+# --- managing through any node with a token: the admin key stays in the "browser"
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+admin_key = Ed25519PrivateKey.from_private_bytes(base64.b64decode(open(D("adm") + "/admin.key").read()))
+
+
+def web(node, method, path, headers, body=b"", peer="10.253.255.9"):
+    use(node)
+    try:
+        return m.respond(method, path, headers, body, peer)
+    finally:
+        m.SESSION = None  # a real request ends with its process
+
+
+def login(node, key=admin_key, minutes=30, shift=0, peer="10.253.255.9"):
+    """what the page's script does: sign a token for the session key the node shows"""
+    facts = json.loads(
+        re.search(r"const S = (\{.*?\}), form", web(node, "GET", "/admin", {}, peer=peer)[1].decode())[1]
+    )
+    nbf, exp = facts["now"] - 60 + shift, facts["now"] + minutes * 60 + shift
+    sig = base64.b64encode(key.sign(m.session_message(m.local()["mesh"], facts["pub"], nbf, exp))).decode()
+    st = web(node, "POST", "/admin/login", {}, form(sid=facts["sid"], nbf=nbf, exp=exp, sig=sig), peer)[0]
+    return st, {"cookie": "mb=" + facts["sid"]}, facts["sid"]
+
+
+st, cookie, sid = login("a")
+assert st.startswith("303")
+page = web("a", "GET", "/admin", cookie)[1].decode()
+assert "signing with your token" in page and "<h2>password</h2>" not in page and "<h2>software</h2>" in page
+tok = hashlib.sha256(("csrf:" + sid).encode()).hexdigest()
+assert web("a", "POST", "/admin", cookie, form(action="revoke", name="c"))[0].startswith("403")
+body = web(
+    "a",
+    "POST",
+    "/admin",
+    cookie,
+    form(csrf=tok, action="set", name="c", subnets="10.3.0.0/24", labels="edge", desc="by token", cost=77),
+)[1]
+assert b"saved" in body
+entry = use("adm").load()[victim]
+mesh_ = m.local()["mesh"]
+assert (
+    entry["cost"] == 77 and entry["by"]["key"] and m.valid(mesh_, victim, entry)
+)  # signed on the hub, accepted by all
+assert (
+    not os.path.exists(D("a") + "/admin.key")
+    and base64.b64encode(admin_key.private_bytes_raw()).decode()
+    not in open((D("a") + ".sessions/" + sid + ".json")).read()
+)
+# the token works only for its session key, on that node, from that address, inside its time window
+assert b"id=login" in web("a", "GET", "/admin", cookie, peer="10.253.255.66")[1]
+assert b"id=login" in web("d", "GET", "/admin", cookie)[1]
+assert login("a", key=Ed25519PrivateKey.generate())[0] == "200 OK"  # not the admin key: back at the login page
+assert login("a", minutes=24 * 60)[0] == "200 OK" and login("a", shift=-7200)[0] == "200 OK"  # too long; already over
+session_key = Ed25519PrivateKey.from_private_bytes(
+    base64.b64decode(json.load(open((D("a") + ".sessions/" + sid + ".json")))["key"])
+)
+
+
+def by_session(**change):
+    forged = {k: v for k, v in {**entry, **change}.items() if k != "sig"}
+    forged["sig"] = base64.b64encode(session_key.sign(m.signable(victim, forged))).decode()
+    return forged
+
+
+assert m.valid(mesh_, victim, by_session(seq=entry["seq"] + 1))  # the session key itself, inside the window: fine
+assert not m.valid(mesh_, victim, by_session(seq=entry["by"]["exp"] + 1))  # ...but not for a later time
+assert not m.valid(
+    mesh_, victim, by_session(by={**entry["by"], "exp": entry["by"]["exp"] + 9**9})
+)  # nor with a stretched token
+assert not m.valid(mesh_, victim, {**entry, "cost": 1})
+body = web("a", "POST", "/admin", cookie, form(csrf=tok, action="invite", name="watch", simple=1))[1]
+assert (
+    b"Save it now" in body and b"PrivateKey" in body and "watch" in names("adm")
+)  # no stored key on a hub: shown once
+assert b"only kept on nodes that hold the admin key" in web("a", "GET", "/admin/simple?name=watch", cookie)[1]
+web("a", "GET", "/admin/logout", cookie)
+assert b"id=login" in web("a", "GET", "/admin", cookie)[1] and not os.path.exists(
+    (D("a") + ".sessions/" + sid + ".json")
+)
 
 # --- deploy over ssh through jump hosts, with and without passwords (ssh stubbed)
 assert m.parse_chain("u1@h1:u2@h2:10.9.9.9") == [("u1@h1", None), ("u2@h2", None), ("10.9.9.9", None)]
@@ -723,7 +811,7 @@ V2 = hashlib.sha256(open(v2, "rb").read()).hexdigest()
 U = lambda **k: A(url=k.get("url"), ref=k.get("ref"), file=k.get("file"), rollback=k.get("rollback", False))
 log_of = lambda n: [json.loads(l)["event"] for l in open(D(n) + "/audit.log")]
 use("a")
-expect_exit(lambda: m.cmd_update(U(file=v2)), "admin.key")  # only an admin node can publish
+expect_exit(lambda: m.cmd_update(U(file=v2)), "no admin key")  # only an admin node can publish
 broken = os.path.join(root, "broken.py")
 open(broken, "w").write("def (:\n")
 use("adm")

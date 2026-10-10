@@ -35,7 +35,10 @@ Any machine
   meshbone cost NAME MS         local penalty in ms for sending via hub NAME (0 = automatic)
   meshbone status | leave | upgrade
 
-On an admin node (management page: http://<its mesh address>:7948/admin)
+Managing (the commands below, or http://10.253.253.1:7948/admin on any node)
+  Changes are signed. A node that holds admin.key signs directly. Anywhere else you paste the
+  admin key into the page - it stays in the browser, which signs a token of limited life for
+  that node - or type it when a command asks.
   meshbone passwd               change the management page's password, on every admin node
   meshbone update URL [--ref REF] | --file PATH | --rollback
                                 fetch a version (https://github.com/OWNER/REPO at a branch, tag or commit),
@@ -73,6 +76,10 @@ FRESH = 180  # a WireGuard peer with a handshake this recent (s) counts as reach
 VERIFY_WAIT = 20  # how long join waits for the first handshakes (s)
 CONFIRM_WAIT = 60  # how long a new hub has to be reached from outside before it is demoted again (s)
 UPDATE_SETTLE = 10  # seconds a freshly upgraded node gets before its health is judged
+SESSIONS = "/run/meshbone-sessions"  # web sessions that hold a token; gone at reboot
+SESSION_MAX = 12 * 3600  # the longest a token may be valid (s)
+SESSION = None  # (key, delegation) while a command or request may sign changes without the admin key file
+ISSUED = {}  # private keys of simple clients created by this process: name -> key
 KEEP_FINE = 2 * 86400  # traffic history: per-minute buckets this long, 10-minute buckets after that
 KEEP_ALL = 90 * 86400
 PARALLEL = 16
@@ -271,18 +278,73 @@ def signable(pk, n):
     return json.dumps({**{k: v for k, v in n.items() if k != "sig"}, "pk": pk}, sort_keys=True).encode()
 
 
+def authority():
+    """Who signs a change right now -> (Ed25519 private key, delegation or None).
+
+    Either this machine holds the admin key, or a web session presented a token:
+    the admin key's signature under a short-lived session key that lives only on
+    the node serving that session. On a terminal the key can also be typed in.
+    """
+    global SESSION
+    if SESSION:
+        return SESSION
+    load_key = ed25519().Ed25519PrivateKey.from_private_bytes
+    if os.path.exists(f"{DIR}/admin.key"):
+        return load_key(base64.b64decode(read("admin.key"))), None
+    if not sys.stdin.isatty():
+        sys.exit("this machine holds no admin key: use the management page with your key, or an admin node")
+    import getpass
+    from cryptography.hazmat.primitives import serialization as ser
+
+    try:
+        key = load_key(base64.b64decode(getpass.getpass("admin key: ").strip()))
+        mine = key.public_key().public_bytes(ser.Encoding.Raw, ser.PublicFormat.Raw)
+        assert base64.b64encode(mine).decode() == local()["mesh"]["admin_pub"]
+    except Exception:
+        sys.exit("that is not this mesh's admin key")
+    SESSION = (key, None)
+    return SESSION
+
+
+def seal(record, message):
+    """Sign a record in place; `message(record)` is what the signature covers."""
+    key, by = authority()
+    record.pop("by", None)
+    if by:
+        record["by"] = by
+        if not by["nbf"] <= record["seq"] <= by["exp"]:
+            sys.exit("this change falls outside the token's validity; log in again")
+    record["sig"] = base64.b64encode(key.sign(message(record))).decode()
+    return record
+
+
+def sealed(mesh, record, message):
+    """Was this record signed by the admin key, or under a token the admin key issued that was
+    valid at the record's time? Raises if not."""
+    load_pub = ed25519().Ed25519PublicKey.from_public_bytes
+    root, by, sig = load_pub(base64.b64decode(mesh["admin_pub"])), record.get("by"), base64.b64decode(record["sig"])
+    if by is None:
+        return root.verify(sig, message)
+    assert set(by) == {"key", "nbf", "exp", "sig"} and type(by["nbf"]) is int and type(by["exp"]) is int
+    assert 0 < by["exp"] - by["nbf"] <= SESSION_MAX + 120 and by["nbf"] <= record["seq"] <= by["exp"]
+    root.verify(base64.b64decode(by["sig"]), session_message(mesh, by["key"], by["nbf"], by["exp"]))
+    load_pub(base64.b64decode(by["key"])).verify(sig, message)
+
+
+def session_message(mesh, pub, nbf, exp):
+    """What the admin key signs to issue a token: this session key, on this mesh, for this long."""
+    return f"meshbone-session\n{mesh['name']}\n{mesh['admin_pub']}\n{pub}\n{nbf}\n{exp}".encode()
+
+
 def sign(pk, n):
-    key = ed25519().Ed25519PrivateKey.from_private_bytes(base64.b64decode(read("admin.key")))
-    n["sig"] = base64.b64encode(key.sign(signable(pk, n))).decode()
-    return n
+    return seal(n, lambda r: signable(pk, r))
 
 
 def valid(mesh, pk, n):
-    """A directory entry is only accepted if the mesh's admin key signed it."""
+    """A directory entry is only accepted if the admin key signed it, directly or through a token."""
     try:
         assert wellformed(pk, n)
-        key = ed25519().Ed25519PublicKey.from_public_bytes(base64.b64decode(mesh["admin_pub"]))
-        key.verify(base64.b64decode(n["sig"]), signable(pk, n))
+        sealed(mesh, n, signable(pk, n))
         return True
     except Exception:
         return False
@@ -322,15 +384,17 @@ def valid_nets(pk, r):
 
 
 def conf_signable(name, r):
-    return json.dumps({"conf": name, "value": r["value"], "seq": r["seq"]}, sort_keys=True).encode()
+    covered = {"conf": name, "value": r["value"], "seq": r["seq"]}
+    if "by" in r:
+        covered["by"] = r["by"]
+    return json.dumps(covered, sort_keys=True).encode()
 
 
 def valid_conf(mesh, name, r):
     try:
         assert re.fullmatch(r"[a-z0-9_]{1,40}", name) and type(r["seq"]) is int
         assert isinstance(r["value"], str) and len(r["value"]) < 4096
-        key = ed25519().Ed25519PublicKey.from_public_bytes(base64.b64decode(mesh["admin_pub"]))
-        key.verify(base64.b64decode(r["sig"]), conf_signable(name, r))
+        sealed(mesh, r, conf_signable(name, r))
         return True
     except Exception:
         return False
@@ -418,19 +482,82 @@ def merge(msg, only=None):
 
 
 def conf_put(name, value):
-    """Store one mesh-wide setting, signed (call it on an admin node, under the lock)."""
+    """Store one mesh-wide setting, signed (call it under the lock)."""
     conf = load_conf()
-    r = {"value": value, "seq": next_seq(conf.get(name, {}).get("seq", 0))}
-    key = ed25519().Ed25519PrivateKey.from_private_bytes(base64.b64decode(read("admin.key")))
-    r["sig"] = base64.b64encode(key.sign(conf_signable(name, r))).decode()
-    conf[name] = r
+    conf[name] = seal(
+        {"value": value, "seq": next_seq(conf.get(name, {}).get("seq", 0))}, lambda r: conf_signable(name, r)
+    )
     write(f"{DIR}/conf.json", json.dumps(conf, indent=1, sort_keys=True))
 
 
+def session_file(sid):
+    return f"{SESSIONS}/{sid}.json" if re.fullmatch(r"[\w-]{10,60}", sid or "") else None
+
+
+def session_open(peer):
+    """Start a web session for the browser at address `peer` -> (session id, session public key).
+    It can do nothing until the browser returns a token for that key."""
+    from cryptography.hazmat.primitives import serialization as ser
+
+    os.makedirs(SESSIONS, mode=0o700, exist_ok=True)
+    now = time.time()
+    for name in os.listdir(SESSIONS):  # forget sessions that have run out or were never completed
+        try:
+            with open(f"{SESSIONS}/{name}") as f:
+                s = json.load(f)
+            over = now > s.get("exp", s["born"] + 600)
+        except (OSError, ValueError, KeyError):
+            over = True
+        if over:
+            with contextlib.suppress(OSError):
+                os.remove(f"{SESSIONS}/{name}")
+    key = ed25519().Ed25519PrivateKey.generate()
+    private = key.private_bytes(ser.Encoding.Raw, ser.PrivateFormat.Raw, ser.NoEncryption())
+    public = base64.b64encode(key.public_key().public_bytes(ser.Encoding.Raw, ser.PublicFormat.Raw)).decode()
+    sid = secrets.token_urlsafe(24)
+    write(
+        session_file(sid),
+        json.dumps({"key": base64.b64encode(private).decode(), "pub": public, "peer": peer, "born": int(now)}),
+    )
+    return sid, public
+
+
+def session_grant(mesh, sid, peer, nbf, exp, sig):
+    """Accept the token the browser made for a session, if the admin key really signed it."""
+    try:
+        with open(session_file(sid)) as f:
+            s = json.load(f)
+        now = time.time()
+        assert s["peer"] == peer and "by" not in s
+        assert nbf <= now + 120 and now < exp and 0 < exp - nbf <= SESSION_MAX + 120
+        root = ed25519().Ed25519PublicKey.from_public_bytes(base64.b64decode(mesh["admin_pub"]))
+        root.verify(base64.b64decode(sig), session_message(mesh, s["pub"], nbf, exp))
+    except Exception:
+        return False
+    s.update(by={"key": s["pub"], "nbf": nbf, "exp": exp, "sig": sig}, exp=exp)
+    write(session_file(sid), json.dumps(s))
+    return True
+
+
+def session_use(sid, peer):
+    """A session that holds a token still in force, asked for from the same address -> (key, delegation, expiry)."""
+    try:
+        with open(session_file(sid)) as f:
+            s = json.load(f)
+        assert s["peer"] == peer and time.time() < s["exp"]
+        return ed25519().Ed25519PrivateKey.from_private_bytes(base64.b64decode(s["key"])), s["by"], s["exp"]
+    except Exception:
+        return None
+
+
+def session_close(sid):
+    with contextlib.suppress(OSError, TypeError):
+        os.remove(session_file(sid))
+
+
 def admin():
-    """State for a directory-changing command; needs the key every entry is signed with."""
-    if not os.path.exists(f"{DIR}/admin.key"):
-        sys.exit("run this on an admin node: this machine does not hold the mesh's admin.key")
+    """State for a directory-changing command; exits unless changes can be signed here and now."""
+    authority()
     return local(), load(), load_nets()
 
 
@@ -519,12 +646,14 @@ def check_password(password):
     return hmac.compare_digest(hashlib.scrypt(password.encode(), salt=raw[:16], n=2**14, r=8, p=1, dklen=32), raw[16:])
 
 
-def simple_config(name, hub=None):
+def simple_config(name, hub=None, key=None):
     """A standard WireGuard config for a simple client -> (text, hub used, all hub names).
 
     Plain WireGuard cannot choose between hubs, so the device sends everything through
     one of them; pick another and import again if that hub is ever down. The config
     lists the networks known right now - it does not follow later changes by itself.
+    The device's key is `key` if it was just created here, else the copy the admin
+    nodes keep.
     """
     loc, nodes, nets = admin()
     mesh, alive = loc["mesh"], live(nodes)
@@ -532,9 +661,9 @@ def simple_config(name, hub=None):
     if not n.get("simple"):
         sys.exit(f"{name} is not a simple client")
     try:
-        key = password_box().decrypt(load_conf()[f"simple_{n['id']}"]["value"].encode()).decode()
+        key = key or password_box().decrypt(load_conf()[f"simple_{n['id']}"]["value"].encode()).decode()
     except Exception:
-        sys.exit(f"the key of {name} is not on this admin node yet; try again in a moment")
+        sys.exit(f"the key of {name} is only kept on nodes that hold the admin key; elsewhere its config is shown once")
     hubs = {
         h["name"]: (k, h)
         for k, h in sorted(alive.items(), key=lambda kv: (kv[1]["cost"], kv[1]["id"]))
@@ -1524,6 +1653,69 @@ load(); setInterval(() => { if (range.span) load(); }, 60000); addEventListener(
 </script>"""
 
 
+SIGN_SCRIPT = """<script>
+// Ed25519 signing in the page: the browser offers no crypto API over plain http, and the key must not leave it.
+const big = b => b.reduce((n, x, i) => n + (BigInt(x) << BigInt(8 * i)), 0n);
+const bytes = (n, len) => Uint8Array.from({length: len}, (_, i) => Number((n >> BigInt(8 * i)) & 255n));
+const cat = (...p) => Uint8Array.from(p.flatMap(x => [...x]));
+const M = (1n << 64n) - 1n, rotr = (x, n) => ((x >> n) | (x << (64n - n))) & M;
+const root = (n, k) => { let x = 1n << BigInt(Math.ceil(n.toString(2).length / k)); for (;;) { const y = ((BigInt(k) - 1n) * x + n / x ** BigInt(k - 1)) / BigInt(k); if (y >= x) return x; x = y; } };
+const primes = []; for (let n = 2; primes.length < 80; n++) if (primes.every(p => n % p)) primes.push(n);
+const K = primes.map(p => root(BigInt(p) << 192n, 3) & M), H0 = primes.slice(0, 8).map(p => root(BigInt(p) << 128n, 2) & M);
+function sha512(m) {
+  const l = m.length, n = Math.ceil((l + 17) / 128) * 128, p = new Uint8Array(n); p.set(m); p[l] = 0x80;
+  for (let i = 0; i < 8; i++) p[n - 1 - i] = Number((BigInt(l) * 8n >> BigInt(8 * i)) & 255n);
+  let h = H0.slice();
+  for (let o = 0; o < n; o += 128) {
+    const w = []; for (let i = 0; i < 16; i++) { let v = 0n; for (let j = 0; j < 8; j++) v = (v << 8n) | BigInt(p[o + 8 * i + j]); w.push(v); }
+    for (let i = 16; i < 80; i++) { const a = w[i - 15], b = w[i - 2];
+      w.push((w[i - 16] + (rotr(a, 1n) ^ rotr(a, 8n) ^ (a >> 7n)) + w[i - 7] + (rotr(b, 19n) ^ rotr(b, 61n) ^ (b >> 6n))) & M); }
+    let [a, b, c, d, e, f, g, y] = h;
+    for (let i = 0; i < 80; i++) {
+      const t1 = (y + (rotr(e, 14n) ^ rotr(e, 18n) ^ rotr(e, 41n)) + ((e & f) ^ (~e & M & g)) + K[i] + w[i]) & M;
+      const t2 = ((rotr(a, 28n) ^ rotr(a, 34n) ^ rotr(a, 39n)) + ((a & b) ^ (a & c) ^ (b & c))) & M;
+      y = g; g = f; f = e; e = (d + t1) & M; d = c; c = b; b = a; a = (t1 + t2) & M;
+    }
+    h = [a, b, c, d, e, f, g, y].map((v, i) => (v + h[i]) & M);
+  }
+  const out = new Uint8Array(64); h.forEach((v, i) => { for (let j = 0; j < 8; j++) out[8 * i + j] = Number((v >> BigInt(56 - 8 * j)) & 255n); }); return out;
+}
+const P = 2n ** 255n - 19n, L = 2n ** 252n + 27742317777372353535851937790883648493n;
+const mod = (a, m = P) => ((a % m) + m) % m;
+const pow = (b, e, m = P) => { let r = 1n; b = mod(b, m); while (e > 0n) { if (e & 1n) r = r * b % m; b = b * b % m; e >>= 1n; } return r; };
+const inv = a => pow(a, P - 2n), D = mod(-121665n * inv(121666n)), By = mod(4n * inv(5n));
+const Bx = (() => { const x2 = mod((By * By - 1n) * inv(D * By * By + 1n)); let x = pow(x2, (P + 3n) / 8n); if (mod(x * x - x2) !== 0n) x = mod(x * pow(2n, (P - 1n) / 4n)); return x & 1n ? P - x : x; })();
+const add = ([X1, Y1, Z1, T1], [X2, Y2, Z2, T2]) => { const A = mod((Y1 - X1) * (Y2 - X2)), B = mod((Y1 + X1) * (Y2 + X2)), C = mod(2n * D * T1 * T2), Q = mod(2n * Z1 * Z2), E = B - A, F = Q - C, G = Q + C, H = B + A; return [mod(E * F), mod(G * H), mod(F * G), mod(E * H)]; };
+const mul = (k, p) => { let r = [0n, 1n, 1n, 0n]; while (k > 0n) { if (k & 1n) r = add(r, p); p = add(p, p); k >>= 1n; } return r; };
+const enc = ([X, Y, Z]) => { const zi = inv(Z); return bytes(mod(Y * zi) | ((mod(X * zi) & 1n) << 255n), 32); };
+const BASE = [Bx, By, 1n, mod(Bx * By)];
+function sign(msg, seed) {
+  const h = sha512(seed), a = (big(h.slice(0, 32)) & ((1n << 254n) - 8n)) | (1n << 254n), pub = enc(mul(a, BASE));
+  const r = mod(big(sha512(cat(h.slice(32), msg))), L), R = enc(mul(r, BASE));
+  return {pub, sig: cat(R, bytes(mod(r + mod(big(sha512(cat(R, pub, msg))), L) * a, L), 32))};
+}
+const b64 = b => btoa(String.fromCharCode(...b));
+</script>"""
+
+
+LOGIN_SCRIPT = """<script>
+const S = __DATA__, form = document.getElementById('login'), key = document.getElementById('key');
+const fail = t => { document.getElementById('why').textContent = t; return false; };
+form.onsubmit = e => {
+  e.preventDefault();
+  let seed = [];
+  try { seed = Uint8Array.from(atob(key.value.trim()), c => c.charCodeAt(0)); } catch (x) {}
+  if (seed.length !== 32) return fail('that is not an admin key');
+  if (Math.abs(Date.now() / 1000 - S.now) > 300) return fail('the clock of this node and yours differ by more than five minutes');
+  const minutes = Math.max(1, Math.min(S.max, +form.minutes.value || 30)), nbf = S.now - 60, exp = S.now + minutes * 60;
+  const made = sign(new TextEncoder().encode(['meshbone-session', S.mesh, S.admin_pub, S.pub, nbf, exp].join('\\n')), seed);
+  if (b64(made.pub) !== S.admin_pub) return fail('this key does not belong to this mesh');
+  form.nbf.value = nbf; form.exp.value = exp; form.sig.value = b64(made.sig); key.value = '';
+  form.submit();   // only the token goes to the node; the key field has no name and was just emptied
+};
+</script>"""
+
+
 def esc(v):
     return html.escape(str(v), quote=True)
 
@@ -1641,6 +1833,33 @@ def view_api(mesh):
     ).encode()
 
 
+def view_login(mesh, sid, pub, now, note):
+    """Ask for the admin key - and turn it, inside the browser, into a token for this session only."""
+    facts = {
+        "sid": sid,
+        "pub": pub,
+        "now": now,
+        "mesh": mesh["name"],
+        "admin_pub": mesh["admin_pub"],
+        "max": SESSION_MAX // 60,
+    }
+    return (
+        page_head(mesh, "manage", "")
+        + "<h1>manage</h1><p>Paste the mesh's admin key. It stays in this browser: the page uses it once to sign a token "
+        "that lets this node sign changes for a limited time, and only the token is sent.</p>"
+        + (f"<pre>{esc(note)}</pre>" if note else "")
+        + "<form id=login method=post action=/admin/login class=grid>"
+        f'<input type=hidden name=sid value="{esc(sid)}"><input type=hidden name=nbf><input type=hidden name=exp>'
+        "<input type=hidden name=sig><input id=key type=password class=w placeholder='admin key' autocomplete=off required> "
+        "<label>valid for <input name=minutes value=30 style='width:4em'> minutes</label> "
+        "<button>sign in</button></form><p id=why style='color:var(--bad)'></p>"
+        "<p>The token only works on this node, from your address, until it expires. Changes made with it are signed by "
+        "a key that exists only for this session.</p>"
+        + SIGN_SCRIPT
+        + LOGIN_SCRIPT.replace("__DATA__", json.dumps(facts).replace("</", "<\\/"))
+    ).encode()
+
+
 def view_metrics(topo, totals):
     """The mesh in Prometheus text format."""
     out, names = [], {n["id"]: n["name"] for n in topo["nodes"]}
@@ -1705,12 +1924,18 @@ def view_metrics(topo, totals):
     return ("\n".join(out) + "\n").encode()
 
 
-def view_admin(mesh, me, nodes, csrf, note, soft):
+def view_admin(mesh, me, nodes, csrf, note, soft, until, held):
     """The management page: nodes, adding one, software versions, the password."""
     out = [
         page_head(mesh, "manage", ""),
-        f"<h1>manage</h1><p>changes are signed by <b>{esc(me)}</b>, which holds the mesh's admin key; "
-        f"<code>http://{admin_vip(mesh)}:{ADMIN_PORT}/admin</code> on any hub leads here</p>",
+        f"<h1>manage</h1><p>on <b>{esc(me)}</b> &middot; "
+        + (
+            f"signing with your token until {time.strftime('%H:%M', time.localtime(until))} &middot; "
+            "<a href=/admin/logout>end the session</a>"
+            if until
+            else "this node holds the admin key &middot; <a href=/admin/login>use a token instead</a>"
+        )
+        + f" &middot; also reachable as <code>http://{admin_vip(mesh)}:{ADMIN_PORT}/admin</code> on every hub</p>",
     ]
     if note:
         out.append(f"<pre>{esc(note)}</pre>")
@@ -1724,7 +1949,7 @@ def view_admin(mesh, me, nodes, csrf, note, soft):
         approve = f" <button name=action value=approve>make hub at {esc(r['wants'])}</button>" if r["wants"] else ""
         simple = (
             f" &middot; <a href='/admin/simple?name={urllib.parse.quote(r['name'])}'>QR / config</a>"
-            if r.get("simple")
+            if r.get("simple") and held
             else ""
         )
         out.append(
@@ -1791,6 +2016,8 @@ def view_admin(mesh, me, nodes, csrf, note, soft):
         + esc("\n".join(" ".join(f"{k}={v}" for k, v in e.items()) for e in soft["log"]) or "empty")
         + "</pre></details>"
     )
+    if not held:
+        return "".join(out).encode()
     out.append(
         f"<h2>password</h2><form method=post class=grid>{hidden}"
         "<input type=password name=new1 placeholder='new password' required minlength=8 autocomplete=new-password> "
@@ -1801,7 +2028,7 @@ def view_admin(mesh, me, nodes, csrf, note, soft):
     return "".join(out).encode()
 
 
-def view_simple(mesh, name, hub, hubs, text, code):
+def view_simple(mesh, name, hub, hubs, text, code, stored):
     """One simple client: its QR code and config."""
     link = "/admin/simple?name=" + urllib.parse.quote(name)
     code = (
@@ -1810,16 +2037,23 @@ def view_simple(mesh, name, hub, hubs, text, code):
         else "<p>No QR code: qrencode is not installed on this node.</p>"
     )
     others = " &middot; ".join(
-        f"<b>{esc(h)}</b>" if h == hub else f"<a href='{link}&hub={urllib.parse.quote(h)}'>{esc(h)}</a>" for h in hubs
+        f"<b>{esc(h)}</b>" if h == hub or not stored else f"<a href='{link}&hub={urllib.parse.quote(h)}'>{esc(h)}</a>"
+        for h in hubs
     )
+    download = "data:text/plain;base64," + base64.b64encode(text.encode()).decode()
     return (
         page_head(mesh, name, "")
         + f"<h1>{esc(name)}</h1><p>A plain WireGuard client. Scan this with the WireGuard app, "
-        f"or <a href='{link}&hub={urllib.parse.quote(hub)}&download=1'>download {esc(name)}.conf</a>. <a href=/admin>back</a></p>"
+        f'or <a download="{esc(name)}.conf" href="{download}">download {esc(name)}.conf</a>. <a href=/admin>back</a></p>'
         f"<p>connects through: {others}</p>"
         f"<div style='background:#fff;display:inline-block;padding:10px;border-radius:8px;margin:12px 0;width:min(320px,90vw)'>{code}</div>"
-        "<p>Plain WireGuard uses one hub and cannot switch by itself: if that hub is down, pick another one above and import "
-        "again. The config lists the networks known now; export it again after adding subnets or hubs.</p>"
+        + (
+            ""
+            if stored
+            else "<p><b>Save it now.</b> This node does not keep the device's key, so this page cannot be shown again.</p>"
+        )
+        + "<p>Plain WireGuard uses one hub and cannot switch by itself: if that hub is down, export the config again through "
+        "another one. The config lists the networks known now; export it again after adding subnets or hubs.</p>"
         f"<details><summary>show the config (contains the private key)</summary><pre>{esc(text)}</pre></details>"
     ).encode()
 
@@ -2104,6 +2338,10 @@ def maybe_update():
 def set_password(new):
     if len(new) < 8:
         sys.exit("the password needs at least 8 characters")
+    if not os.path.exists(f"{DIR}/admin.key"):
+        sys.exit(
+            "the password protects this page on nodes that hold the admin key; here you sign in with the key itself"
+        )
     with locked():
         admin()
         salt = secrets.token_bytes(16)
@@ -2213,13 +2451,17 @@ def cmd_invite(a):
                 },
             ),
         )
-        if simple:  # its key stays with the admin nodes, encrypted, so the config can be shown again later
-            conf_put(f"simple_{node_id}", password_box().encrypt(key.encode()).decode())
+        if simple:
+            ISSUED[a.name] = key
+            if os.path.exists(f"{DIR}/admin.key"):  # kept encrypted with the admin nodes, to show the config again
+                conf_put(f"simple_{node_id}", password_box().encrypt(key.encode()).decode())
     if simple:
         return
     out = a.out or f"{a.name}.mesh.json"
     cfg = {**state(), "mesh": mesh, "key": key}
     if a.admin:
+        if not os.path.exists(f"{DIR}/admin.key"):
+            sys.exit("--admin hands over the admin key file, and this machine does not hold it")
         cfg["admin_key"] = read("admin.key")
     write(out, json.dumps(cfg, indent=1))
     print(
@@ -2419,7 +2661,7 @@ def cmd_simple(a):
                 ip=a.ip,
             )
         )
-    text, hub, hubs = simple_config(a.name, a.hub)
+    text, hub, hubs = simple_config(a.name, a.hub, ISSUED.get(a.name))
     out = a.out or f"{a.name}.conf"
     write(out, text)
     print(
@@ -2501,7 +2743,8 @@ def cmd_check():
     view_map(mesh, topo), view_traffic(mesh), view_api(mesh), view_metrics(topo, traffic_totals())
     view_status(mesh, list(rows()), warnings(), ONCE, False, code_sha())
     if os.path.exists(f"{DIR}/admin.key"):
-        view_admin(mesh, nodes[loc["pub"]]["name"], list(rows()), "x", "", software())
+        view_admin(mesh, nodes[loc["pub"]]["name"], list(rows()), "x", "", software(), None, True)
+    view_login(mesh, "s", "p", 0, "")
     for text in UNITS.values():
         text.format(py="p", bin="b", port=1, net=mesh["net"], vip="v", aport=2)
     print("ok")
@@ -2567,29 +2810,25 @@ def web_update(a):
     cmd_update(argparse.Namespace(url=a.source, ref=a.ref, file=None, rollback=a.action == "rollback"))
 
 
-def simple_response(mesh, query):
+def simple_response(mesh, query, key=None):
     name, hub = query.get("name", [""])[0], query.get("hub", [None])[0]
     try:
-        text, hub, hubs = simple_config(name, hub)
+        text, hub, hubs = simple_config(name, hub, key)
     except SystemExit as e:
         return "404 Not Found", f"{e}\n".encode(), "text/plain; charset=utf-8", ""
-    if "download" in query:
-        return (
-            "200 OK",
-            text.encode(),
-            "text/plain; charset=utf-8",
-            f'Content-Disposition: attachment; filename="{name}.conf"\r\n',
-        )
-    return "200 OK", view_simple(mesh, name, hub, hubs, text, qr(text, "SVG")), "text/html; charset=utf-8", ""
+    stored = os.path.exists(f"{DIR}/admin.key")
+    return "200 OK", view_simple(mesh, name, hub, hubs, text, qr(text, "SVG"), stored), "text/html; charset=utf-8", ""
 
 
-def respond(method, path, headers, body):
+def respond(method, path, headers, body, peer="127.0.0.1"):
     """One HTTP request -> (status, body, content type, extra headers).
 
     Everything but /admin is read-only and open to the mesh: the map, traffic,
-    the JSON API and /metrics. /admin exists only where admin.key is and asks
-    for the password (HTTP Basic), so the password is never typed into a hub.
+    the JSON API and /metrics. /admin works on every node. Where the admin key
+    is stored it asks for the page password; anywhere else it asks for the key
+    itself, which the browser turns into a short-lived token (see view_login).
     """
+    global SESSION
     loc = local()
     mesh = loc["mesh"]
     route, _, qs = path.partition("?")
@@ -2615,38 +2854,50 @@ def respond(method, path, headers, body):
             "",
         ),
     }
-    if route not in ("/admin", "/admin/simple"):
+    if not route.startswith("/admin"):
         return public.get(route, public["/"])()
-    if not os.path.exists(f"{DIR}/admin.key"):
-        # the cluster IP lands on a hub, and hubs cannot sign changes: send the browser on to a node that can
-        there = next((n for n in topology()["nodes"] if n["admin"] and not n["me"]), None)
-        if not there:
-            return "404 Not Found", b"no admin node is known to this hub yet\n", "text/plain", ""
-        target = f"http://{there['ip']}:{ADMIN_PORT}{path}"
-        return (
-            "307 Temporary Redirect",
-            f"managed on {there['name']}: {target}\n".encode(),
-            "text/plain",
-            f"Location: {target}\r\n",
-        )
-    try:
-        password = base64.b64decode(headers.get("authorization", "").split()[1]).decode().partition(":")[2]
-    except Exception:
-        password = ""
-    if not password or not check_password(password):
-        return (
-            "401 Unauthorized",
-            b"authentication required\n",
-            "text/plain",
-            'WWW-Authenticate: Basic realm="meshbone"\r\n',
-        )
-    # browsers resend Basic credentials on cross-site requests; this token is what a forged form cannot know
-    csrf = hashlib.sha256(("csrf:" + password).encode()).hexdigest()
+
+    form = (
+        {k: v[0] for k, v in urllib.parse.parse_qs(body.decode("utf-8", "replace")).items()} if method == "POST" else {}
+    )
+    sid = (re.search(r"(?:^|;\s*)mb=([\w-]{10,60})", headers.get("cookie", "")) or [None, None])[1]
+    held, now = os.path.exists(f"{DIR}/admin.key"), int(time.time())
+    if route == "/admin/logout":
+        session_close(sid)
+        return "303 See Other", b"", "text/plain", "Location: /admin\r\nSet-Cookie: mb=; Path=/admin; Max-Age=0\r\n"
+    if route == "/admin/login" and method == "POST":
+        try:
+            nbf, exp = int(form.get("nbf", "")), int(form.get("exp", ""))
+        except ValueError:
+            nbf = exp = 0
+        if session_grant(mesh, form.get("sid", ""), peer, nbf, exp, form.get("sig", "")):
+            cookie = f"mb={form['sid']}; Path=/admin; HttpOnly; SameSite=Strict; Max-Age={exp - now}"
+            return "303 See Other", b"", "text/plain", f"Location: /admin\r\nSet-Cookie: {cookie}\r\n"
+        return page(view_login(mesh, *session_open(peer), now, "that token was not accepted; try again"))
+    session = session_use(sid, peer)
+    if route == "/admin/login" or not (session or held):
+        return page(view_login(mesh, *session_open(peer), now, ""))
+    if session:
+        SESSION, secret, until = session[:2], sid, session[2]
+    else:
+        try:
+            secret = base64.b64decode(headers.get("authorization", "").split()[1]).decode().partition(":")[2]
+        except Exception:
+            secret = ""
+        if not secret or not check_password(secret):
+            return (
+                "401 Unauthorized",
+                b"authentication required\n",
+                "text/plain",
+                'WWW-Authenticate: Basic realm="meshbone"\r\n',
+            )
+        until = None
+    # a forged cross-site form cannot know this value
+    csrf = hashlib.sha256(("csrf:" + secret).encode()).hexdigest()
     if route == "/admin/simple":
         return simple_response(mesh, query)
     note = ""
     if method == "POST":
-        form = {k: v[0] for k, v in urllib.parse.parse_qs(body.decode("utf-8", "replace")).items()}
         if not hmac.compare_digest(form.get("csrf", ""), csrf):
             return "403 Forbidden", b"bad form token\n", "text/plain", ""
         subnets, labels = form.get("subnets", "").split(), form.get("labels", "").split()
@@ -2691,7 +2942,7 @@ def respond(method, path, headers, body):
             with contextlib.redirect_stdout(io.StringIO()) as said:
                 actions[a.action](a)
             if a.action == "invite" and a.simple:
-                return simple_response(mesh, {"name": [a.name]})
+                return simple_response(mesh, {"name": [a.name]}, ISSUED.get(a.name))
             if a.action == "invite" and not a.remote:
                 with open(a.out, "rb") as f:
                     return (
@@ -2706,7 +2957,8 @@ def respond(method, path, headers, body):
         finally:
             with contextlib.suppress(FileNotFoundError):
                 os.remove(a.out)
-    return page(view_admin(mesh, load()[loc["pub"]]["name"], list(rows()), csrf, note, software()))
+    me = load()[loc["pub"]]["name"]
+    return page(view_admin(mesh, me, list(rows()), csrf, note, software(), until, held))
 
 
 def cmd_admin():
@@ -2722,7 +2974,7 @@ def cmd_admin():
                 break
             headers[k.strip().lower()] = v.strip()
         body = f.read(min(int(headers.get("content-length", 0)), 1 << 16))
-        status, out, ctype, extra = respond(method, path, headers, body)
+        status, out, ctype, extra = respond(method, path, headers, body, sock.getpeername()[0])
     except (IndexError, ValueError):
         status, out, ctype, extra = "400 Bad Request", b"bad request\n", "text/plain", ""
     sock.sendall(
