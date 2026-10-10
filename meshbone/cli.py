@@ -124,6 +124,18 @@ def build_parser():
     )
     s.add_argument("--del", dest="delete", metavar="NAME", help="stop serving NAME")
     s.add_argument("--ca", action="store_true", help="print the mesh CA certificate")
+    s.add_argument(
+        "--letsencrypt",
+        metavar="EMAIL",
+        help="a public certificate (wildcard for the zone) from Let's Encrypt, renewed here",
+    )
+    s.add_argument(
+        "--cloudflare-token", help="Cloudflare API token that may edit the zone's DNS (for the dns-01 challenge)"
+    )
+    s.add_argument("--staging", action="store_true", help="use Let's Encrypt's staging CA (for trying it out)")
+    s.add_argument("--cert", metavar="FILE", help="use this certificate chain (PEM) instead, with --key")
+    s.add_argument("--key", metavar="FILE", help="the certificate's private key (PEM)")
+    s.add_argument("--mesh-ca", action="store_true", help="back to a certificate from the mesh's own CA")
     s = sub.add_parser("dns")
     s.add_argument("--zone", help="domain under which every node has a name (default <mesh>.internal)")
     s.add_argument("--upstream", help="resolvers for every other name, e.g. '1.1.1.1 8.8.8.8'")

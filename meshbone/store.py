@@ -259,12 +259,38 @@ def issue_https_cert(mesh):
         .add_extension(x509.ExtendedKeyUsage([x509.ExtendedKeyUsageOID.SERVER_AUTH]), critical=False)
         .sign(ca_key, hashes.SHA256())
     )
-    conf_put("https_cert", cert.public_bytes(ser.Encoding.PEM).decode() + ca_cert_pem)
-    conf_put(
-        "https_key",
-        mesh_box().encrypt(key.private_bytes(ser.Encoding.PEM, ser.PrivateFormat.PKCS8, ser.NoEncryption())).decode(),
+    put_https_material(
+        cert.public_bytes(ser.Encoding.PEM).decode() + ca_cert_pem,
+        key.private_bytes(ser.Encoding.PEM, ser.PrivateFormat.PKCS8, ser.NoEncryption()).decode(),
     )
     return hosts
+
+
+def put_https_material(chain_pem, key_pem):
+    """Store the gateway's certificate chain and key for the mesh (under the lock); the key travels
+    encrypted under a key derived from the mesh's psk, which every hub has."""
+    conf_put("https_cert", chain_pem)
+    conf_put("https_key", mesh_box().encrypt(key_pem.encode()).decode())
+
+
+def https_covers(mesh):
+    """The gateway names the certificate does not cover (a wildcard covers one label)."""
+    names = https_cert_names(mesh)
+    return sorted(h for h in https_routes(mesh) if h not in names and "*." + h.partition(".")[2] not in names and names)
+
+
+def acme_settings():
+    """The ACME account for the gateway's certificate, or None when the mesh CA signs it:
+    {directory, email, token, account_key} - the last two encrypted under the admin key."""
+    try:
+        cfg = json.loads(load_conf()["acme"]["value"])
+        return cfg if isinstance(cfg, dict) and cfg.get("directory") else None
+    except (KeyError, ValueError):
+        return None
+
+
+def has_admin_key():
+    return os.path.exists(f"{settings.DIR}/admin.key")
 
 
 def router_ip(mesh, node_id):

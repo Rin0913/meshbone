@@ -61,7 +61,7 @@ Managing (the commands below, or http://10.253.253.1:7948/admin on any node)
   meshbone gateway NAME [--endpoint HOST:PORT --via HUB --net CIDR...]
                                 add an external gateway (or print its config again): plain WireGuard config
                                 and VyOS commands for the router's operator
-  meshbone https [--add NAME URL] [--del NAME] [--ca]
+  meshbone https [--add NAME URL] [--del NAME] [--ca] [--letsencrypt EMAIL --cloudflare-token T] [--cert F --key F] [--mesh-ca]
                                 the HTTPS gateway on cluster IP .4: NAME.<zone> is served with the mesh's
                                 own certificate and proxied to URL inside the mesh; --ca prints the CA
                                 certificate to install in browsers (also http://<map>/ca.crt)
@@ -80,9 +80,9 @@ The file is laid out as model, view, controller - see the banners below.
 import sys as _sys
 import types as _types
 
-from . import cli, commands, dns, http, model, proxy, settings, ssh, store, system, updates, views, wire
+from . import acme, cli, commands, dns, http, model, proxy, settings, ssh, store, system, updates, views, wire
 
-MODULES = (settings, store, model, system, ssh, wire, updates, dns, proxy, views, http, commands, cli)
+MODULES = (settings, store, model, system, ssh, wire, updates, dns, proxy, acme, views, http, commands, cli)
 
 
 class _Facade(_types.ModuleType):

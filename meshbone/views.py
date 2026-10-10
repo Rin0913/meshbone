@@ -798,10 +798,12 @@ def view_policy(pol):
     return "\n".join(lines + ["always allowed: answers, ping, and the mesh's own ports between nodes"])
 
 
-def view_https(routes, vip, zone):
-    lines = [
-        f"HTTPS gateway on {vip} (https.{zone}), the mesh's own certificate; install the CA from `meshbone https --ca`"
-    ]
+def view_https(routes, vip, zone, cert=""):
+    lines = [f"HTTPS gateway on {vip} (https.{zone}); certificate: {cert or 'none yet'}"]
+    if "meshbone" in cert:
+        lines.append(
+            "  signed by the mesh's own CA: install it from `meshbone https --ca`, or get a public one with --letsencrypt"
+        )
     for host, url in sorted(routes.items()):
         lines.append(f"  https://{host:<36} -> {url}")
     return "\n".join(lines)

@@ -94,7 +94,7 @@ On an admin node:
 | `set NAME [options]` | Change a node |
 | `approve NAME`, `revoke NAME` | Accept a `promote` request; remove a node |
 | `dns [--zone DOMAIN] [--upstream 'IP IP']` | The mesh's names, see below |
-| `https [--add NAME URL] [--del NAME] [--ca]` | The HTTPS gateway, see below |
+| `https [--add NAME URL] [--del NAME] [--ca] [--letsencrypt EMAIL --cloudflare-token T] [--cert F --key F] [--mesh-ca]` | The HTTPS gateway, see below |
 | `gateway NAME [--endpoint HOST:PORT --via HUB --net CIDR...]` | Add an external gateway, or print its configuration again (`transit` still works) |
 | `policy [--default allow\|deny] [--add FROM TO allow\|deny [--ports P] [--at N]] [--del N] [--clear]` | The firewall, see below |
 | `passwd` | Change the management page password |
@@ -296,10 +296,29 @@ sudo meshbone https --ca > meshbone-ca.crt                 # install in browsers
 ```
 
 `https://map.<zone>` is always there (the map, the API, the management page).
+The gateway speaks HTTP/1.1 and HTTP/2 (where `python3-h2` is installed, which
+`install` does), and pipes WebSockets through.
+
 The CA key stays under the admin key; the certificate for the gateway's names
 is issued on an admin node and reaches the hubs with the other settings, its
 key encrypted for the mesh. The CA certificate is also at `/ca.crt` on the
 map's address.
+
+A public certificate instead, so that nothing has to be installed in browsers:
+the zone's DNS must be on Cloudflare (other providers can follow), and the
+names of the gateway must live under the zone, which a wildcard then covers.
+
+```bash
+sudo meshbone https --letsencrypt you@example.net --cloudflare-token TOKEN   # once, on an admin node
+sudo meshbone https --cert chain.pem --key key.pem    # or any certificate obtained elsewhere
+sudo meshbone https --mesh-ca                         # back to the mesh's own CA
+```
+
+The token (one that may edit the zone's DNS) and the account key are kept in
+the mesh's settings encrypted under the admin key; the admin node proves the
+names with dns-01 TXT records placed and removed through the API, and renews
+the certificate by itself a month before it runs out (`--staging` tries the
+whole thing against Let's Encrypt's staging CA first).
 
 ## Health and events
 

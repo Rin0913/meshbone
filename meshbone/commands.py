@@ -3,7 +3,7 @@
 import argparse, base64, contextlib, hashlib, io, json, os, random, re, secrets, shlex, shutil, socket, subprocess, sys, tarfile, time, zlib, zipfile, urllib.parse
 from ipaddress import IPv4Address, IPv4Network
 
-from . import cli, model, settings, ssh, store, system, updates, views, wire
+from . import acme, cli, model, settings, ssh, store, system, updates, views, wire
 
 
 def verify_links():
@@ -538,19 +538,72 @@ def cmd_https(a):
             if a.delete:
                 routes.pop(model.dns_name(a.delete) or a.delete, None)
             store.conf_put("https_routes", json.dumps(routes))
-            hosts = store.issue_https_cert(mesh)
+            if not store.acme_settings():  # the mesh CA names each host; a public wildcard covers them all
+                print(f"certificate issued for {', '.join(store.issue_https_cert(mesh))}")
             system.reconcile()
         wire.gossip(flood=True)
-        print(f"certificate issued for {', '.join(hosts)}")
-    elif os.path.exists(f"{settings.DIR}/admin.key") and store.https_cert_names(mesh) != sorted(
-        store.https_routes(mesh)
+    elif a.letsencrypt or a.cert or a.mesh_ca:
+        if not store.has_admin_key():
+            sys.exit("the gateway's certificate is managed on a node that holds admin.key")
+        if a.letsencrypt:
+            if not a.cloudflare_token:
+                sys.exit("--letsencrypt EMAIL needs --cloudflare-token TOKEN (a token that may edit the zone's DNS)")
+            from cryptography.hazmat.primitives import serialization as ser
+            from cryptography.hazmat.primitives.asymmetric import ec
+
+            box = store.password_box()
+            account = ec.generate_private_key(ec.SECP256R1()).private_bytes(
+                ser.Encoding.PEM, ser.PrivateFormat.PKCS8, ser.NoEncryption()
+            )
+            cfg = {
+                "directory": acme.STAGING if a.staging else acme.LETSENCRYPT,
+                "email": a.letsencrypt,
+                "token": box.encrypt(a.cloudflare_token.encode()).decode(),
+                "account_key": box.encrypt(account).decode(),
+            }
+            with store.locked():
+                store.admin()
+                store.conf_put("acme", json.dumps(cfg))
+            try:
+                acme.renew(mesh)
+            except acme.AcmeError as e:
+                sys.exit(f"no certificate: {e}")
+        elif a.cert:
+            if not a.key:
+                sys.exit("--cert FILE needs --key FILE")
+            with store.locked():
+                store.admin()
+                store.conf_put("acme", "")
+                store.put_https_material(open(a.cert).read(), open(a.key).read())
+        else:
+            with store.locked():
+                store.admin()
+                store.conf_put("acme", "")
+                store.issue_https_cert(mesh)
+        with store.locked():
+            system.reconcile()
+        wire.gossip(flood=True)
+        print(f"certificate: {store.https_cert_info(mesh)}")
+    elif (
+        store.has_admin_key()
+        and not store.acme_settings()
+        and store.https_cert_names(mesh) != sorted(store.https_routes(mesh))
     ):
         with store.locked():  # none yet, or the names changed (a new zone, say)
             hosts = store.issue_https_cert(mesh)
             system.reconcile()
         wire.gossip(flood=True)
         print(f"certificate issued for {', '.join(hosts)}")
-    print(views.view_https(store.https_routes(mesh), store.https_vip(mesh), store.dns_settings(mesh)["zone"]))
+    for host in store.https_covers(mesh):
+        print(f"note: the certificate does not cover {host}; the gateway's names belong under the zone")
+    print(
+        views.view_https(
+            store.https_routes(mesh),
+            store.https_vip(mesh),
+            store.dns_settings(mesh)["zone"],
+            store.https_cert_info(mesh),
+        )
+    )
 
 
 def cmd_dns(a):
@@ -571,7 +624,13 @@ def cmd_dns(a):
                     sys.exit(f"bad upstream: {e}")
             store.conf_put("dns", json.dumps(d))
             if store.https_material(loc["mesh"])[0]:
-                store.issue_https_cert(loc["mesh"])  # the gateway's names live under the zone
+                if store.acme_settings():
+                    try:
+                        acme.renew(loc["mesh"])  # the gateway's names live under the zone
+                    except acme.AcmeError as e:
+                        print(f"the certificate still names the old zone: {e}")
+                else:
+                    store.issue_https_cert(loc["mesh"])  # the gateway's names live under the zone
             system.reconcile()
         wire.gossip(flood=True)
     print(views.view_dns(store.dns_settings(loc["mesh"]), model.dns_records(loc["mesh"], store.load())))
@@ -652,6 +711,7 @@ def cmd_sync():
         system.reconcile()
     wire.gossip()
     updates.maybe_update()
+    acme.maybe_renew()
 
 
 def cmd_status():

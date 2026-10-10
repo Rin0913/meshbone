@@ -122,6 +122,22 @@ m.exchange = fake_exchange
 A = lambda **k: types.SimpleNamespace(**k)
 
 
+def H(**k):  # the https command's arguments, with its defaults
+    d = dict(
+        add=None,
+        delete=None,
+        ca=False,
+        letsencrypt=None,
+        cloudflare_token=None,
+        staging=False,
+        cert=None,
+        key=None,
+        mesh_ca=False,
+    )
+    d.update(k)
+    return A(**d)
+
+
 def invite(on, name, **k):
     use(on)
     out = os.path.join(root, name + ".json")
@@ -1476,10 +1492,10 @@ use("a")
 assert m.ca(mesh_) == (ca_pem, "")  # hubs get the certificate, never the key
 assert m.https_routes(mesh_) == {"map.lab.test": "http://127.0.0.1:7948"} and m.https_material(mesh_) == ("", "")
 use("adm")
-expect_exit(lambda: m.cmd_https(A(add=["files", "ftp://x"], delete=None, ca=False)), "usage")
+expect_exit(lambda: m.cmd_https(H(add=["files", "ftp://x"], delete=None, ca=False)), "usage")
 with quiet:
-    m.cmd_https(A(add=["files", "http://10.253.255.1:3923"], delete=None, ca=False))
-    m.cmd_https(A(add=["grafana.example.org", "https://10.253.255.1:3000/"], delete=None, ca=False))
+    m.cmd_https(H(add=["files", "http://10.253.255.1:3923"], delete=None, ca=False))
+    m.cmd_https(H(add=["grafana.example.org", "https://10.253.255.1:3000/"], delete=None, ca=False))
 use("a")
 routes = m.https_routes(mesh_)
 assert routes["files.lab.test"] == "http://10.253.255.1:3923" and routes["grafana.example.org"].startswith("https://")
@@ -1502,10 +1518,10 @@ with quiet:
 assert m.https_cert_names(mesh_) == ["files.new.lab.test", "grafana.example.org", "map.new.lab.test"]
 m.conf_put("https_routes", json.dumps({**json.loads(m.load_conf()["https_routes"]["value"]), "x": "http://10.1.1.1/"}))
 with quiet:
-    m.cmd_https(A(add=None, delete=None, ca=False))  # a plain look on an admin node repairs a stale certificate
+    m.cmd_https(H(add=None, delete=None, ca=False))  # a plain look on an admin node repairs a stale certificate
 assert "x.new.lab.test" in m.https_cert_names(mesh_)
 with quiet:
-    m.cmd_https(A(add=None, delete="x", ca=False))
+    m.cmd_https(H(add=None, delete="x", ca=False))
     m.cmd_dns(A(zone="lab.test", upstream=None))
 assert m.https_cert_names(mesh_) == ["files.lab.test", "grafana.example.org", "map.lab.test"]
 sync("a")
@@ -1689,8 +1705,219 @@ routes_ = dead
 assert via_proxy(b"GET / HTTP/1.1\r\nHost: files.lab.test\r\n\r\n").startswith(b"HTTP/1.1 502")
 use("adm")
 with quiet:
-    m.cmd_https(A(add=None, delete="files", ca=False))
+    m.cmd_https(H(add=None, delete="files", ca=False))
 assert "files.lab.test" not in m.https_routes(mesh_)
+
+# --- a public certificate through ACME (dns-01 on Cloudflare): a fake CA and a fake Cloudflare
+from cryptography.hazmat.primitives import hashes as _hashes, serialization as _ser
+from cryptography.hazmat.primitives.asymmetric import ec as _ec
+
+fake = {"nonces": 0, "jwk": None, "valid": set(), "records": {}, "issued": 0, "deleted": 0}
+le_key = _ec.generate_private_key(_ec.SECP256R1())
+le_cert = (
+    x509.CertificateBuilder()
+    .subject_name(x509.Name([x509.NameAttribute(x509.NameOID.COMMON_NAME, "Fake LE")]))
+    .issuer_name(x509.Name([x509.NameAttribute(x509.NameOID.COMMON_NAME, "Fake LE")]))
+    .public_key(le_key.public_key())
+    .serial_number(1)
+    .not_valid_before(__import__("datetime").datetime(2020, 1, 1))
+    .not_valid_after(__import__("datetime").datetime(2040, 1, 1))
+    .sign(le_key, _hashes.SHA256())
+)
+
+
+class FakeCA(http.server.BaseHTTPRequestHandler):
+    def base(self):
+        return f"http://127.0.0.1:{self.server.server_port}"
+
+    def reply(self, status, body, ctype="application/json", extra=()):
+        self.send_response(status)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Replay-Nonce", f"n{fake['nonces']}")
+        fake["nonces"] += 1
+        for k, v in extra:
+            self.send_header(k, v)
+        body = body if isinstance(body, bytes) else json.dumps(body).encode()
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        b = self.base()
+        if self.path == "/directory":
+            return self.reply(200, {"newNonce": b + "/nonce", "newAccount": b + "/acct", "newOrder": b + "/order"})
+        if self.path.startswith("/cf/zones?name="):  # the fake Cloudflare
+            name = self.path.split("=")[1]
+            assert self.headers["Authorization"] == "Bearer cf-token"
+            return self.reply(200, {"success": True, "result": [{"id": "z1"}] if name == "lab.test" else []})
+        self.reply(404, {})
+
+    def do_HEAD(self):
+        self.reply(200, b"")
+
+    def do_DELETE(self):
+        assert self.path.startswith("/cf/zones/z1/dns_records/")
+        fake["records"].pop(self.path.rsplit("/", 1)[1])
+        fake["deleted"] += 1
+        self.reply(200, {"success": True, "result": {}})
+
+    def do_POST(self):
+        b = self.base()
+        raw = self.rfile.read(int(self.headers["Content-Length"]))
+        if self.path.startswith("/cf/"):
+            rec = json.loads(raw)
+            assert (
+                rec["type"] == "TXT"
+                and rec["name"].startswith("_acme-challenge.")
+                and self.path == "/cf/zones/z1/dns_records"
+            )
+            rid = f"r{len(fake['records']) + 1}"
+            fake["records"][rid] = rec["content"]
+            return self.reply(200, {"success": True, "result": {"id": rid}})
+        jws = json.loads(raw)
+        protected = json.loads(base64.urlsafe_b64decode(jws["protected"] + "=="))
+        assert protected["url"] == b + self.path and protected["alg"] == "ES256" and protected["nonce"].startswith("n")
+        if "jwk" in protected:
+            fake["jwk"] = protected["jwk"]
+        else:
+            assert protected["kid"] == b + "/acct/1"
+        k = fake["jwk"]
+        pub = _ec.EllipticCurvePublicNumbers(
+            int.from_bytes(base64.urlsafe_b64decode(k["x"] + "=="), "big"),
+            int.from_bytes(base64.urlsafe_b64decode(k["y"] + "=="), "big"),
+            _ec.SECP256R1(),
+        ).public_key()
+        sig = base64.urlsafe_b64decode(jws["signature"] + "==")
+        from cryptography.hazmat.primitives.asymmetric.utils import encode_dss_signature
+
+        pub.verify(
+            encode_dss_signature(int.from_bytes(sig[:32], "big"), int.from_bytes(sig[32:], "big")),
+            f"{jws['protected']}.{jws['payload']}".encode(),
+            _ec.ECDSA(_hashes.SHA256()),
+        )
+        payload = json.loads(base64.urlsafe_b64decode(jws["payload"] + "==")) if jws["payload"] else None
+        if self.path == "/acct":
+            assert payload["termsOfServiceAgreed"] and payload["contact"] == ["mailto:me@lab.test"]
+            return self.reply(201, {"status": "valid"}, extra=[("Location", b + "/acct/1")])
+        if self.path == "/order":
+            fake["names"] = [i["value"] for i in payload["identifiers"]]
+            assert fake["names"] == [fake["names"][0], "*." + fake["names"][0]]  # the zone and its wildcard
+            fake["valid"] = set()
+            return self.reply(
+                201,
+                {
+                    "status": "pending",
+                    "authorizations": [b + "/authz/1", b + "/authz/2"],
+                    "finalize": b + "/order/1/finalize",
+                },
+                extra=[("Location", b + "/order/1")],
+            )
+        if self.path.startswith("/authz/"):
+            n = self.path[-1]
+            return self.reply(
+                200,
+                {
+                    "status": "valid" if n in fake["valid"] else "pending",
+                    "identifier": {"type": "dns", "value": fake["names"][0]},
+                    "challenges": [{"type": "dns-01", "url": b + "/chal/" + n, "token": "tok" + n}],
+                },
+            )
+        if self.path.startswith("/chal/"):
+            n = self.path[-1]
+            want = m.b64(hashlib.sha256(f"tok{n}.{m.thumbprint(acct_key())}".encode()).digest())
+            assert want in fake["records"].values(), "the TXT record is not in place"
+            fake["valid"].add(n)
+            return self.reply(200, {"status": "valid"})
+        if self.path == "/order/1/finalize":
+            csr = x509.load_der_x509_csr(base64.urlsafe_b64decode(payload["csr"] + "=="))
+            sans = csr.extensions.get_extension_for_class(x509.SubjectAlternativeName).value.get_values_for_type(
+                x509.DNSName
+            )
+            assert sorted(sans) == sorted(fake["names"])
+            fake["cert"] = (
+                x509.CertificateBuilder()
+                .subject_name(csr.subject)
+                .issuer_name(le_cert.subject)
+                .public_key(csr.public_key())
+                .serial_number(fake["issued"] + 2)
+                .not_valid_before(__import__("datetime").datetime(2020, 1, 1))
+                .not_valid_after(__import__("datetime").datetime(2039, 6, 1))
+                .add_extension(x509.SubjectAlternativeName([x509.DNSName(n) for n in sans]), critical=False)
+                .sign(le_key, _hashes.SHA256())
+            )
+            fake["issued"] += 1
+            return self.reply(200, {"status": "valid", "certificate": b + "/cert/1"})
+        if self.path == "/order/1":
+            return self.reply(200, {"status": "valid", "certificate": b + "/cert/1"})
+        if self.path == "/cert/1":
+            pem = fake["cert"].public_bytes(_ser.Encoding.PEM) + le_cert.public_bytes(_ser.Encoding.PEM)
+            return self.reply(200, pem, "application/pem-certificate-chain")
+        self.reply(404, {"type": "urn:ietf:params:acme:error:malformed", "detail": "what?"})
+
+    def log_message(self, *a):
+        pass
+
+
+def acct_key():
+    return _ser.load_pem_private_key(m.password_box().decrypt(m.acme_settings()["account_key"].encode()), None)
+
+
+ca_srv = http.server.HTTPServer(("127.0.0.1", 0), FakeCA)
+threading.Thread(target=ca_srv.serve_forever, daemon=True).start()
+m.LETSENCRYPT = f"http://127.0.0.1:{ca_srv.server_port}/directory"
+m.CLOUDFLARE = f"http://127.0.0.1:{ca_srv.server_port}/cf"
+m.txt_visible = lambda name, value, resolvers=(): True  # no real DNS in tests
+assert m.acme.LETSENCRYPT.startswith("http://127.0.0.1") and m.commands.acme.CLOUDFLARE.startswith("http://127.0.0.1")
+use("a")
+expect_exit(lambda: m.cmd_https(H(letsencrypt="me@lab.test", cloudflare_token="cf-token")), "holds admin.key")
+use("adm")
+expect_exit(lambda: m.cmd_https(H(letsencrypt="me@lab.test")), "needs --cloudflare-token")
+with quiet:
+    m.cmd_https(H(letsencrypt="me@lab.test", cloudflare_token="cf-token"))
+assert fake["issued"] == 1 and fake["deleted"] == 2 and not fake["records"]  # challenge records placed, then removed
+assert (
+    m.https_cert_names(mesh_) == ["*.lab.test", "lab.test"] and m.https_cert_info(mesh_) == "Fake LE, until 2039-06-01"
+)
+assert fake["names"] == ["lab.test", "*.lab.test"]
+assert "cf-token" not in json.dumps(m.load_conf()) and m.acme_settings()["email"] == "me@lab.test"
+sync("adm"), sync("a")
+use("a")
+cert_pem, key_pem = m.https_material(mesh_)
+assert "Fake LE" in m.https_cert_info(mesh_) and "PRIVATE KEY" in key_pem  # the hub serves it
+assert m.acme_settings() and not m.has_admin_key()  # the hub sees the account, cannot read its secrets
+use("adm")
+with quiet:
+    m.cmd_https(H(add=["files", "http://10.253.255.1:3923"]))  # a name under the zone: covered, nothing re-issued
+assert fake["issued"] == 1 and m.https_covers(mesh_) == ["grafana.example.org"]  # from before: outside the zone
+buf = io.StringIO()
+with contextlib.redirect_stdout(buf):
+    m.cmd_https(H(add=["grafana.example.org", "https://10.253.255.1:3000/"]))
+assert "does not cover grafana.example.org" in buf.getvalue() and fake["issued"] == 1
+with quiet:
+    m.cmd_https(H(delete="grafana.example.org"))
+assert m.https_covers(mesh_) == []
+# renewal from sync on an admin node: when time is short, not more than once per RETRY after a failure
+m.maybe_renew()
+assert fake["issued"] == 1  # plenty of time left
+m.days_left = lambda mesh: 10
+m.maybe_renew()
+assert fake["issued"] == 2
+m.maybe_renew()
+assert fake["issued"] == 2  # just tried
+use("a")
+m.maybe_renew()
+assert fake["issued"] == 2  # no admin key here
+use("adm")
+with quiet:
+    m.cmd_dns(A(zone="new.lab.test", upstream=None))  # a new zone: the public CA is asked again
+assert m.https_cert_names(mesh_) == ["*.new.lab.test", "new.lab.test"] and fake["issued"] == 3
+with quiet:
+    m.cmd_dns(A(zone="lab.test", upstream=None))
+del m.acme.days_left
+with quiet:
+    m.cmd_https(H(mesh_ca=True))
+assert not m.acme_settings() and "meshbone" in m.https_cert_info(mesh_) and "map.lab.test" in m.https_cert_names(mesh_)
+ca_srv.shutdown()
 
 # --- the original admin machine dies; the rest carries on
 shutil.move(D("adm"), D("adm.dead"))
