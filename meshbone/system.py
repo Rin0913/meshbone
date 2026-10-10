@@ -340,6 +340,7 @@ def reconcile():
         run("ip", "link", "del", settings.IFACE, check=False)
         run("ip", "rule", "del", "pref", str(settings.MESH_TABLE), check=False)
         sync_exit(False)
+        sync_resolver(False)
         firewall([])
         apply_table(None)
         for name in ("meshbone-serve.socket", "meshbone-admin.socket", "meshbone-dns.service"):
@@ -441,6 +442,12 @@ def reconcile():
     }
     if now_state != was:
         store.write(f"{settings.DIR}/state.json", json.dumps(now_state))
+    if loc.get("resolver", True) != was.get("resolver_on"):
+        sync_resolver(loc.get("resolver", True))
+        store.write(
+            f"{settings.DIR}/state.json",
+            json.dumps({**store.read_json("state.json", {}), "resolver_on": loc.get("resolver", True)}),
+        )
     unit("start", "meshbone-serve.socket")
     unit("start" if serves_admin else "stop", "meshbone-admin.socket")
     unit("start" if hub else "stop", "meshbone-dns.service")
@@ -495,23 +502,82 @@ def install_units():
     run("systemctl", "--no-block", *(["start"] if settings.ONCE else ["enable", "--now"]), "meshbone.timer")
 
 
-def set_resolver(on):
-    """Point this host at the mesh's resolver for the mesh zone -> what was done, as text.
-    Uses systemd-resolved's per-interface settings (split DNS); without it, says what to do."""
+def resolver_manager():
+    """Who owns this host's DNS settings: resolved, resolvconf, networkmanager, or file."""
+    if (
+        shutil.which("resolvectl")
+        and run("systemctl", "is-active", "systemd-resolved", check=False).strip() == "active"
+    ):
+        return "resolved"
+    if shutil.which("resolvconf") and os.path.isdir("/run/resolvconf"):
+        return "resolvconf"
+    try:
+        with open("/etc/resolv.conf") as f:
+            head = f.read(200)
+    except OSError:
+        head = ""
+    if "NetworkManager" in head and run("systemctl", "is-active", "NetworkManager", check=False).strip() == "active":
+        return "networkmanager"
+    return "file"
+
+
+def sync_resolver(on):
+    """Make the mesh resolver this host's DNS, with the mesh's upstream resolvers as fallback -
+    or undo that. Done through whatever manages the host's DNS, so it survives the manager's
+    own changes; the plain-file case keeps a copy of what was there. Returns what was done."""
     mesh = store.local()["mesh"]
     d = store.dns_settings(mesh)
-    if not shutil.which("resolvectl"):
-        return (
-            f"no systemd-resolved here: point your resolver at {store.dns_vip(mesh)} for the domain {d['zone']} yourself"
-            if on
-            else "nothing to undo"
+    servers, zone, how = [str(store.dns_vip(mesh))] + d["upstream"], d["zone"], resolver_manager()
+    if how == "resolved":
+        if on:
+            run("resolvectl", "dns", settings.IFACE, *servers, check=False)
+            run("resolvectl", "domain", settings.IFACE, "~.", f"~{zone}", check=False)
+            run("resolvectl", "default-route", settings.IFACE, "yes", check=False)
+        else:
+            run("resolvectl", "revert", settings.IFACE, check=False)
+    elif how == "resolvconf":
+        if on:  # named lo.* so that resolvconf puts it before the DHCP-provided ones
+            text = "".join(f"nameserver {s}\n" for s in servers) + f"search {zone}\noptions timeout:2 attempts:1\n"
+            run("resolvconf", "-a", "lo.meshbone", input=text, check=False)
+        else:
+            run("resolvconf", "-d", "lo.meshbone", check=False)
+    elif how == "networkmanager":
+        path = "/etc/NetworkManager/conf.d/meshbone.conf"
+        text = f"# written by meshbone: the mesh resolver first, then its fallbacks\n[global-dns-domain-*]\nservers={','.join(servers)}\n"
+        if on and (not os.path.exists(path) or open(path).read() != text):
+            store.write(path, text, 0o644)
+            run("nmcli", "general", "reload", "dns-full", check=False)
+        elif not on and os.path.exists(path):
+            os.remove(path)
+            run("nmcli", "general", "reload", "dns-full", check=False)
+    else:
+        path, saved = "/etc/resolv.conf", f"{settings.DIR}/resolv.conf.saved"
+        text = (
+            "# written by meshbone; the original is kept beside its state\n"
+            + "".join(f"nameserver {s}\n" for s in servers)
+            + f"search {zone}\noptions timeout:2 attempts:1\n"
         )
-    if on:
-        run("resolvectl", "dns", settings.IFACE, str(store.dns_vip(mesh)), check=False)
-        run("resolvectl", "domain", settings.IFACE, f"~{d['zone']}", "~in-addr.arpa", check=False)
-        return f"names under {d['zone']} are resolved through {store.dns_vip(mesh)}"
-    run("resolvectl", "revert", settings.IFACE, check=False)
-    return "the mesh resolver is no longer used here"
+        try:
+            current = open(path).read()
+        except OSError:
+            current = ""
+        if on and current != text:
+            if "written by meshbone" not in current and not os.path.exists(saved):
+                store.write(saved, current)
+            if os.path.islink(path):
+                os.remove(path)
+            store.write(path, text, 0o644)
+        elif not on and "written by meshbone" in current:
+            if os.path.exists(saved):
+                store.write(path, open(saved).read(), 0o644)
+                os.remove(saved)
+            else:
+                os.remove(path)
+    return (
+        f"DNS: the mesh resolver {servers[0]} first, then {', '.join(servers[1:])} (via {how})"
+        if on
+        else f"DNS: the mesh resolver is no longer used here (via {how})"
+    )
 
 
 def script(path, *args, timeout=240):

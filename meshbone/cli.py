@@ -36,7 +36,9 @@ def build_parser():
             "--nat", choices=("on", "off"), help="as a gateway, hide the mesh behind this node's address (default on)"
         )
         s.add_argument(
-            "--resolver", choices=("on", "off"), help="resolve the mesh's names through the mesh resolver here"
+            "--resolver",
+            choices=("on", "off"),
+            help="use the mesh resolver as this host's DNS, fallbacks after it (default on)",
         )
 
     s = sub.add_parser("create")

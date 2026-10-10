@@ -204,9 +204,12 @@ from the directory and forwards everything else to the upstream resolvers.
 | reverse names of mesh addresses | the node's name |
 
 The zone defaults to `<mesh>.internal`; `meshbone dns --zone home.example
---upstream '9.9.9.9 1.1.1.1'` changes it for the whole mesh. Simple clients
-get the resolver and the zone in their config. On a full node,
-`meshbone local --resolver on` points systemd-resolved at it for the zone only.
+--upstream '9.9.9.9 1.1.1.1'` changes it for the whole mesh. Every node uses
+the mesh resolver as its DNS, with the upstream resolvers after it as
+fallbacks - set through whatever manages the host's DNS (systemd-resolved,
+resolvconf, NetworkManager, or the file itself, which is kept) - and simple
+clients get it in their config. `meshbone local --resolver off` leaves a
+host's DNS alone.
 
 ## Firewall
 

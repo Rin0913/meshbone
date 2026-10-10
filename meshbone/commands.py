@@ -430,10 +430,10 @@ def cmd_local(a):
         system.reconcile()
     print(
         f"listen port {loc.get('listen_port') or 'automatic'}, mtu {loc.get('mtu') or 1420}, "
-        f"gateway NAT {'on' if loc.get('nat', True) else 'off'}, mesh resolver {'on' if loc.get('resolver') else 'off'}"
+        f"gateway NAT {'on' if loc.get('nat', True) else 'off'}, mesh resolver {'on' if loc.get('resolver', True) else 'off'}"
     )
     if a.resolver:
-        print(system.set_resolver(a.resolver == "on"))
+        print(system.sync_resolver(a.resolver == "on"))
 
 
 def cmd_promote(a):
@@ -630,6 +630,7 @@ def cmd_leave():
     system.apply_table(None)
     system.run("ip", "rule", "del", "pref", str(settings.MESH_TABLE), check=False)
     system.sync_exit(False)
+    system.sync_resolver(False)
     for ifn in (settings.IFACE, "mbvip"):
         system.run("ip", "link", "del", ifn, check=False)
     for path in [f"{settings.UNIT_DIR}/{name}" for name in settings.UNITS]:

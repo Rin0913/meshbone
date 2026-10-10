@@ -68,6 +68,8 @@ m.joined = lambda: False
 m.set_mode = lambda once: None
 m.resolve = lambda host, port: f"{host}:{port}"
 m.loosen_rp_filter = lambda: None
+resolver_calls = []
+m.sync_resolver = lambda on: resolver_calls.append((here(), on)) or "stub"  # the host's DNS is not touched in tests
 m.PARALLEL = 1
 m.VERIFY_WAIT = 0
 m.CONFIRM_WAIT = 0
@@ -1373,6 +1375,19 @@ sync("adm")
 topo = m.topology()
 assert topo["edges"] == edges and "id=edges" in G("/")[1].decode()
 del m.system.open
+
+# --- the mesh resolver becomes every node's DNS unless switched off
+assert ("c", True) in resolver_calls and ("a", True) in resolver_calls and ("d", False) not in resolver_calls
+use("c")
+with quiet:
+    m.cmd_local(A(listen_port=None, mtu=None, nat=None, resolver="off"))
+assert resolver_calls[-1] == ("c", False)
+n_calls = len(resolver_calls)
+sync("c")
+assert len(resolver_calls) == n_calls  # settled: not repeated every sync
+with quiet:
+    m.cmd_local(A(listen_port=None, mtu=None, nat=None, resolver="on"))
+assert resolver_calls[-1] == ("c", True)
 
 # --- the original admin machine dies; the rest carries on
 shutil.move(D("adm"), D("adm.dead"))
