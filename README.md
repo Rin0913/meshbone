@@ -91,12 +91,13 @@ On an admin node:
 | `simple NAME [--hub HUB] [--qr]` | Add a plain-WireGuard device, or export its config again |
 | `set NAME [options]` | Change a node |
 | `approve NAME`, `revoke NAME` | Accept a `promote` request; remove a node |
+| `dns [--zone DOMAIN] [--upstream 'IP IP']` | The mesh's names, see below |
 | `policy [--default allow\|deny] [--add FROM TO allow\|deny [--ports P] [--at N]] [--del N] [--clear]` | The firewall, see below |
 | `passwd` | Change the management page password |
 | `update URL [--ref REF]`, `update --file PATH`, `update --rollback` | Roll out a new version of meshbone itself, see below |
 
 Node options: `--endpoint HOST:PORT`, `--subnet CIDR`, `--vip IP`, `--cost MS`,
-`--desc TEXT`, `--label L`, `--ip ADDRESS`, `--admin`.
+`--desc TEXT`, `--label L`, `--dns NAME`, `--ip ADDRESS`, `--admin`.
 
 A node with an endpoint is a hub. Giving a client an endpoint makes it a hub
 once another client has actually reached it there; otherwise the endpoint is
@@ -115,7 +116,7 @@ Served on port 7948, reachable only from inside the mesh.
 |---|---|
 | `http://10.253.253.1:7948/` on every hub | Mesh map, node and link tables |
 | `/traffic` | Per-link traffic graphs with a time range |
-| `/api/nodes`, `/api/topology`, `/api/traffic`, `/api/policy` | Read-only JSON; `/api/nodes` filters by `label`, `role`, `name` |
+| `/api/nodes`, `/api/topology`, `/api/traffic`, `/api/policy`, `/api/dns` | Read-only JSON; `/api/nodes` filters by `label`, `role`, `name` |
 | `http://10.253.253.2:7948/metrics` on every hub | Prometheus text format |
 | `http://10.253.253.1:7948/admin` | Management page, on every node (see below) |
 
@@ -158,6 +159,25 @@ announced network is masqueraded behind the node's own address there. The
 hosts in that network therefore need no route to the mesh. If their router
 does have one and you want them to see the real source addresses, turn the
 masquerade off on the gateway with `meshbone local --nat off`.
+
+## DNS
+
+Every hub runs a resolver on the third cluster IP (`10.253.253.3` by default,
+also `dns.<zone>`), written in the script itself. It answers the mesh's zone
+from the directory and forwards everything else to the upstream resolvers.
+
+| Name | Resolves to |
+|---|---|
+| `<node>.<zone>` | the node's mesh address |
+| a node's own `--dns` names (bare: under the zone; dotted: as written) | the node |
+| `<label>.<zone>`, for labels that are valid host names | every node carrying the label |
+| `map.<zone>`, `metrics.<zone>`, `dns.<zone>` | the hubs' service addresses |
+| reverse names of mesh addresses | the node's name |
+
+The zone defaults to `<mesh>.internal`; `meshbone dns --zone home.example
+--upstream '9.9.9.9 1.1.1.1'` changes it for the whole mesh. Simple clients
+get the resolver and the zone in their config. On a full node,
+`meshbone local --dns on` points systemd-resolved at it for the zone only.
 
 ## Firewall
 

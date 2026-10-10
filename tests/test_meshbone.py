@@ -133,6 +133,7 @@ def invite(on, name, **k):
             desc=k.get("desc", ""),
             label=k.get("label", []),
             ip=k.get("ip", ""),
+            dns=k.get("dns", []),
         )
     )
     use(name)
@@ -179,6 +180,7 @@ S = lambda name, **k: A(
     label=k.get("label", []),
     no_label=k.get("no_label", False),
     verify=k.get("verify", True),
+    dns=k.get("dns"),
 )
 quiet = contextlib.redirect_stdout(io.StringIO())
 
@@ -238,6 +240,7 @@ assert peers[P["a"]]["allowed"] == {
     IP["adm"] + "/32",
     "10.253.253.1/32",
     "10.253.253.2/32",
+    "10.253.253.3/32",
 }  # nearest hub
 assert peers[P["b"]]["allowed"] == {IP["b"] + "/32"} and peers[P["a"]]["Endpoint"] == "a.example:51533"
 head, peers = wg("d")
@@ -756,11 +759,11 @@ assert (
 assert "chain mesh" not in gw and did("c", "sysctl", "-qw", "net.ipv4.ip_forward=1")
 assert ["FORWARD", "-i", "mb0", "-j", "ACCEPT"] in json.load(open(D("c") + "/fw.json"))
 use("c")
-m.cmd_local(A(listen_port=None, mtu=None, nat="off"))
+m.cmd_local(A(listen_port=None, mtu=None, nat="off", dns=None))
 assert did("c", "nft", "delete", "table", "inet", "meshbone") and not os.path.exists(
     D("c") + "/policy.nft"
 )  # routed, not hidden
-m.cmd_local(A(listen_port=None, mtu=None, nat="on"))
+m.cmd_local(A(listen_port=None, mtu=None, nat="on", dns=None))
 assert "masquerade" in nft("c")[-1]
 use("adm")
 expect_exit(lambda: m.cmd_policy(P_(add=["sub nets", "nodes", "deny"])), "cannot read selector")
@@ -841,6 +844,95 @@ with quiet:
     use("adm")
     m.cmd_policy(P_(clear=True))
 assert did("a", "nft", "delete", "table", "inet", "meshbone") and not os.path.exists(D("a") + "/policy.nft")
+
+# --- DNS: every node has a name, the resolver on the hubs' cluster IP answers the zone and forwards the rest
+import struct
+
+
+def q(name, qtype=1, qid=0x1234):
+    body = b"".join(bytes([len(l)]) + l.encode() for l in name.split(".")) + b"\x00"
+    return struct.pack("!HHHHHH", qid, 0x0100, 1, 0, 0, 0) + body + struct.pack("!HH", qtype, 1)
+
+
+def answers(reply):
+    qid, flags, qd, an = struct.unpack("!HHHH", reply[:8])
+    pos, out = 12, []
+    while reply[pos]:
+        pos += reply[pos] + 1
+    pos += 5
+    for _ in range(an):
+        rtype, _, _, rdlen = struct.unpack("!HHIH", reply[pos + 2 : pos + 12])
+        rdata = reply[pos + 12 : pos + 12 + rdlen]
+        out.append(str(m.IPv4Address(rdata)) if rtype == 1 else rdata)
+        pos += 12 + rdlen
+    return flags, out
+
+
+use("adm")
+d0 = m.dns_settings(mesh_)
+assert d0 == {"zone": "lab.internal", "upstream": ["1.1.1.1", "8.8.8.8"]}
+expect_exit(lambda: m.cmd_dns(A(zone="bad zone", upstream=None)), "not a domain name")
+expect_exit(lambda: m.cmd_dns(A(zone=None, upstream="1.1.1.1 nope")), "bad upstream")
+with quiet:
+    m.cmd_dns(A(zone="Home.Mesh", upstream="9.9.9.9, 1.1.1.1"))
+    m.cmd_set(S("c", dns=["files", "nas.example.org"]))
+expect_exit(lambda: m.cmd_set(S("c", dns=["bad_name"])), "not a host name")
+expect_exit(lambda: m.cmd_set(S("c", vip=["10.253.253.3"])), "belong to the hubs")
+use("a")
+assert m.dns_settings(mesh_) == {"zone": "home.mesh", "upstream": ["9.9.9.9", "1.1.1.1"]}  # settings travel, signed
+rec = m.dns_records(mesh_, m.load())
+assert [str(v) for v in rec["c.home.mesh"]] == [IP["c"]] and rec["files.home.mesh"] == rec["c.home.mesh"] == rec[
+    "nas.example.org"
+]
+assert sorted(str(v) for v in rec["edge.home.mesh"]) == sorted([IP["c"], ip("g")])  # a label is a group name
+assert str(rec["map.home.mesh"][0]) == "10.253.253.1" and str(rec["dns.home.mesh"][0]) == "10.253.253.3"
+assert rec[m.IPv4Address(IP["c"]).reverse_pointer] == ["c.home.mesh"]
+flags, got = answers(m.dns_answer(rec, "home.mesh", q("C.Home.Mesh")))
+assert got == [IP["c"]] and flags & 0x8400 == 0x8400 and flags & 0xF == 0  # authoritative, case does not matter
+assert answers(m.dns_answer(rec, "home.mesh", q("nobody.home.mesh")))[0] & 0xF == 3  # NXDOMAIN inside the zone
+assert answers(m.dns_answer(rec, "home.mesh", q("c.home.mesh", 28)))[1] == []  # AAAA: nothing, but no error
+assert m.dns_answer(rec, "home.mesh", q("www.example.com")) is None  # not ours: upstream
+assert m.dns_answer(rec, "home.mesh", q("1.1.1.1.in-addr.arpa", 12)) is None  # reverse of something else: upstream
+reply = m.dns_answer(rec, "home.mesh", q(m.IPv4Address(IP["c"]).reverse_pointer, 12))
+assert struct.unpack("!H", reply[6:8])[0] == 1 and b"\x01c\x04home\x04mesh\x00" in reply
+assert (
+    m.dns_answer(rec, "home.mesh", b"\x00\x01") is None
+    and m.dns_answer(rec, "home.mesh", q("c.home.mesh")[:20]) is None
+)
+real_fwd = m.dns_forward
+m.dns_forward = lambda up, query, tcp=False: b"UP:" + ",".join(up).encode() + query[:2]
+sent = m.dns_forward(["9.9.9.9"], q("x.org"))
+assert sent == b"UP:9.9.9.9\x12\x34"
+m.dns_forward = real_fwd
+use("adm")
+text = m.simple_config("phone")[0]
+assert "DNS = 10.253.253.3, home.mesh" in text
+assert did("a", "ip", "addr", "add", "10.253.253.3/32", "dev", "mbvip") and did(
+    "a", "systemctl", "start", "meshbone-dns.service"
+)
+assert ["INPUT", "-i", "mb0", "-p", "udp", "--dport", "53", "-j", "ACCEPT"] in json.load(open(D("a") + "/fw.json"))
+assert not did("c", "systemctl", "start", "meshbone-dns.service")
+page = R(pw="correct-horse")[1].decode()
+assert "<h2>DNS</h2>" in page and "home.mesh" in page and 'name=dns value="files nas.example.org"' in page
+R("POST", "correct-horse", form(csrf=csrf("correct-horse"), action="dns", zone="lab.test", upstream="1.1.1.1"))
+R(
+    "POST",
+    "correct-horse",
+    form(
+        csrf=csrf("correct-horse"),
+        action="set",
+        name="c",
+        subnets="10.3.0.0/24",
+        labels="edge x=1",
+        dns="",
+        desc="gw",
+        cost=42,
+    ),
+)
+use("a")
+assert m.dns_settings(mesh_)["zone"] == "lab.test" and m.load()[victim].get("dns") == []
+api = json.loads(G("/api/dns")[1])
+assert api["zone"] == "lab.test" and api["records"]["a.lab.test"] == [IP["a"]]
 
 # --- deploy over ssh through jump hosts, with and without passwords (ssh stubbed)
 assert m.parse_chain("u1@h1:u2@h2:10.9.9.9") == [("u1@h1", None), ("u2@h2", None), ("10.9.9.9", None)]

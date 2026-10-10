@@ -29,7 +29,7 @@ Any machine
                                 this machine becomes the first node and the first admin
   meshbone join FILE [--once]   FILE is the mesh config written by `invite`;
                                 --once keeps everything in /run (gone after reboot or `leave`)
-  meshbone local [--listen-port N] [--mtu N] [--nat on|off]
+  meshbone local [--listen-port N] [--mtu N] [--nat on|off] [--dns on|off]
                                 this machine's own network settings (also accepted by create, join and deploy)
   meshbone promote --endpoint HOST:PORT   ask to become a hub at this stable public address
   meshbone cost NAME MS         local penalty in ms for sending via hub NAME (0 = automatic)
@@ -55,6 +55,9 @@ Managing (the commands below, or http://10.253.253.1:7948/admin on any node)
                                 a client for a phone or any device that only runs plain WireGuard:
                                 writes a standard config (and shows a QR code); run it again to re-export
   meshbone approve NAME         accept a `promote` request
+  meshbone dns [--zone DOMAIN] [--upstream 'IP IP']
+                                the mesh's names: every node is <name>.<zone> (plus --dns names and labels);
+                                the resolver is cluster IP .3 on every hub, other names go upstream
   meshbone policy [--default allow|deny] [--add FROM TO allow|deny [--ports P] [--at N]] [--del N] [--clear]
                                 the firewall: who may open connections to whom across the mesh. FROM and TO
                                 are groups: a label, @name, nodes, hubs, clients, subnets, LABEL+net, any,
@@ -66,7 +69,8 @@ The file is laid out as model, view, controller - see the banners below.
 
 
 import argparse, base64, contextlib, fcntl, hashlib, hmac, html, io, json, os, random, re
-import secrets, shlex, shutil, socket, sqlite3, subprocess, sys, tarfile, tempfile, time, urllib.parse, urllib.request, zlib
+import secrets, select, shlex, shutil, socket, sqlite3, struct, subprocess, sys, tarfile, tempfile, time
+import urllib.parse, urllib.request, zlib
 from concurrent.futures import ThreadPoolExecutor
 from ipaddress import IPv4Address, IPv4Network, collapse_addresses
 
@@ -220,13 +224,18 @@ def metrics_vip(mesh):
     return cluster_net(mesh).network_address + 2
 
 
+def dns_vip(mesh):
+    return cluster_net(mesh).network_address + 3
+
+
 def router_ip(mesh, node_id):
     return mesh_net(mesh).network_address + node_id
 
 
 def held_vips(mesh, node):
-    """A node's cluster IPs; every hub also holds the two service addresses (map and metrics)."""
-    return node["vips"] + ([str(admin_vip(mesh)), str(metrics_vip(mesh))] if node["endpoint"] else [])
+    """A node's cluster IPs; every hub also holds the three service addresses (map, metrics, DNS)."""
+    service = [str(admin_vip(mesh)), str(metrics_vip(mesh)), str(dns_vip(mesh))]
+    return node["vips"] + (service if node["endpoint"] else [])
 
 
 def prefixes(mesh, node):
@@ -385,6 +394,7 @@ def wellformed(pk, n):
         assert all(isinstance(v, str) and str(IPv4Address(v)) == v for v in n["vips"])
         assert isinstance(n.get("desc", ""), str) and len(n.get("desc", "")) <= 200 and n.get("desc", "").isprintable()
         assert type(n.get("simple", False)) is bool
+        assert len(n.get("dns", [])) <= 8 and all(dns_name(d) == d for d in n.get("dns", []))
         assert len(n.get("labels", [])) <= 16 and all(
             isinstance(l, str) and re.fullmatch(LABEL_RE, l) for l in n.get("labels", [])
         )
@@ -435,6 +445,8 @@ def checked(mesh, nodes, nets, pk, n, keep=()):
         sys.exit(f"bad address: {e}")
     if "labels" in n:
         n["labels"] = listed(n["labels"])
+    if "dns" in n:
+        n["dns"] = [dns_name(d) or sys.exit(f"{d!r} is not a host name") for d in listed(n["dns"])]
     n["endpoint"] = norm_endpoint(n["endpoint"])
     if not wellformed(pk, n) or not n["id"] < mesh_net(mesh).num_addresses:
         sys.exit("bad name, endpoint, cost, description (200 printable characters) or label (letters, digits, _.:=/-)")
@@ -442,10 +454,10 @@ def checked(mesh, nodes, nets, pk, n, keep=()):
     if any(o["name"] == n["name"] for o in others.values()):
         sys.exit(f"name {n['name']} is already taken")
     for v in map(IPv4Address, n["vips"]):
-        if v not in cluster_net(mesh) or v in (admin_vip(mesh), metrics_vip(mesh)):
+        if v not in cluster_net(mesh) or v in (admin_vip(mesh), metrics_vip(mesh), dns_vip(mesh)):
             sys.exit(
                 f"{v} is not a free address in the cluster range {mesh['cluster_net']} "
-                f"({admin_vip(mesh)} and {metrics_vip(mesh)} belong to the hubs: map and metrics)"
+                f"({admin_vip(mesh)}, {metrics_vip(mesh)} and {dns_vip(mesh)} belong to the hubs: map, metrics, DNS)"
             )
     # A network may *contain* something more specific that exists elsewhere - the more specific one
     # keeps winning, on every node - but it may not be, or lie inside, what somebody already has.
@@ -707,7 +719,7 @@ def simple_config(name, hub=None, key=None):
     reach = [mesh["net"], mesh["cluster_net"]] + sorted({s for o in alive.values() for s in o["subnets"]})
     text = (
         f"# mesh {mesh['name']}: {name} via {hub}\n[Interface]\nPrivateKey = {key}\n"
-        f"Address = {router_ip(mesh, n['id'])}/32\n\n[Peer]\nPublicKey = {hub_pk}\n"
+        f"Address = {router_ip(mesh, n['id'])}/32\nDNS = {dns_vip(mesh)}, {dns_settings(mesh)['zone']}\n\n[Peer]\nPublicKey = {hub_pk}\n"
         f"PresharedKey = {pair_psk({'key': key, 'mesh': mesh}, hub_pk)}\nEndpoint = {h['endpoint']}\n"
         f"AllowedIPs = {', '.join(reach)}\nPersistentKeepalive = 25\n"
     )
@@ -1086,6 +1098,127 @@ def policy():
         return {"default": "allow", "rules": []}
 
 
+def dns_settings(mesh):
+    """The mesh's DNS: {zone, upstream}. The zone is where every node has a name; what is not
+    in it is asked of the upstream resolvers, in order."""
+    try:
+        d = json.loads(load_conf()["dns"]["value"])
+        assert dns_name(d["zone"]) and d["upstream"] and all(IPv4Address(u) for u in d["upstream"])
+        return {"zone": d["zone"].lower(), "upstream": d["upstream"]}
+    except (KeyError, ValueError, AssertionError, TypeError):
+        return {"zone": f"{mesh['name'].lower()}.internal", "upstream": ["1.1.1.1", "8.8.8.8"]}
+
+
+def dns_name(text):
+    """A host name: labels of letters, digits and hyphens, dots between -> lower case, or None."""
+    text = (text or "").strip(".").lower()
+    ok = (
+        text
+        and len(text) <= 253
+        and all(re.fullmatch(r"[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?", l) for l in text.split("."))
+    )
+    return text if ok else None
+
+
+def dns_records(mesh, nodes):
+    """What the resolver answers for the mesh's zone -> {name: [IPv4Address]} plus reverse names.
+
+    Every node is `<node>.<zone>` and may add names of its own (`--dns`): a bare name goes under
+    the zone, a dotted one is taken as written. A label that is a valid host name resolves to all
+    nodes carrying it. `map`, `metrics` and `dns` are the hubs' service addresses.
+    """
+    zone, alive = dns_settings(mesh)["zone"], live(nodes)
+    out = {}
+
+    def add(name, ip):
+        out.setdefault(name, [])
+        if ip not in out[name]:
+            out[name].append(ip)
+
+    for n in sorted(alive.values(), key=lambda n: n["id"]):
+        ip = router_ip(mesh, n["id"])
+        add(f"{n['name'].lower()}.{zone}", ip)
+        add(f"{ip.reverse_pointer}", n["name"].lower() + "." + zone)
+        for extra in n.get("dns", []):
+            add(extra if "." in extra else f"{extra}.{zone}", ip)
+    for n in alive.values():  # groups after names, so a node's own name is never shadowed
+        for label in n.get("labels", []):
+            name = dns_name(label)
+            if name and "." not in name and f"{name}.{zone}" not in out:
+                out[f"{name}.{zone}"] = []
+            if name and "." not in name and router_ip(mesh, n["id"]) not in out[f"{name}.{zone}"]:
+                out[f"{name}.{zone}"].append(router_ip(mesh, n["id"]))
+    for name, ip in (("map", admin_vip(mesh)), ("metrics", metrics_vip(mesh)), ("dns", dns_vip(mesh))):
+        add(f"{name}.{zone}", ip)
+    return out
+
+
+def dns_answer(records, zone, query):
+    """Reply to one DNS message from what we know -> bytes, or None when it is not ours to answer
+    (then it goes upstream). Pure: a question in, an answer out."""
+    try:
+        qid, flags, qd = struct.unpack("!HHH", query[:6])
+        if qd != 1 or flags & 0x8000:
+            return None
+        labels, pos = [], 12
+        while True:
+            n = query[pos]
+            pos += 1
+            if n == 0:
+                break
+            if n & 0xC0 or pos + n > len(query):
+                return None
+            labels.append(query[pos : pos + n].decode("ascii").lower())
+            pos += n
+        qtype, qclass = struct.unpack("!HH", query[pos : pos + 4])
+    except (struct.error, IndexError, UnicodeDecodeError):
+        return None
+    name = ".".join(labels)
+    ours = name == zone or name.endswith("." + zone) or name.endswith(".in-addr.arpa")
+    if not ours:
+        return None
+    question = query[12 : pos + 4]
+    rrs = []
+    if qclass == 1 and name in records:
+        for value in records[name]:
+            if qtype in (1, 255) and isinstance(value, IPv4Address):
+                rrs.append(struct.pack("!HHIH", 1, 1, 60, 4) + value.packed)
+            elif qtype in (12, 255) and isinstance(value, str):
+                rdata = b"".join(bytes([len(l)]) + l.encode() for l in value.split(".")) + b"\x00"
+                rrs.append(struct.pack("!HHIH", 12, 1, 60, len(rdata)) + rdata)
+    if name not in records and name.endswith(".in-addr.arpa"):
+        return None  # a reverse name that is not one of ours: let the upstream try
+    rcode = 0 if name in records else 3  # NXDOMAIN for a name in our zone that nobody has
+    head = struct.pack("!HHHHHH", qid, 0x8400 | (flags & 0x0100) | 0x0080 | rcode, 1, len(rrs), 0, 0)
+    return head + question + b"".join(b"\xc0\x0c" + rr for rr in rrs)
+
+
+def dns_forward(upstream, query, tcp=False):
+    """Ask the upstream resolvers in turn -> their raw reply, or a SERVFAIL."""
+    for server in upstream:
+        try:
+            if tcp:
+                with socket.create_connection((server, 53), timeout=3) as s:
+                    s.sendall(struct.pack("!H", len(query)) + query)
+                    size = struct.unpack("!H", s.recv(2))[0]
+                    reply = b""
+                    while len(reply) < size:
+                        part = s.recv(size - len(reply))
+                        if not part:
+                            break
+                        reply += part
+            else:
+                with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+                    s.settimeout(3)
+                    s.sendto(query, (server, 53))
+                    reply = s.recv(4096)
+            if reply[:2] == query[:2]:
+                return reply
+        except OSError:
+            continue
+    return query[:2] + struct.pack("!H", 0x8182) + query[4:6] + b"\x00\x00\x00\x00" + query[12:]  # SERVFAIL
+
+
 def parse_ports(text):
     """'tcp/22,443 udp/53 tcp/8000-8100' -> {"tcp": ["22", "443", "8000-8100"], "udp": ["53"]}; '' -> {} (all traffic)."""
     out = {}
@@ -1164,6 +1297,7 @@ def policy_ruleset(mesh, alive, pol):
         "ct state established,related accept",
         "meta l4proto icmp accept",
         f"{match('saddr', members('nodes', mesh, alive))}tcp dport {{ {GOSSIP_PORT}, {ADMIN_PORT} }} accept",
+        f"ip daddr {dns_vip(mesh)} meta l4proto {{ tcp, udp }} th dport 53 accept",
     ]
     for r in pol["rules"]:
         src, dst = members(r["from"], mesh, alive), members(r["to"], mesh, alive)
@@ -1329,6 +1463,89 @@ def apply_table(text):
         log(f"nftables table NOT applied (firewall policy, gateway NAT): {getattr(e, 'stderr', '') or e}")
 
 
+def resolver_loop(address):
+    """The DNS service: answer the zone from the directory, pass everything else upstream.
+    Serves UDP and TCP on `address`:53 until the process is stopped."""
+    loc = local()
+    mesh = loc["mesh"]
+    cache = {"stamp": None, "records": {}, "zone": "", "upstream": []}
+
+    def current():
+        try:
+            stamp = (os.stat(f"{DIR}/nodes.json").st_mtime_ns, os.stat(f"{DIR}/conf.json").st_mtime_ns)
+        except OSError:
+            stamp = None
+        if stamp != cache["stamp"]:
+            d = dns_settings(mesh)
+            cache.update(stamp=stamp, records=dns_records(mesh, load()), zone=d["zone"], upstream=d["upstream"])
+        return cache
+
+    def reply(query, tcp):
+        c = current()
+        return dns_answer(c["records"], c["zone"], query) or dns_forward(c["upstream"], query, tcp)
+
+    udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    tcp = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    for s in (udp, tcp):
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.setsockopt(socket.SOL_IP, 15, 1)  # IP_FREEBIND: the cluster IP may appear a moment later
+        s.bind((address, 53))
+    tcp.listen(16)
+
+    def over_tcp(conn):
+        with conn:
+            try:
+                conn.settimeout(10)
+                size = struct.unpack("!H", conn.recv(2))[0]
+                query = b""
+                while len(query) < size:
+                    part = conn.recv(size - len(query))
+                    if not part:
+                        return
+                    query += part
+                out = reply(query, True)
+                conn.sendall(struct.pack("!H", len(out)) + out)
+            except (OSError, struct.error):
+                pass
+
+    def over_udp(query, peer):
+        try:
+            udp.sendto(reply(query, False), peer)
+        except OSError:
+            pass
+
+    with ThreadPoolExecutor(PARALLEL) as pool:
+        while True:
+            ready, _, _ = select.select([udp, tcp], [], [])
+            for s in ready:
+                if s is udp:
+                    query, peer = udp.recvfrom(4096)
+                    if len(query) >= 12:
+                        pool.submit(over_udp, query, peer)
+                else:
+                    conn, _ = tcp.accept()
+                    pool.submit(over_tcp, conn)
+
+
+def set_resolver(on):
+    """Point this host at the mesh's resolver for the mesh zone -> what was done, as text.
+    Uses systemd-resolved's per-interface settings (split DNS); without it, says what to do."""
+    mesh = local()["mesh"]
+    d = dns_settings(mesh)
+    if not shutil.which("resolvectl"):
+        return (
+            f"no systemd-resolved here: point your resolver at {dns_vip(mesh)} for the domain {d['zone']} yourself"
+            if on
+            else "nothing to undo"
+        )
+    if on:
+        run("resolvectl", "dns", IFACE, str(dns_vip(mesh)), check=False)
+        run("resolvectl", "domain", IFACE, f"~{d['zone']}", "~in-addr.arpa", check=False)
+        return f"names under {d['zone']} are resolved through {dns_vip(mesh)}"
+    run("resolvectl", "revert", IFACE, check=False)
+    return "the mesh resolver is no longer used here"
+
+
 def resolve(host, port):
     """host -> 'ip:port', or None while DNS is unavailable (e.g. early at boot)."""
     try:
@@ -1452,7 +1669,7 @@ def reconcile():
         run("ip", "rule", "del", "pref", str(MESH_TABLE), check=False)
         firewall([])
         apply_table(None)
-        for unit in ("meshbone-serve.socket", "meshbone-admin.socket"):
+        for unit in ("meshbone-serve.socket", "meshbone-admin.socket", "meshbone-dns.service"):
             run("systemctl", "stop", unit, check=False)
         return
 
@@ -1505,6 +1722,8 @@ def reconcile():
         rules.append(["INPUT", "-i", IFACE, "-p", "tcp", "--dport", str(ADMIN_PORT), "-j", "ACCEPT"])
     if port:
         rules.append(["INPUT", "-p", "udp", "--dport", str(port), "-j", "ACCEPT"])
+    if hub:
+        rules += [["INPUT", "-i", IFACE, "-p", p, "--dport", "53", "-j", "ACCEPT"] for p in ("udp", "tcp")]
     if hub or me["subnets"]:
         rules += [["FORWARD", "-i", IFACE, "-j", "ACCEPT"], ["FORWARD", "-o", IFACE, "-j", "ACCEPT"]]
     firewall(rules)
@@ -1513,6 +1732,7 @@ def reconcile():
         write(f"{DIR}/state.json", json.dumps({"primary": primary, "rtt": rtt, "elsewhere": elsewhere}))
     run("systemctl", "start", "meshbone-serve.socket", check=False)
     run("systemctl", "start" if serves_admin else "stop", "meshbone-admin.socket", check=False)
+    run("systemctl", "start" if hub else "stop", "meshbone-dns.service", check=False)
 
 
 UNITS = {
@@ -1568,6 +1788,15 @@ Accept=yes
 MaxConnections=16
 IPAddressDeny=any
 IPAddressAllow={net} 127.0.0.0/8
+""",
+    "meshbone-dns.service": """[Unit]
+Description=meshbone DNS: the mesh's names, everything else forwarded
+After=network.target
+
+[Service]
+ExecStart={py} {bin} dnsd
+Restart=always
+RestartSec=3
 """,
     "meshbone-admin@.service": """[Unit]
 Description=meshbone admin page (per connection)
@@ -2074,6 +2303,7 @@ def view_api(mesh):
         ),
         ("/api/topology", "nodes plus every link with state, ping and whether it is in use (what the map draws)"),
         ("/api/policy", "the firewall policy: the default and the ordered rules"),
+        ("/api/dns", "the zone, the upstream resolvers and every name the mesh resolver answers"),
         (
             "/api/traffic",
             "per-link byte counts in buckets. <code>?from=UNIX&amp;to=UNIX</code> (default: last 6 h), "
@@ -2184,7 +2414,8 @@ def view_metrics(topo, totals):
     return ("\n".join(out) + "\n").encode()
 
 
-def view_admin(mesh, me, nodes, csrf, note, soft, until, held, origin, pol):
+def view_admin(mesh, me, nodes, csrf, note, soft, until, held, origin, pol, dns):
+    zone = dns["zone"]
     """The management page: nodes, adding one, software versions, the password."""
     out = [
         page_head(mesh, "manage", ""),
@@ -2203,7 +2434,7 @@ def view_admin(mesh, me, nodes, csrf, note, soft, until, held, origin, pol):
     out.append(
         "<h2>nodes</h2><p>A node with an endpoint is a hub: enter one and it becomes a hub once a client has reached it "
         "there; clear it and it is a client again.</p><div class=scroll><table>"
-        "<tr><th>role<th>name<th>address<th>endpoint<th>subnets<th>labels<th>description<th>cost (ms)<th>"
+        "<tr><th>role<th>name<th>address<th>endpoint<th>subnets<th>labels<th>DNS names<th>description<th>cost (ms)<th>"
     )
     for i, r in enumerate(nodes):
         approve = f" <button name=action value=approve>make hub at {esc(r['wants'])}</button>" if r["wants"] else ""
@@ -2217,6 +2448,7 @@ def view_admin(mesh, me, nodes, csrf, note, soft, until, held, origin, pol):
             f"<td><input form=f{i} name=endpoint value=\"{esc(r['endpoint'])}\" placeholder='host:port'>"
             f"<td><input form=f{i} name=subnets value=\"{esc(' '.join(r['subnets']))}\">"
             f"<td><input form=f{i} name=labels value=\"{esc(' '.join(r.get('labels', [])))}\">"
+            f"<td><input form=f{i} name=dns value=\"{esc(' '.join(r.get('dns', [])))}\" placeholder='{esc(r['name'])}.{esc(zone)}'>"
             f"<td><input form=f{i} class=w name=desc value=\"{esc(r.get('desc', ''))}\">"
             f"<td><input form=f{i} name=cost value={r['cost']}>"
             f"<td><form id=f{i} method=post>{hidden}<input type=hidden name=name value=\"{esc(r['name'])}\">"
@@ -2281,6 +2513,12 @@ def view_admin(mesh, me, nodes, csrf, note, soft, until, held, origin, pol):
         + "</pre></details>"
     )
     out.append(
+        f"<h2>DNS</h2><p>Every node is <code>&lt;name&gt;.{esc(zone)}</code>, plus the names in its DNS column; a label that is "
+        "a valid host name resolves to all nodes carrying it. The resolver is <code>"
+        f"{dns_vip(mesh)}</code> on every hub (also <code>dns.{esc(zone)}</code>); names outside the zone go to "
+        f"{esc(', '.join(dns['upstream']))}.</p><form method=post class=grid>{hidden}"
+        f"<input name=zone value=\"{esc(zone)}\"> <input class=w name=upstream value=\"{esc(' '.join(dns['upstream']))}\"> "
+        "<button name=action value=dns>save</button></form>"
         "<h2>firewall</h2><p>Who may open connections to whom across the mesh. Rules are tried from the top and the first "
         f"match decides; without a match the default applies, which is <b>{pol['default']}</b>. Answers, ping and the mesh's "
         "own ports always pass.</p><div class=scroll><table><tr><th>#<th>action<th>from<th>to<th>ports<th>"
@@ -2370,6 +2608,14 @@ def view_policy(pol):
             f"{i:>3}  {r['action']:<5} from {r['from']:<18} to {r['to']:<18} {r.get('ports') or 'all traffic'}"
         )
     return "\n".join(lines + ["always allowed: answers, ping, and the mesh's own ports between nodes"])
+
+
+def view_dns(settings, records):
+    lines = [f"zone {settings['zone']}, other names go to {' then '.join(settings['upstream'])}"]
+    for name, values in sorted(records.items()):
+        if not name.endswith(".in-addr.arpa"):
+            lines.append(f"  {name:<40} {', '.join(str(v) for v in values)}")
+    return "\n".join(lines)
 
 
 # ==============================================================================
@@ -2746,6 +2992,7 @@ def cmd_invite(a):
                     "seq": next_seq(),
                     "desc": getattr(a, "desc", "") or "",
                     "labels": getattr(a, "label", []) or [],
+                    "dns": getattr(a, "dns", []) or [],
                     **({"simple": True} if simple else {}),
                 },
             ),
@@ -2897,6 +3144,8 @@ def cmd_set(a):
             n["desc"] = a.desc
         if getattr(a, "label", None) or getattr(a, "no_label", False):
             n["labels"] = a.label
+        if getattr(a, "dns", None) is not None:
+            n["dns"] = a.dns
         n["seq"] = next_seq(n["seq"])
         sign(pk, checked(loc["mesh"], nodes, nets, pk, n, had))
     if n["endpoint"] and not was and getattr(a, "verify", True):
@@ -2911,12 +3160,16 @@ def cmd_local(a):
                 loc[k] = getattr(a, k)  # 0 puts it back to automatic
         if a.nat:
             loc["nat"] = a.nat == "on"
+        if a.dns:
+            loc["dns"] = a.dns == "on"
         write(f"{DIR}/node.json", json.dumps(loc))
         reconcile()
     print(
         f"listen port {loc.get('listen_port') or 'automatic'}, mtu {loc.get('mtu') or 1420}, "
-        f"gateway NAT {'on' if loc.get('nat', True) else 'off'}"
+        f"gateway NAT {'on' if loc.get('nat', True) else 'off'}, mesh resolver {'on' if loc.get('dns') else 'off'}"
     )
+    if a.dns:
+        print(set_resolver(a.dns == "on"))
 
 
 def cmd_promote(a):
@@ -2991,6 +3244,33 @@ def cmd_policy(a):
     print(view_policy(pol))
 
 
+def cmd_dns(a):
+    """Show or change the mesh's DNS: its zone and where other names are looked up."""
+    loc = local()
+    if a.zone or a.upstream:
+        with locked():
+            admin()
+            d = dns_settings(loc["mesh"])
+            if a.zone:
+                if not dns_name(a.zone):
+                    sys.exit(f"{a.zone!r} is not a domain name")
+                d["zone"] = dns_name(a.zone)
+            if a.upstream:
+                try:
+                    d["upstream"] = [str(IPv4Address(u)) for u in listed(a.upstream)]
+                except ValueError as e:
+                    sys.exit(f"bad upstream: {e}")
+            conf_put("dns", json.dumps(d))
+            reconcile()
+        gossip(flood=True)
+    print(view_dns(dns_settings(loc["mesh"]), dns_records(loc["mesh"], load())))
+
+
+def cmd_dnsd():
+    """The resolver process, on hubs; started by `sync`, kept alive by systemd."""
+    resolver_loop(str(dns_vip(local()["mesh"])))
+
+
 def cmd_simple(a):
     """Create a simple client, or export an existing one again (e.g. through another hub)."""
     if not any(n["name"] == a.name for n in live(load()).values()):
@@ -3049,7 +3329,13 @@ def cmd_status():
 
 
 def cmd_leave():
-    units = ["meshbone.timer", "meshbone.service", "meshbone-serve.socket", "meshbone-admin.socket"]
+    units = [
+        "meshbone.timer",
+        "meshbone.service",
+        "meshbone-serve.socket",
+        "meshbone-admin.socket",
+        "meshbone-dns.service",
+    ]
     run("systemctl", "disable", "--now", *units, check=False)
     firewall([])
     apply_table(None)
@@ -3098,7 +3384,26 @@ def cmd_check():
     view_map(mesh, topo), view_traffic(mesh), view_api(mesh), view_metrics(topo, traffic_totals())
     view_status(mesh, list(rows()), warnings(), ONCE, False, code_sha())
     if os.path.exists(f"{DIR}/admin.key"):
-        view_admin(mesh, nodes[loc["pub"]]["name"], list(rows()), "x", "", software(), None, True, "", policy())
+        view_admin(
+            mesh,
+            nodes[loc["pub"]]["name"],
+            list(rows()),
+            "x",
+            "",
+            software(),
+            None,
+            True,
+            "",
+            policy(),
+            dns_settings(mesh),
+        )
+    records = dns_records(mesh, nodes)
+    dns_answer(
+        records,
+        dns_settings(mesh)["zone"],
+        b"\x00\x01\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x03map\x00\x00\x01\x00\x01",
+    )
+    view_dns(dns_settings(mesh), records)
     mesh_table(policy_ruleset(mesh, live(nodes), policy()), gateway_ruleset(mesh, nodes[loc["pub"]], True))
     view_policy(policy())
     view_login(mesh, "s", "p", 0, "")
@@ -3180,6 +3485,10 @@ def web_policy(a):
     )
 
 
+def web_dns(a):
+    cmd_dns(argparse.Namespace(zone=a.zone, upstream=a.upstream))
+
+
 def simple_response(mesh, query, key=None):
     name, hub = query.get("name", [""])[0], query.get("hub", [None])[0]
     try:
@@ -3217,6 +3526,9 @@ def respond(method, path, headers, body, peer="127.0.0.1"):
         "/api/nodes": lambda: data(api_nodes(query)),
         "/api/topology": lambda: data(topology()),
         "/api/policy": lambda: data(policy()),
+        "/api/dns": lambda: data(
+            {**dns_settings(mesh), "records": {k: [str(x) for x in v] for k, v in dns_records(mesh, load()).items()}}
+        ),
         "/api/traffic": lambda: data(api_traffic(query)),
         "/metrics": lambda: (
             "200 OK",
@@ -3229,7 +3541,9 @@ def respond(method, path, headers, body, peer="127.0.0.1"):
         return public.get(route, public["/"])()
 
     form = (
-        {k: v[0] for k, v in urllib.parse.parse_qs(body.decode("utf-8", "replace")).items()} if method == "POST" else {}
+        {k: v[0] for k, v in urllib.parse.parse_qs(body.decode("utf-8", "replace"), keep_blank_values=True).items()}
+        if method == "POST"
+        else {}
     )
     sid = (re.search(r"(?:^|;\s*)mb=([\w-]{10,60})", headers.get("cookie", "")) or [None, None])[1]
     held, now = os.path.exists(f"{DIR}/admin.key"), int(time.time())
@@ -3294,6 +3608,9 @@ def respond(method, path, headers, body, peer="127.0.0.1"):
             verdict=form.get("verdict", ""),
             ports=form.get("ports", ""),
             rule=form.get("rule", "0"),
+            zone=form.get("zone", ""),
+            upstream=form.get("upstream", ""),
+            dns=listed(form.get("dns", "")) if "dns" in form else None,
             once=False,
             listen_port=None,
             mtu=None,
@@ -3315,6 +3632,7 @@ def respond(method, path, headers, body, peer="127.0.0.1"):
             "policy_add": web_policy,
             "policy_del": web_policy,
             "policy_default": web_policy,
+            "dns": web_dns,
         }
         try:
             a.cost = int(form.get("cost") or 0)
@@ -3343,7 +3661,9 @@ def respond(method, path, headers, body, peer="127.0.0.1"):
         origin = deploy_key()[1] if os.geteuid() == 0 else ""
     except (OSError, subprocess.CalledProcessError):
         origin = ""
-    return page(view_admin(mesh, me, list(rows()), csrf, note, software(), until, held, origin, policy()))
+    return page(
+        view_admin(mesh, me, list(rows()), csrf, note, software(), until, held, origin, policy(), dns_settings(mesh))
+    )
 
 
 def cmd_admin():
@@ -3377,6 +3697,9 @@ def main():
         s.add_argument("--subnet", action="append", default=[], help="network behind the node to announce")
         s.add_argument("--vip", action="append", default=[], help="cluster IP the node holds")
         s.add_argument("--cost", type=int, default=0, help="ms added when choosing this hub")
+        s.add_argument(
+            "--dns", action="append", default=[], help="extra DNS name for the node (bare: under the mesh zone)"
+        )
         s.add_argument("--desc", default="", help="free-text description")
         s.add_argument("--label", action="append", default=[], help="label, repeatable")
         s.add_argument("--ip", default="", help="mesh address to give the node (default: a free one)")
@@ -3392,6 +3715,9 @@ def main():
         s.add_argument("--mtu", type=int, help="tunnel MTU (default 1420)")
         s.add_argument(
             "--nat", choices=("on", "off"), help="as a gateway, hide the mesh behind this node's address (default on)"
+        )
+        s.add_argument(
+            "--dns", choices=("on", "off"), help="resolve the mesh's names through the mesh resolver on this host"
         )
 
     s = sub.add_parser("create")
@@ -3440,6 +3766,7 @@ def main():
     s.add_argument("--label", action="append", default=[])
     s.add_argument("--no-label", action="store_true")
     s.add_argument("--no-verify", dest="verify", action="store_false")
+    s.add_argument("--dns", action="append", help="extra DNS names; --dns '' removes them")
     local_options(sub.add_parser("local"))
     s = sub.add_parser("promote")
     s.add_argument("--endpoint", required=True, help="stable public HOST:PORT of this node; '' withdraws")
@@ -3455,6 +3782,9 @@ def main():
     s.add_argument("name")
     s.add_argument("--no-verify", dest="verify", action="store_false")
     sub.add_parser("revoke").add_argument("name")
+    s = sub.add_parser("dns")
+    s.add_argument("--zone", help="domain under which every node has a name (default <mesh>.internal)")
+    s.add_argument("--upstream", help="resolvers for every other name, e.g. '1.1.1.1 8.8.8.8'")
     s = sub.add_parser("policy")
     s.add_argument("--default", choices=("allow", "deny"), help="what happens to a new connection no rule matches")
     s.add_argument("--add", nargs=3, metavar=("FROM", "TO", "ACTION"), help="add a rule; ACTION is allow or deny")
@@ -3470,7 +3800,7 @@ def main():
     s.add_argument("--ref", help="branch, tag or commit (default main)")
     s.add_argument("--file", help="take the new version from a local file instead")
     s.add_argument("--rollback", action="store_true", help="publish the version this node ran before")
-    plain = ("install", "sync", "serve", "admin", "status", "leave", "upgrade", "passwd", "check", "health")
+    plain = ("install", "sync", "serve", "admin", "status", "leave", "upgrade", "passwd", "check", "health", "dnsd")
     for c in plain:
         sub.add_parser(c)
     a = p.parse_args()
