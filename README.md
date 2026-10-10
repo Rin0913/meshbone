@@ -22,6 +22,7 @@ routing daemon, and a public node needs exactly one forwarded UDP port.
 | **client** | A node behind NAT. It stays linked to every hub, sends through the one with the best ping, and moves to another within seconds if that hub dies. |
 | **simple client** | A phone or any device that only runs plain WireGuard. It gets a standard config (file or QR code) and uses a single hub. |
 | **admin** | Whoever has the admin key. Every directory entry is signed with it, directly on a node that stores `admin.key`, or through a short-lived token made in the browser. |
+| **managed hub** | A router (VyOS) that runs no meshbone: admin nodes push its WireGuard, routes and NAT over ssh. With an internet side it is the mesh's exit. |
 | **subnet** | A network behind a node, announced into the mesh. |
 | **cluster IP** | An address held by several nodes at once (anycast). Every hub holds two: the mesh map and the metrics endpoint. |
 
@@ -92,12 +93,13 @@ On an admin node:
 | `set NAME [options]` | Change a node |
 | `approve NAME`, `revoke NAME` | Accept a `promote` request; remove a node |
 | `dns [--zone DOMAIN] [--upstream 'IP IP']` | The mesh's names, see below |
+| `managed` | The ssh key managed routers must accept, and how each is doing |
 | `policy [--default allow\|deny] [--add FROM TO allow\|deny [--ports P] [--at N]] [--del N] [--clear]` | The firewall, see below |
 | `passwd` | Change the management page password |
 | `update URL [--ref REF]`, `update --file PATH`, `update --rollback` | Roll out a new version of meshbone itself, see below |
 
 Node options: `--endpoint HOST:PORT`, `--subnet CIDR`, `--vip IP`, `--cost MS`,
-`--desc TEXT`, `--label L`, `--dns NAME`, `--ip ADDRESS`, `--admin`.
+`--desc TEXT`, `--label L`, `--dns NAME`, `--public IP`, `--ip ADDRESS`, `--admin`.
 
 A node with an endpoint is a hub. Giving a client an endpoint makes it a hub
 once another client has actually reached it there; otherwise the endpoint is
@@ -159,6 +161,32 @@ announced network is masqueraded behind the node's own address there. The
 hosts in that network therefore need no route to the mesh. If their router
 does have one and you want them to see the real source addresses, turn the
 masquerade off on the gateway with `meshbone local --nat off`.
+
+## Public addresses through a managed router
+
+A router with a public prefix routed to it (a VyOS on a VPS, say) can join as a
+hub without running meshbone. Admin nodes configure it over ssh, from the same
+directory every hub's table is computed from:
+
+```bash
+sudo meshbone invite edge --driver vyos --endpoint edge.example.net:51820 --manage vyos@edge.example.net --wan eth0
+sudo meshbone managed                       # prints the ssh public key: add it to the router's user
+sudo meshbone set nas --public 203.0.113.70 # 1:1: inbound to the nas, the nas's internet out as that address
+```
+
+The router gets a WireGuard interface with a peer per node, static routes for
+the mesh and every subnet, and a destination and a source NAT rule per public
+address. A node with a public address needs no configuration: it sends its
+internet traffic through the router (the tunnel's own packets and everything
+with a more specific route stay where they were), and falls back to its own
+internet while the router is unreachable. Other hubs relay for it. Inbound
+traffic from the internet reaches such a node from the router, so give it a
+firewall policy if it should not be open.
+
+The router is pushed when its configuration changes and once an hour
+otherwise; only its own WireGuard peers, routes over that interface and NAT
+rules 5000-9095 are touched. Its handshakes stand in for the `sees` report a
+hub would send itself. It cannot serve the map, metrics or DNS.
 
 ## DNS
 

@@ -15,6 +15,10 @@ Roles
            key, so only admin nodes can add, change or revoke nodes - keep it
            off the exposed machines.
   subnet   a network announced into the mesh by a hub or client acting as gateway.
+  managed hub  a router (VyOS) we do not run meshbone on: admin nodes push its WireGuard,
+           routes and NAT over ssh. With --wan it is the mesh's internet exit: a node
+           given --public gets that address 1:1 (inbound and outbound), its internet
+           leaving through the router. It needs no configuration itself.
   cluster IP  an address several nodes hold at once (anycast): traffic goes to
            one that is alive. Every hub holds the first two: .1 is the mesh
            map, traffic graphs and JSON API, .2 the Prometheus /metrics
@@ -55,6 +59,7 @@ Managing (the commands below, or http://10.253.253.1:7948/admin on any node)
                                 a client for a phone or any device that only runs plain WireGuard:
                                 writes a standard config (and shows a QR code); run it again to re-export
   meshbone approve NAME         accept a `promote` request
+  meshbone managed              the ssh key managed routers must accept, and how each of them is doing
   meshbone dns [--zone DOMAIN] [--upstream 'IP IP']
                                 the mesh's names: every node is <name>.<zone> (plus --dns names and labels);
                                 the resolver is cluster IP .3 on every hub, other names go upstream
@@ -85,6 +90,10 @@ VERIFY_WAIT = 20  # how long join waits for the first handshakes (s)
 CONFIRM_WAIT = 60  # how long a new hub has to be reached from outside before it is demoted again (s)
 UPDATE_SETTLE = 10  # seconds a freshly upgraded node gets before its health is judged
 MESH_TABLE = 7948  # routing table (and rule priority) for packets that arrive from the mesh
+NAT_RULE_BASE = 5000  # VyOS NAT rule numbers for public addresses: base + node id
+
+
+EXIT_TABLE = 7949  # routing table (and fwmark) for a node whose internet goes out through the mesh
 SESSIONS = "/run/meshbone-sessions"  # web sessions that hold a token; gone at reboot
 SESSION_MAX = 12 * 3600  # the longest a token may be valid (s)
 SESSION = None  # (key, delegation) while a command or request may sign changes without the admin key file
@@ -239,9 +248,17 @@ def router_ip(mesh, node_id):
 
 
 def held_vips(mesh, node):
-    """A node's cluster IPs; every hub also holds the three service addresses (map, metrics, DNS)."""
+    """A node's cluster IPs; every hub that runs meshbone also holds the three service addresses
+    (map, metrics, DNS). A managed hub (a router we only configure) cannot serve them."""
     service = [str(admin_vip(mesh)), str(metrics_vip(mesh)), str(dns_vip(mesh))]
-    return node["vips"] + (service if node["endpoint"] else [])
+    return node["vips"] + (service if node["endpoint"] and not node.get("driver") else [])
+
+
+def exit_node(alive):
+    """The node that carries the internet traffic of nodes with a public address, if any."""
+    return next(
+        (pk for pk, n in sorted(alive.items(), key=lambda kv: kv[1]["id"]) if n.get("exit") and n["endpoint"]), None
+    )
 
 
 def prefixes(mesh, node):
@@ -401,6 +418,8 @@ def wellformed(pk, n):
         assert isinstance(n.get("desc", ""), str) and len(n.get("desc", "")) <= 200 and n.get("desc", "").isprintable()
         assert type(n.get("simple", False)) is bool
         assert len(n.get("dns", [])) <= 8 and all(dns_name(d) == d for d in n.get("dns", []))
+        assert n.get("driver", "") in ("", "vyos") and type(n.get("exit", False)) is bool
+        assert not n.get("public") or str(IPv4Address(n["public"])) == n["public"]
         assert len(n.get("labels", [])) <= 16 and all(
             isinstance(l, str) and re.fullmatch(LABEL_RE, l) for l in n.get("labels", [])
         )
@@ -454,11 +473,24 @@ def checked(mesh, nodes, nets, pk, n, keep=()):
     if "dns" in n:
         n["dns"] = [dns_name(d) or sys.exit(f"{d!r} is not a host name") for d in listed(n["dns"])]
     n["endpoint"] = norm_endpoint(n["endpoint"])
+    if n.get("public"):
+        try:
+            n["public"] = str(IPv4Address(n["public"]))
+        except ValueError as e:
+            sys.exit(f"bad public address: {e}")
+        if any(IPv4Address(n["public"]) in net for net in (mesh_net(mesh), cluster_net(mesh))):
+            sys.exit(f"{n['public']} is a mesh address, not a public one")
+    else:
+        n.pop("public", None)
+    if n.get("driver") and not n["endpoint"]:
+        sys.exit("a managed router is a hub: it needs an endpoint")
     if not wellformed(pk, n) or not n["id"] < mesh_net(mesh).num_addresses:
         sys.exit("bad name, endpoint, cost, description (200 printable characters) or label (letters, digits, _.:=/-)")
     others = {k: o for k, o in live(nodes).items() if k != pk}
     if any(o["name"] == n["name"] for o in others.values()):
         sys.exit(f"name {n['name']} is already taken")
+    if n.get("public") and any(o.get("public") == n["public"] for o in others.values()):
+        sys.exit(f"public address {n['public']} already belongs to another node")
     for v in map(IPv4Address, n["vips"]):
         if v not in cluster_net(mesh) or v in (admin_vip(mesh), metrics_vip(mesh), dns_vip(mesh)):
             sys.exit(
@@ -512,8 +544,9 @@ def merge(msg, only=None):
         return False
     mesh, nodes, nets = local()["mesh"], load(), load_nets()
     theirs = msg.get("nets")
-    if only:
-        theirs = {only: theirs[only]} if isinstance(theirs, dict) and only in theirs else {}
+    if only:  # a client speaks for itself - and, as an admin node, for the routers it manages
+        allowed = {only} | {k for k, n in nodes.items() if n.get("driver")}
+        theirs = {k: v for k, v in theirs.items() if k in allowed} if isinstance(theirs, dict) else {}
     conf = load_conf()
     a = lww(nodes, msg.get("nodes"), lambda pk, n: valid(mesh, pk, n))
     b = lww(nets, theirs, valid_nets)
@@ -633,9 +666,14 @@ def plan(loc, nodes, nets, rtt, seen, previous=None):
     on that hub and sends everything else through its primary hub: the reachable
     one with the best ping (plus cost), unless that hub does not currently see
     the destination and another one does.
+
+    The exit node, if there is one, gets everything else (0.0.0.0/0): on hubs, so
+    they relay for it and accept the internet's addresses from it; on a node with
+    a public address, whose internet goes out through it.
     """
     mesh, mypk, alive = loc["mesh"], loc["pub"], live(nodes)
-    hub = bool(alive[mypk]["endpoint"])
+    me = alive[mypk]
+    hub = bool(me["endpoint"])
     peers = {pk: n for pk, n in alive.items() if pk != mypk and (hub or n["endpoint"])}
     table = {pk: [] for pk in peers}
     if not peers:
@@ -644,6 +682,9 @@ def plan(loc, nodes, nets, rtt, seen, previous=None):
     for pk, n in alive.items():
         for p in prefixes(mesh, n):
             owners.setdefault(p, []).append(pk)
+    via_exit = exit_node(alive)
+    if via_exit in peers and (hub or me.get("public")):
+        table[via_exit].append(IPv4Network("0.0.0.0/0"))
     if hub:
         for p, own in owners.items():
             if mypk not in own:  # among several holders of a cluster IP: the one heard from last
@@ -707,7 +748,7 @@ def simple_config(name, hub=None, key=None):
     if not n.get("simple"):
         sys.exit(f"{name} is not a simple client")
     try:
-        key = key or password_box().decrypt(load_conf()[f"simple_{n['id']}"]["value"].encode()).decode()
+        key = key or kept_key(n["id"])
     except Exception:
         sys.exit(f"the key of {name} is only kept on nodes that hold the admin key; elsewhere its config is shown once")
     hubs = {
@@ -953,6 +994,9 @@ def topology():
                 "labels": n.get("labels", []),
                 "desc": n.get("desc", ""),
                 "simple": bool(n.get("simple")),
+                "managed": n.get("driver", ""),
+                "public": n.get("public", ""),
+                "exit": bool(n.get("exit")),
             }
         )
         for hpk, h in alive.items():
@@ -1086,7 +1130,7 @@ def software():
                 "update": nets.get(pk, {}).get("update") or {},
             }
             for pk, n in sorted(live(load()).items(), key=lambda kv: kv[1]["id"])
-            if not n.get("simple")
+            if not n.get("simple") and not n.get("driver")
         ],
         "log": audit_tail(),
         "mesh": loc["mesh"]["name"],
@@ -1113,6 +1157,123 @@ def dns_settings(mesh):
         return {"zone": d["zone"].lower(), "upstream": d["upstream"]}
     except (KeyError, ValueError, AssertionError, TypeError):
         return {"zone": f"{mesh['name'].lower()}.internal", "upstream": ["1.1.1.1", "8.8.8.8"]}
+
+
+def managed(mesh, nodes):
+    """The nodes we configure rather than run: {pubkey: {ssh, wan, wg}} from the signed settings."""
+    out = {}
+    for pk, n in live(nodes).items():
+        if n.get("driver"):
+            with contextlib.suppress(KeyError, ValueError, TypeError):
+                out[pk] = json.loads(load_conf()[f"managed_{n['id']}"]["value"])
+    return out
+
+
+def kept_key(node_id):
+    """The private key of a node whose key the admin nodes keep (simple and managed nodes)."""
+    conf = load_conf()
+    record = conf.get(f"node_{node_id}") or conf[f"simple_{node_id}"]
+    return password_box().decrypt(record["value"].encode()).decode()
+
+
+def managed_ssh_key():
+    """The ssh key admin nodes use for routers they manage -> (private key text, public line).
+    Made once per mesh, kept encrypted under the admin key; the public line goes on the routers."""
+    from cryptography.hazmat.primitives import serialization as ser
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+    conf = load_conf()
+    if "managed_key" not in conf:
+        key = Ed25519PrivateKey.generate()
+        private = key.private_bytes(ser.Encoding.PEM, ser.PrivateFormat.OpenSSH, ser.NoEncryption()).decode()
+        public = key.public_key().public_bytes(ser.Encoding.OpenSSH, ser.PublicFormat.OpenSSH).decode()
+        conf_put("managed_key", password_box().encrypt(private.encode()).decode())
+        conf_put("managed_pub", f"{public} meshbone-managed@{local()['mesh']['name']}")
+        conf = load_conf()
+    return password_box().decrypt(conf["managed_key"]["value"].encode()).decode(), conf["managed_pub"]["value"]
+
+
+def vyos_name(text):
+    return re.sub(r"[^A-Za-z0-9_-]", "-", text)
+
+
+def vyos_commands(mesh, nodes, pk, key, opts):
+    """Everything a VyOS router needs to be the hub `pk` -> list of `set ...` lines (pure).
+
+    Its WireGuard interface, a peer per node with the same allowed-ips a meshbone hub would
+    compute, static routes for the mesh's ranges and every subnet, and 1:1 NAT for the nodes
+    that have a public address: inbound to their mesh address, outbound from it.
+    """
+    alive, me = live(nodes), nodes[pk]
+    wg, wan = opts.get("wg", "wg0"), opts["wan"]
+    loc = {"key": key, "mesh": mesh, "pub": pk, "cost": {}}
+    table, _ = plan(loc, nodes, {}, {}, {})
+    port = int(me["endpoint"].rpartition(":")[2])
+    out = [
+        f"set interfaces wireguard {wg} description 'meshbone {mesh['name']}'",
+        f"set interfaces wireguard {wg} address {router_ip(mesh, me['id'])}/32",
+        f"set interfaces wireguard {wg} port {port}",
+        f"set interfaces wireguard {wg} private-key {key}",
+        f"set interfaces wireguard {wg} mtu 1420",
+    ]
+    for ppk, carried in sorted(table.items(), key=lambda kv: alive[kv[0]]["id"]):
+        n = alive[ppk]
+        peer = f"set interfaces wireguard {wg} peer {vyos_name(n['name'])}"
+        out += [f"{peer} public-key {ppk}", f"{peer} preshared-key {pair_psk(loc, ppk)}"]
+        out += [f"{peer} allowed-ips {p}" for p in sorted(carried)]
+        if n["endpoint"]:
+            host, _, pport = n["endpoint"].rpartition(":")
+            where = resolve(host, int(pport))
+            if where:
+                out += [f"{peer} address {where.rpartition(':')[0].strip('[]')}", f"{peer} port {pport}"]
+        out.append(f"{peer} persistent-keepalive 25")
+    nets = {mesh_net(mesh), cluster_net(mesh)} | {
+        IPv4Network(s) for k, n in alive.items() if k != pk for s in n["subnets"]
+    }
+    out += [f"set protocols static route {p} interface {wg}" for p in sorted(nets)]
+    for k, n in sorted(alive.items(), key=lambda kv: kv[1]["id"]):
+        if n.get("public") and k != pk:
+            rule, ip = NAT_RULE_BASE + n["id"], router_ip(mesh, n["id"])
+            out += [
+                f"set nat destination rule {rule} description 'meshbone {n['name']}'",
+                f"set nat destination rule {rule} inbound-interface name {wan}",
+                f"set nat destination rule {rule} destination address {n['public']}",
+                f"set nat destination rule {rule} translation address {ip}",
+                f"set nat source rule {rule} description 'meshbone {n['name']}'",
+                f"set nat source rule {rule} outbound-interface name {wan}",
+                f"set nat source rule {rule} source address {ip}",
+                f"set nat source rule {rule} translation address {n['public']}",
+            ]
+    return out
+
+
+def vyos_deletes(current, opts):
+    """What to remove from a router's running configuration before our commands -> delete lines.
+    Only what is ours: the WireGuard interface's peers, static routes over it, NAT rules in our range."""
+    wg, out = opts.get("wg", "wg0"), []
+    seen = set()
+    for line in current.splitlines():
+        m = re.match(rf"set interfaces wireguard {re.escape(wg)} peer (\S+)", line)
+        if m:
+            seen.add(f"delete interfaces wireguard {wg} peer {m[1]}")
+        m = re.match(rf"set protocols static route (\S+) interface {re.escape(wg)}\b", line)
+        if m:
+            seen.add(f"delete protocols static route {m[1]} interface {wg}")
+        m = re.match(r"set nat (source|destination) rule (\d+) ", line)
+        if m and NAT_RULE_BASE <= int(m[2]) < NAT_RULE_BASE + 4096:
+            seen.add(f"delete nat {m[1]} rule {m[2]}")
+    out = sorted(seen)
+    return out
+
+
+def vyos_script(deletes, sets):
+    """A configuration session for VyOS's own shell: apply everything in one commit, keep it
+    across reboots, and undo it all if the commit is refused."""
+    body = "\n".join(deletes + sets)
+    return (
+        "#!/bin/vbash\nsource /opt/vyatta/etc/functions/script-template\nconfigure\n"
+        f"{body}\ncommit || {{ echo MESHBONE-COMMIT-FAILED; exit discard; exit 1; }}\nsave\nexit\necho MESHBONE-APPLIED\n"
+    )
 
 
 def dns_name(text):
@@ -1408,13 +1569,14 @@ def sync_vips(want):
         run("ip", "addr", "del", f"{ip}/32", "dev", "mbvip", check=False)
 
 
-def sync_routes(want, src):
+def sync_routes(want, src, relay=()):
     """Route exactly these prefixes into the mesh. Returns the ones this host already sends elsewhere.
 
     Packets that arrive *from* the mesh are looked up in a table of our own first, so relaying -
     a hub handing traffic on, a gateway receiving it - never depends on what else the host
     routes. For traffic the machine itself originates, the prefixes go into the main table,
-    but only where nothing else claims them: a route somebody put there stays.
+    but only where nothing else claims them: a route somebody put there stays. `relay` prefixes
+    (the internet, on a hub) go into the relay table only.
     """
 
     def held(*where):
@@ -1424,10 +1586,10 @@ def sync_routes(want, src):
                 out.add(IPv4Network(r["dst"]))
         return out
 
-    ours = held("dev", IFACE, "table", str(MESH_TABLE))
-    for p in want - ours:
+    ours, table = held("dev", IFACE, "table", str(MESH_TABLE)), want | set(relay)
+    for p in table - ours:
         run("ip", "route", "replace", str(p), "dev", IFACE, "table", str(MESH_TABLE), check=False)
-    for p in ours - want:
+    for p in ours - table:
         run("ip", "route", "del", str(p), "table", str(MESH_TABLE), check=False)
     if not ip_json("rule", "show", "pref", str(MESH_TABLE)):
         run("ip", "rule", "add", "iif", IFACE, "lookup", str(MESH_TABLE), "pref", str(MESH_TABLE), check=False)
@@ -1441,6 +1603,38 @@ def sync_routes(want, src):
     for p in main - want:
         run("ip", "route", "del", str(p), "dev", IFACE, check=False)
     return sorted(str(p) for p in elsewhere)
+
+
+def sync_exit(on):
+    """Send this host's own internet traffic into the mesh (to the exit node), or stop doing so.
+
+    The tunnel's own packets carry a mark and keep using the main table, so the tunnel does
+    not try to carry itself; everything the main table has no specific route for goes to the
+    mesh interface. The LAN, the mesh and announced subnets keep their specific routes.
+    """
+    have = bool(ip_json("rule", "show", "pref", str(EXIT_TABLE)))
+    if on and not have:
+        run("wg", "set", IFACE, "fwmark", str(EXIT_TABLE), check=False)
+        run("ip", "route", "replace", "default", "dev", IFACE, "table", str(EXIT_TABLE), check=False)
+        run("ip", "rule", "add", "lookup", "main", "suppress_prefixlength", "0", "pref", str(EXIT_TABLE), check=False)
+        run(
+            "ip",
+            "rule",
+            "add",
+            "not",
+            "fwmark",
+            str(EXIT_TABLE),
+            "lookup",
+            str(EXIT_TABLE),
+            "pref",
+            str(EXIT_TABLE + 1),
+            check=False,
+        )
+    elif have and not on:
+        for pref in (EXIT_TABLE, EXIT_TABLE + 1):
+            run("ip", "rule", "del", "pref", str(pref), check=False)
+        run("ip", "route", "flush", "table", str(EXIT_TABLE), check=False)
+        run("wg", "set", IFACE, "fwmark", "0", check=False)
 
 
 def firewall(want):
@@ -1687,6 +1881,7 @@ def reconcile():
     if not active:  # revoked: take everything down
         run("ip", "link", "del", IFACE, check=False)
         run("ip", "rule", "del", "pref", str(MESH_TABLE), check=False)
+        sync_exit(False)
         firewall([])
         apply_table(None)
         for name in ("meshbone-serve.socket", "meshbone-admin.socket", "meshbone-dns.service"):
@@ -1732,7 +1927,12 @@ def reconcile():
         if not any(IPv4Network(s).subnet_of(IPv4Network(l)) for l in attached)
         and not any(u in IPv4Network(s) for u in underlay)
     }
-    elsewhere = sync_routes(routes, my_ip)
+    via_exit = exit_node(alive)
+    relay = [IPv4Network("0.0.0.0/0")] if hub and via_exit and via_exit != mypk else []
+    elsewhere = sync_routes(routes, my_ip, relay)
+    sync_exit(bool(me.get("public")) and via_exit in rtt)
+    if os.path.exists(f"{DIR}/admin.key") and any(n.get("driver") for n in alive.values()):
+        manage_routers()
     if hub:
         record_stats(me["id"], alive, nets, rtt)
 
@@ -1893,6 +2093,74 @@ def deploy_key():
         )
     with open(path + ".pub") as f:
         return path, f.read().strip()
+
+
+def router_run(opts, identity, command, stdin=None):
+    """Run a command on a managed router over ssh -> its output. Raises on failure."""
+    hops = parse_chain(opts["ssh"])
+    with ssh_session(hops, identity) as base:
+        argv = remote_argv(
+            base + ["-o", "BatchMode=yes", "-o", "ConnectTimeout=15"], [d for d, _ in hops], command, len(hops) > 1
+        )
+        r = subprocess.run(
+            argv,
+            input=(stdin or "").encode(),
+            capture_output=True,
+            timeout=120,
+        )
+        if r.returncode:
+            raise OSError(
+                (r.stderr or r.stdout).decode("utf-8", "replace").strip()[-300:] or f"ssh exit {r.returncode}"
+            )
+        return r.stdout.decode("utf-8", "replace")
+
+
+def manage_routers():
+    """On an admin node: keep every managed router configured, and report what it sees.
+
+    The router's configuration is derived from the directory the same way a hub's own is;
+    it is pushed when it changes (or hourly, in case somebody edited the router by hand),
+    and its WireGuard handshakes stand in for the `sees` report a hub would send itself.
+    """
+    loc, nodes, nets = local(), load(), load_nets()
+    mesh, alive = loc["mesh"], live(nodes)
+    state_ = read_json("managed.json", {})
+    changed = False
+    for pk, opts in managed(mesh, nodes).items():
+        n, st = alive[pk], state_.setdefault(pk, {})
+        try:
+            key = kept_key(n["id"])
+            identity = managed_ssh_key()[0]
+            sets = vyos_commands(mesh, nodes, pk, key, opts)
+            digest = hashlib.sha256("\n".join(sets).encode()).hexdigest()
+            if st.get("applied") != digest or time.time() - st.get("at", 0) > 3600:
+                current = router_run(
+                    opts, identity, "/opt/vyatta/bin/vyatta-op-cmd-wrapper show configuration commands"
+                )
+                out = router_run(opts, identity, "vbash -s", vyos_script(vyos_deletes(current, opts), sets))
+                if "MESHBONE-APPLIED" not in out:
+                    raise OSError("the router refused the configuration: " + out.strip()[-300:])
+                st.update(applied=digest, at=int(time.time()), error="")
+                audit("router-configured", node=n["name"], peers=len(sets))
+            shakes = router_run(opts, identity, f"sudo wg show {opts.get('wg', 'wg0')} latest-handshakes")
+            now, sees = time.time(), []
+            for line in shakes.splitlines():
+                peer, _, ts = line.partition("\t")
+                if ts.strip().isdigit() and int(ts) and now - int(ts) < FRESH and peer in alive:
+                    sees.append(alive[peer]["id"])
+            report = {"nets": [], "wants": "", "sees": sorted(sees), "code": "managed"}
+            if {k: v for k, v in nets.get(pk, {}).items() if k != "seq"} != report:
+                nets[pk] = {**report, "seq": next_seq(nets.get(pk, {}).get("seq", 0))}
+                changed = True
+            st["error"] = ""
+        except (OSError, KeyError, ValueError, subprocess.TimeoutExpired) as e:
+            if st.get("error") != str(e)[:200]:
+                log(f"managed router {n['name']}: {e}")
+            st["error"] = str(e)[:200]
+    if changed:
+        save_nets(nets)
+    write(f"{DIR}/managed.json", json.dumps(state_))
+    return state_
 
 
 @contextlib.contextmanager
@@ -2276,11 +2544,13 @@ def view_map(mesh, topo):
             + (" · admin" if n["admin"] else "")
             + (" · simple" if n["simple"] else "")
         )
+        role += f" · managed ({n['managed']})" if n["managed"] else ""
+        role += " · exit" if n["exit"] else ""
         out.append(
             f"<tr><td>{role}<td><b>{esc(n['name'])}</b><td class=m>{n['ip']}<td class=m>{esc(n['endpoint'] or 'behind NAT')}"
             f"<td class=m>{esc(' '.join(n['subnets'] + ['vip ' + v for v in n['vips']]) or '-')}"
             f"<td>{esc(via or ('-' if n['hub'] else 'not connected'))}<td>{esc(seen_by)}<td>{tags(n['labels'])}"
-            f"<td>{esc(n['desc'] or '-')}"
+            f"<td>{esc(n['desc'] or '-')}{(' · public ' + esc(n['public'])) if n['public'] else ''}"
         )
     out.append(
         "</table></div><h2>links</h2><div class=scroll><table><tr><th>from<th>to<th>state<th class=n>ping"
@@ -2454,7 +2724,7 @@ def view_admin(mesh, me, nodes, csrf, note, soft, until, held, origin, pol, dns)
     out.append(
         "<h2>nodes</h2><p>A node with an endpoint is a hub: enter one and it becomes a hub once a client has reached it "
         "there; clear it and it is a client again.</p><div class=scroll><table>"
-        "<tr><th>role<th>name<th>address<th>endpoint<th>subnets<th>labels<th>DNS names<th>description<th>cost (ms)<th>"
+        "<tr><th>role<th>name<th>address<th>endpoint<th>subnets<th>labels<th>DNS names<th>description<th>public IP<th>cost (ms)<th>"
     )
     for i, r in enumerate(nodes):
         approve = f" <button name=action value=approve>make hub at {esc(r['wants'])}</button>" if r["wants"] else ""
@@ -2470,6 +2740,7 @@ def view_admin(mesh, me, nodes, csrf, note, soft, until, held, origin, pol, dns)
             f"<td><input form=f{i} name=labels value=\"{esc(' '.join(r.get('labels', [])))}\">"
             f"<td><input form=f{i} name=dns value=\"{esc(' '.join(r.get('dns', [])))}\" placeholder='{esc(r['name'])}.{esc(zone)}'>"
             f"<td><input form=f{i} class=w name=desc value=\"{esc(r.get('desc', ''))}\">"
+            f"<td><input form=f{i} name=public value=\"{esc(r.get('public', ''))}\" placeholder='via the exit router'>"
             f"<td><input form=f{i} name=cost value={r['cost']}>"
             f"<td><form id=f{i} method=post>{hidden}<input type=hidden name=name value=\"{esc(r['name'])}\">"
             f"<button name=action value=set>save</button> <button name=action value=revoke>revoke</button>"
@@ -2635,6 +2906,18 @@ def view_dns(settings, records):
     for name, values in sorted(records.items()):
         if not name.endswith(".in-addr.arpa"):
             lines.append(f"  {name:<40} {', '.join(str(v) for v in values)}")
+    return "\n".join(lines)
+
+
+def view_managed(mesh, nodes, state_, pub):
+    lines = [f"ssh public key for managed routers (add it to their meshbone user):\n  {pub}"]
+    for pk, opts in managed(mesh, nodes).items():
+        n, st = live(nodes)[pk], state_.get(pk, {})
+        when = time.strftime("%H:%M", time.localtime(st["at"])) if st.get("at") else "never"
+        lines.append(
+            f"{n['name']:<16} {opts['ssh']:<28} wan {opts['wan']}, {opts.get('wg', 'wg0')}: configured {when}"
+            + (f"  ERROR {st['error']}" if st.get("error") else "")
+        )
     return "\n".join(lines)
 
 
@@ -3003,9 +3286,15 @@ def cmd_invite(a):
             if not free:
                 sys.exit("the mesh range has no free address for this role")
             node_id = random.choice(free)
-        simple = getattr(a, "simple", False)
+        simple, driver = getattr(a, "simple", False), getattr(a, "driver", "") or ""
         if simple and (a.endpoint or a.subnet or a.vip or a.admin):
             sys.exit("a simple client only gets an address: no endpoint, subnets, cluster IPs or admin key")
+        if driver and not (getattr(a, "manage", "") and getattr(a, "wan", "")):
+            sys.exit(
+                "a managed router needs --manage USER@HOST (its ssh login) and --wan INTERFACE (its internet side)"
+            )
+        if driver and not os.path.exists(f"{DIR}/admin.key"):
+            sys.exit("a managed router is set up from a node that holds the admin key")
         nodes[pub] = sign(
             pub,
             checked(
@@ -3024,15 +3313,29 @@ def cmd_invite(a):
                     "desc": getattr(a, "desc", "") or "",
                     "labels": getattr(a, "label", []) or [],
                     "dns": getattr(a, "dns", []) or [],
+                    **({"public": a.public} if getattr(a, "public", "") else {}),
                     **({"simple": True} if simple else {}),
+                    **({"driver": driver, "exit": getattr(a, "exit", None) is not False} if driver else {}),
                 },
             ),
         )
         if simple:
             ISSUED[a.name] = key
             if os.path.exists(f"{DIR}/admin.key"):  # kept encrypted with the admin nodes, to show the config again
-                conf_put(f"simple_{node_id}", password_box().encrypt(key.encode()).decode())
+                conf_put(f"node_{node_id}", password_box().encrypt(key.encode()).decode())
+        if driver:  # the router's key and how to reach it stay with the admin nodes, who configure it
+            conf_put(f"node_{node_id}", password_box().encrypt(key.encode()).decode())
+            conf_put(
+                f"managed_{node_id}", json.dumps({"ssh": a.manage, "wan": a.wan, "wg": getattr(a, "wg", "") or "wg0"})
+            )
+            managed_ssh_key()
     if simple:
+        return
+    if driver:
+        print(
+            f"{a.name} is a managed hub; it is configured over ssh from the admin nodes, and must accept this key:\n"
+            f"  {managed_ssh_key()[1]}\nsee `meshbone managed`"
+        )
         return
     out = a.out or f"{a.name}.mesh.json"
     cfg = {**state(), "mesh": mesh, "key": key}
@@ -3177,9 +3480,13 @@ def cmd_set(a):
             n["labels"] = a.label
         if getattr(a, "dns", None) is not None:
             n["dns"] = a.dns
+        if getattr(a, "public", None) is not None:
+            n["public"] = a.public
+        if getattr(a, "exit", None) is not None:
+            n["exit"] = a.exit
         n["seq"] = next_seq(n["seq"])
         sign(pk, checked(loc["mesh"], nodes, nets, pk, n, had))
-    if n["endpoint"] and not was and getattr(a, "verify", True):
+    if n["endpoint"] and not was and getattr(a, "verify", True) and not n.get("driver"):
         confirm_hub(a.name)
 
 
@@ -3297,6 +3604,12 @@ def cmd_dns(a):
     print(view_dns(dns_settings(loc["mesh"]), dns_records(loc["mesh"], load())))
 
 
+def cmd_managed():
+    """Show the key managed routers must accept, and how each of them is doing."""
+    loc = local()
+    print(view_managed(loc["mesh"], load(), read_json("managed.json", {}), managed_ssh_key()[1]))
+
+
 def cmd_dnsd():
     """The resolver process, on hubs; started by `sync`, kept alive by systemd."""
     resolver_loop(str(dns_vip(local()["mesh"])))
@@ -3371,6 +3684,7 @@ def cmd_leave():
     firewall([])
     apply_table(None)
     run("ip", "rule", "del", "pref", str(MESH_TABLE), check=False)
+    sync_exit(False)
     for ifn in (IFACE, "mbvip"):
         run("ip", "link", "del", ifn, check=False)
     for path in [f"{UNIT_DIR}/{name}" for name in UNITS]:
@@ -3440,6 +3754,10 @@ def cmd_check():
     view_login(mesh, "s", "p", 0, "")
     for text in UNITS.values():
         text.format(py="p", bin="b", port=1, net=mesh["net"], vip="v", aport=2)
+    for pk, opts in managed(mesh, nodes).items():
+        vyos_script(
+            vyos_deletes("", opts), vyos_commands(mesh, nodes, pk, "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=", opts)
+        )
     build_parser()
     print("ok")
 
@@ -3643,6 +3961,8 @@ def respond(method, path, headers, body, peer="127.0.0.1"):
             zone=form.get("zone", ""),
             upstream=form.get("upstream", ""),
             dns=listed(form.get("dns", "")) if "dns" in form else None,
+            public=form.get("public", "").strip() if "public" in form else None,
+            exit=None,
             once=False,
             listen_port=None,
             mtu=None,
@@ -3732,6 +4052,7 @@ def build_parser():
         s.add_argument(
             "--dns", action="append", default=[], help="extra DNS name for the node (bare: under the mesh zone)"
         )
+        s.add_argument("--public", default="", help="public address the exit router maps 1:1 onto this node")
         s.add_argument("--desc", default="", help="free-text description")
         s.add_argument("--label", action="append", default=[], help="label, repeatable")
         s.add_argument("--ip", default="", help="mesh address to give the node (default: a free one)")
@@ -3767,6 +4088,15 @@ def build_parser():
     s.add_argument("--endpoint", default="", help="public HOST:PORT; makes the new node a hub")
     node_options(s)
     s.add_argument("--admin", action="store_true", help="the new node also gets admin.key and can manage the mesh")
+    s.add_argument(
+        "--driver", choices=("vyos",), default="", help="a router we configure over ssh instead of running meshbone on"
+    )
+    s.add_argument("--manage", default="", help="ssh login of the managed router, e.g. vyos@203.0.113.9")
+    s.add_argument("--wan", default="", help="the managed router's internet-facing interface, e.g. eth0")
+    s.add_argument("--wg", default="", help="WireGuard interface name on the managed router (default wg0)")
+    s.add_argument(
+        "--no-exit", dest="exit", action="store_false", help="do not use the managed router as the internet exit"
+    )
     s.add_argument("-o", "--out")
     s = sub.add_parser("deploy")
     s.add_argument("name")
@@ -3799,6 +4129,9 @@ def build_parser():
     s.add_argument("--no-label", action="store_true")
     s.add_argument("--no-verify", dest="verify", action="store_false")
     s.add_argument("--dns", action="append", help="extra DNS names; --dns '' removes them")
+    s.add_argument("--public", help="public address for the node; --public '' removes it")
+    s.add_argument("--exit", dest="exit", action="store_const", const=True, help="make this hub the internet exit")
+    s.add_argument("--no-exit", dest="exit", action="store_const", const=False)
     local_options(sub.add_parser("local"))
     s = sub.add_parser("promote")
     s.add_argument("--endpoint", required=True, help="stable public HOST:PORT of this node; '' withdraws")
@@ -3832,7 +4165,20 @@ def build_parser():
     s.add_argument("--ref", help="branch, tag or commit (default main)")
     s.add_argument("--file", help="take the new version from a local file instead")
     s.add_argument("--rollback", action="store_true", help="publish the version this node ran before")
-    plain = ("install", "sync", "serve", "admin", "status", "leave", "upgrade", "passwd", "check", "health", "dnsd")
+    plain = (
+        "install",
+        "sync",
+        "serve",
+        "admin",
+        "status",
+        "leave",
+        "upgrade",
+        "passwd",
+        "check",
+        "health",
+        "dnsd",
+        "managed",
+    )
     for c in plain:
         sub.add_parser(c)
     return p, plain
