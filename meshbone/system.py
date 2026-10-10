@@ -195,12 +195,11 @@ def apply_table(text):
         return
     try:
         in_place = os.path.exists(path) and store.read("policy.nft") == text.strip()
-        if in_place and run("nft", "list", "table", "inet", "meshbone", check=False):
-            return
-        run("nft", "-f", "-", input=text)
-        store.write(path, text)
+        if not (in_place and run("nft", "list", "table", "inet", "meshbone", check=False)):
+            run("nft", "-f", "-", input=text)
+            store.write(path, text)
         st = store.read_json("state.json", {})
-        if st.get("nft_error"):  # applied again after a failure: the problem is over
+        if st.get("nft_error"):  # in place again after a failure: the problem is over
             store.write(f"{settings.DIR}/state.json", json.dumps({**st, "nft_error": ""}))
     except (OSError, subprocess.CalledProcessError) as e:
         why = str(getattr(e, "stderr", "") or e)[:200]
