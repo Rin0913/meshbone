@@ -617,7 +617,7 @@ def topology():
     """The whole mesh as its nodes report it: every node, and every link with state and latency."""
     loc, nodes, nets = store.local(), store.load(), store.load_nets()
     mesh, alive = loc["mesh"], store.live(nodes)
-    out = {"nodes": [], "links": []}
+    out = {"nodes": [], "links": [], "mesh": mesh["name"]}
     try:  # bytes over the last hour, as counted by the hub end: {(hub id, peer id): (received, sent)}
         db = stats_db()
         hour = {

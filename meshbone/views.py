@@ -28,15 +28,24 @@ pre{padding:10px;border:1px solid var(--line);border-radius:6px;white-space:pre-
 MAP_SCRIPT = """<script>
 const T = __DATA__, cv = document.getElementById('map'), g = cv.getContext('2d');
 const css = v => getComputedStyle(document.documentElement).getPropertyValue(v).trim();
-function draw() {
-  const W = cv.clientWidth, H = Math.max(380, Math.min(680, W * 0.62)), k = devicePixelRatio || 1;
-  cv.width = W * k; cv.height = H * k; cv.style.height = H + 'px'; g.setTransform(k, 0, 0, k, 0, 0); g.clearRect(0, 0, W, H);
-  const hubs = T.nodes.filter(n => n.hub), pos = {}, cx = W / 2, cy = H / 2;
+const KEY = 'meshbone-map-' + (T.mesh || ''), hubs = T.nodes.filter(n => n.hub), clients = T.nodes.filter(n => !n.hub);
+let saved = {}; try { saved = JSON.parse(localStorage.getItem(KEY) || '{}'); } catch (e) {}
+let pos = {}, drag = null;
+function layout(W, H) {                          // hubs on an inner ring, clients on an outer one; saved drags win
+  const cx = W / 2, cy = H / 2;
   const sendsVia = n => { const l = T.links.find(l => l.a === n.id && l.primary); return l ? hubs.findIndex(h => h.id === l.b) : hubs.length; };
-  const clients = T.nodes.filter(n => !n.hub).sort((a, b) => sendsVia(a) - sendsVia(b) || a.id - b.id);
-  const r1 = hubs.length > 1 ? Math.min(W, H) * 0.24 : 0;
+  const order = clients.slice().sort((a, b) => sendsVia(a) - sendsVia(b) || a.id - b.id);
+  const r1 = hubs.length > 1 ? Math.min(W, H) * 0.16 : 0;
   hubs.forEach((n, i) => { const a = 2 * Math.PI * i / hubs.length - Math.PI / 2; pos[n.id] = [cx + r1 * Math.cos(a), cy + r1 * Math.sin(a)]; });
-  clients.forEach((n, i) => { const a = 2 * Math.PI * (i + 0.5) / clients.length - Math.PI / 2; pos[n.id] = [cx + W * 0.36 * Math.cos(a), cy + H * 0.33 * Math.sin(a)]; });
+  order.forEach((n, i) => { const a = 2 * Math.PI * (i + 0.5) / order.length - Math.PI / 2; pos[n.id] = [cx + W * 0.40 * Math.cos(a), cy + H * 0.38 * Math.sin(a)]; });
+  for (const n of T.nodes) if (saved[n.name]) pos[n.id] = [saved[n.name][0] * W, saved[n.name][1] * H];
+}
+function labelsOf(n) { return [n.name, n.ip].concat(n.subnets.map(s => 'net ' + s), n.vips.map(v => 'vip ' + v), n.public ? ['public ' + n.public] : []); }
+function draw() {
+  const W = cv.clientWidth, H = Math.max(420, Math.min(760, W * 0.66)), k = devicePixelRatio || 1;
+  cv.width = W * k; cv.height = H * k; cv.style.height = H + 'px'; g.setTransform(k, 0, 0, k, 0, 0); g.clearRect(0, 0, W, H);
+  if (!Object.keys(pos).length || cv.dataset.w != W) { pos = {}; layout(W, H); cv.dataset.w = W; }
+  const cx = W / 2, cy = H / 2;
   g.textAlign = 'center'; g.textBaseline = 'middle';
   for (const l of T.links) {                       // links first, nodes on top
     const [x1, y1] = pos[l.a], [x2, y2] = pos[l.b], hubLink = hubs.some(h => h.id === l.a);
@@ -55,7 +64,8 @@ function draw() {
     g.beginPath(); g.arc(x, y, r, 0, 2 * Math.PI); g.fillStyle = css(n.hub ? '--hub' : linked ? '--client' : '--bg'); g.fill();
     g.lineWidth = n.me ? 3 : 1.5; g.strokeStyle = css(n.me ? '--fg' : n.hub ? '--hub' : '--client'); g.stroke();
     if (n.admin) { g.beginPath(); g.arc(x, y, r + 4, 0, 2 * Math.PI); g.lineWidth = 1; g.setLineDash([2, 3]); g.strokeStyle = css('--fg'); g.stroke(); g.setLineDash([]); }
-    const up = y < cy - 1 ? -1 : 1, lines = [n.name, n.ip].concat(n.subnets.map(s => 'net ' + s), n.vips.map(v => 'vip ' + v));
+    // labels go away from the centre for clients (outer ring) and towards it for hubs (inner ring), so they meet nobody
+    const up = n.hub ? (y < cy - 1 ? 1 : -1) : (y < cy - 1 ? -1 : 1), lines = labelsOf(n);
     lines.forEach((t, i) => {
       g.font = (i ? '11px ui-monospace, monospace' : '600 13px system-ui, sans-serif');
       const ty = y + up * (r + 13) + (up > 0 ? i : i - lines.length + 1) * 14, w = g.measureText(t).width + 6;
@@ -64,7 +74,24 @@ function draw() {
     });
   }
 }
-draw(); addEventListener('resize', draw); matchMedia('(prefers-color-scheme: dark)').addEventListener('change', draw);
+function at(e) { const b = cv.getBoundingClientRect(); return [e.clientX - b.left, e.clientY - b.top]; }
+cv.onpointerdown = e => {                        // drag a node; where it lands is remembered in this browser
+  const [x, y] = at(e);
+  const hit = T.nodes.find(n => Math.hypot(pos[n.id][0] - x, pos[n.id][1] - y) < 18);
+  if (hit) { drag = hit; cv.setPointerCapture(e.pointerId); cv.style.cursor = 'grabbing'; }
+};
+cv.onpointermove = e => {
+  if (!drag) { const [x, y] = at(e); cv.style.cursor = T.nodes.some(n => Math.hypot(pos[n.id][0] - x, pos[n.id][1] - y) < 18) ? 'grab' : ''; return; }
+  const [x, y] = at(e); pos[drag.id] = [Math.max(10, Math.min(cv.clientWidth - 10, x)), Math.max(10, Math.min(cv.clientHeight - 10, y))]; draw();
+};
+cv.onpointerup = cv.onpointercancel = e => {
+  if (!drag) return;
+  saved[drag.name] = [pos[drag.id][0] / cv.clientWidth, pos[drag.id][1] / cv.clientHeight];
+  try { localStorage.setItem(KEY, JSON.stringify(saved)); } catch (x) {}
+  drag = null; cv.style.cursor = '';
+};
+cv.ondblclick = () => { saved = {}; try { localStorage.removeItem(KEY); } catch (x) {} pos = {}; draw(); };
+draw(); addEventListener('resize', () => { pos = {}; draw(); }); matchMedia('(prefers-color-scheme: dark)').addEventListener('change', draw);
 </script>"""
 
 
@@ -254,13 +281,14 @@ def view_map(mesh, topo):
     here = next(n for n in topo["nodes"] if n["me"])
     names = {n["id"]: n["name"] for n in topo["nodes"]}
     out = [
-        page_head(mesh, "map", "map").replace("<title>", "<meta http-equiv=refresh content=20><title>"),
+        page_head(mesh, "map", "map").replace("<title>", "<meta http-equiv=refresh content=60><title>"),
         f"<p>nodes <code>{esc(mesh['net'])}</code> &middot; cluster IPs <code>{esc(mesh['cluster_net'])}</code> &middot; "
         f"this page is <code>{store.admin_vip(mesh)}</code> on every hub, answered now by <b>{esc(here['name'])}</b></p>"
         "<canvas id=map></canvas><p class=key><span>large dot: hub</span><span>small dot: client</span>"
         "<span>thick line: hub-to-hub, or the hub a client sends through</span><span>thin line: standby link</span>"
         "<span>faint dashed red: no link</span><span>number: ping across that link</span>"
-        "<span>dotted ring: admin node</span><span>bold outline: the node answering</span></p>",
+        "<span>dotted ring: admin node</span><span>bold outline: the node answering</span>"
+        "<span>drag a node to move it (remembered here); double-click the map to reset</span></p>",
         "<h2>nodes</h2><div class=scroll><table><tr><th>role<th>name<th>address<th>endpoint<th>subnets"
         "<th>sends through<th>seen by<th>labels<th>description",
     ]
