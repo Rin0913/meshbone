@@ -131,6 +131,12 @@ def read(name):
 
 
 def write(path, text, mode=0o600):
+    """Write a file in one step. A device or pipe given as the path (/dev/null, /dev/stdout)
+    is written through as it is - replacing it would leave a plain file where a device was."""
+    if os.path.exists(path) and not os.path.isfile(path):
+        with open(path, "w") as f:
+            f.write(text)
+        return
     tmp = path + ".tmp"
     with open(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode), "w") as f:
         f.write(text)
