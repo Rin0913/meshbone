@@ -149,6 +149,16 @@ A node that is already compromised when you sign in can serve a page that
 steals the key. The token protects against everything else: someone listening
 on the way, and a node compromised later.
 
+## Gateways
+
+A node that announces a network becomes a gateway for it without further
+setup: IP forwarding is switched on, forwarding through the mesh interface is
+allowed where the host filters it, and traffic from the mesh into the
+announced network is masqueraded behind the node's own address there. The
+hosts in that network therefore need no route to the mesh. If their router
+does have one and you want them to see the real source addresses, turn the
+masquerade off on the gateway with `meshbone local --nat off`.
+
 ## Firewall
 
 A policy says who may open connections to whom across the mesh. Groups are

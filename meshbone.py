@@ -29,8 +29,8 @@ Any machine
                                 this machine becomes the first node and the first admin
   meshbone join FILE [--once]   FILE is the mesh config written by `invite`;
                                 --once keeps everything in /run (gone after reboot or `leave`)
-  meshbone local [--listen-port N] [--mtu N]   this machine's own network settings
-                                (also accepted by create, join and deploy)
+  meshbone local [--listen-port N] [--mtu N] [--nat on|off]
+                                this machine's own network settings (also accepted by create, join and deploy)
   meshbone promote --endpoint HOST:PORT   ask to become a hub at this stable public address
   meshbone cost NAME MS         local penalty in ms for sending via hub NAME (0 = automatic)
   meshbone status | leave | upgrade
@@ -1121,7 +1121,7 @@ def members(selector, mesh, alive):
 
 
 def policy_ruleset(mesh, alive, pol):
-    """The policy as an nftables table of our own -> text, or None when everything is allowed anyway.
+    """The policy as nftables chains -> text, or '' when everything is allowed anyway.
 
     It judges new connections that enter or leave through the mesh interface: on the node they
     are for, on the hub that relays them, and on the gateway of a subnet. Answers to connections
@@ -1129,7 +1129,7 @@ def policy_ruleset(mesh, alive, pol):
     a policy cannot cut the mesh's control traffic or the management page off.
     """
     if pol["default"] == "allow" and not pol["rules"]:
-        return None
+        return ""
 
     def match(field, nets):
         each = [str(n.network_address) if n.prefixlen == 32 else str(n) for n in nets or []]
@@ -1152,12 +1152,35 @@ def policy_ruleset(mesh, alive, pol):
         lines.append("counter drop")
     rules = "\n".join("    " + line for line in lines)
     return (
-        "table inet meshbone\ndelete table inet meshbone\ntable inet meshbone {\n"
         f"  chain mesh {{\n{rules}\n  }}\n"
         f'  chain input {{ type filter hook input priority 0; policy accept; iifname "{IFACE}" jump mesh; }}\n'
         f'  chain forward {{ type filter hook forward priority 0; policy accept; iifname "{IFACE}" jump mesh; '
-        f'iifname != "{IFACE}" oifname "{IFACE}" jump mesh; }}\n}}\n'
+        f'iifname != "{IFACE}" oifname "{IFACE}" jump mesh; }}\n'
     )
+
+
+def gateway_ruleset(mesh, me, nat):
+    """What makes a node a working gateway for the networks it announces -> nftables text, or ''.
+
+    The hosts in such a network know nothing about the mesh: they would send their answers to
+    their own default router, and the connection would never complete. So whatever comes out of
+    the mesh for an announced network leaves the gateway with the gateway's own address there
+    (masquerade); answers then come back to it and it hands them on. `meshbone local --nat off`
+    is for networks whose router already has a route back to the mesh.
+    """
+    nets = [str(piece) for s in me["subnets"] for piece in carve(IPv4Network(s), [mesh_net(mesh), cluster_net(mesh)])]
+    if not nets or not nat:
+        return ""
+    return (
+        f'  chain gateway {{ type nat hook postrouting priority 100; policy accept; iifname "{IFACE}" '
+        f'oifname != "{IFACE}" ip daddr {{ {", ".join(nets)} }} masquerade; }}\n'
+    )
+
+
+def mesh_table(*chains):
+    """Our own nftables table holding these chains -> text that replaces it in one step, or None if empty."""
+    body = "".join(chains)
+    return f"table inet meshbone\ndelete table inet meshbone\ntable inet meshbone {{\n{body}}}\n" if body else None
 
 
 # ==============================================================================
@@ -1229,8 +1252,8 @@ def firewall(want):
         write(f"{DIR}/fw.json", json.dumps(want))
 
 
-def apply_policy(text):
-    """Load the policy's nftables table, or remove it. The table is ours alone; whatever other
+def apply_table(text):
+    """Load our nftables table (firewall policy, gateway NAT), or remove it. The table is ours alone; whatever other
     firewall the host has stays as it is, and both have to let a packet through."""
     path = f"{DIR}/policy.nft"
     if text is None:
@@ -1249,7 +1272,7 @@ def apply_policy(text):
         run("nft", "-f", "-", input=text)
         write(path, text)
     except (OSError, subprocess.CalledProcessError) as e:
-        log(f"firewall policy NOT applied: {getattr(e, 'stderr', '') or e}")
+        log(f"nftables table NOT applied (firewall policy, gateway NAT): {getattr(e, 'stderr', '') or e}")
 
 
 def resolve(host, port):
@@ -1382,7 +1405,7 @@ def reconcile():
     if not active:  # revoked: take everything down
         run("ip", "link", "del", IFACE, check=False)
         firewall([])
-        apply_policy(None)
+        apply_table(None)
         for unit in ("meshbone-serve.socket", "meshbone-admin.socket"):
             run("systemctl", "stop", unit, check=False)
         return
@@ -1439,7 +1462,7 @@ def reconcile():
     if hub or me["subnets"]:
         rules += [["FORWARD", "-i", IFACE, "-j", "ACCEPT"], ["FORWARD", "-o", IFACE, "-j", "ACCEPT"]]
     firewall(rules)
-    apply_policy(policy_ruleset(mesh, alive, policy()))
+    apply_table(mesh_table(policy_ruleset(mesh, alive, policy()), gateway_ruleset(mesh, me, loc.get("nat", True))))
     if {"primary": primary, "rtt": rtt} != was:
         write(f"{DIR}/state.json", json.dumps({"primary": primary, "rtt": rtt}))
     run("systemctl", "start", "meshbone-serve.socket", check=False)
@@ -2433,6 +2456,8 @@ def bootstrap(mesh, key, nodes, nets, a, admin_key=None, conf=None):
     set_mode(getattr(a, "once", False))
     os.makedirs(DIR, mode=0o700, exist_ok=True)
     opts = {k: getattr(a, k) for k in ("listen_port", "mtu") if getattr(a, k, None)}
+    if getattr(a, "nat", None):
+        opts["nat"] = a.nat == "on"
     write(f"{DIR}/node.json", json.dumps({"mesh": mesh, "key": key, "pub": pub, "cost": {}, **opts}))
     if admin_key:
         write(f"{DIR}/admin.key", admin_key)
@@ -2747,7 +2772,9 @@ def cmd_deploy(a):
                 f"python3 {tmp}/meshbone.py join {tmp}/mesh.json"
                 + (" --once" if a.once else "")
                 + "".join(
-                    f" --{k.replace('_', '-')} {int(getattr(a, k))}" for k in ("listen_port", "mtu") if getattr(a, k)
+                    f" --{k.replace('_', '-')} {shlex.quote(str(getattr(a, k)))}"
+                    for k in ("listen_port", "mtu", "nat")
+                    if getattr(a, k, None)
                 )
             )
             sudo = "sudo -S -p ''" if secret else "sudo"  # with a password, sudo reads it from stdin
@@ -2835,9 +2862,14 @@ def cmd_local(a):
         for k in ("listen_port", "mtu"):
             if getattr(a, k) is not None:
                 loc[k] = getattr(a, k)  # 0 puts it back to automatic
+        if a.nat:
+            loc["nat"] = a.nat == "on"
         write(f"{DIR}/node.json", json.dumps(loc))
         reconcile()
-    print(f"listen port {loc.get('listen_port') or 'automatic'}, mtu {loc.get('mtu') or 1420}")
+    print(
+        f"listen port {loc.get('listen_port') or 'automatic'}, mtu {loc.get('mtu') or 1420}, "
+        f"gateway NAT {'on' if loc.get('nat', True) else 'off'}"
+    )
 
 
 def cmd_promote(a):
@@ -2968,7 +3000,7 @@ def cmd_leave():
     units = ["meshbone.timer", "meshbone.service", "meshbone-serve.socket", "meshbone-admin.socket"]
     run("systemctl", "disable", "--now", *units, check=False)
     firewall([])
-    apply_policy(None)
+    apply_table(None)
     for ifn in (IFACE, "mbvip"):
         run("ip", "link", "del", ifn, check=False)
     for path in [f"{UNIT_DIR}/{name}" for name in UNITS]:
@@ -3014,7 +3046,8 @@ def cmd_check():
     view_status(mesh, list(rows()), warnings(), ONCE, False, code_sha())
     if os.path.exists(f"{DIR}/admin.key"):
         view_admin(mesh, nodes[loc["pub"]]["name"], list(rows()), "x", "", software(), None, True, "", policy())
-    policy_ruleset(mesh, live(nodes), policy()), view_policy(policy())
+    mesh_table(policy_ruleset(mesh, live(nodes), policy()), gateway_ruleset(mesh, nodes[loc["pub"]], True))
+    view_policy(policy())
     view_login(mesh, "s", "p", 0, "")
     for text in UNITS.values():
         text.format(py="p", bin="b", port=1, net=mesh["net"], vip="v", aport=2)
@@ -3304,6 +3337,9 @@ def main():
     def local_options(s):
         s.add_argument("--listen-port", type=int, help="local UDP port, if it differs from the endpoint's")
         s.add_argument("--mtu", type=int, help="tunnel MTU (default 1420)")
+        s.add_argument(
+            "--nat", choices=("on", "off"), help="as a gateway, hide the mesh behind this node's address (default on)"
+        )
 
     s = sub.add_parser("create")
     s.add_argument("--endpoint", default="", help="public HOST:PORT of this machine, if it is to be a hub")

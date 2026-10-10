@@ -719,7 +719,26 @@ P_ = lambda **k: A(
 )
 fmt = lambda nets: ", ".join(str(n.network_address) if n.prefixlen == 32 else str(n) for n in nets)
 use("adm")
-assert m.policy_ruleset(mesh_, m.live(m.load()), m.policy()) is None and not nft("a")  # no policy: nothing installed
+chains = lambda t: t[t.index("chain mesh") : t.index("chain forward")]  # the policy part of a node's table
+assert m.policy_ruleset(mesh_, m.live(m.load()), m.policy()) == "" and not os.path.exists(
+    D("a") + "/policy.nft"
+)  # no policy, no subnets: no table
+# a node that announces a network is made a working gateway for it: forwarding on, and the mesh hidden behind its own address
+gw = nft("c")[-1]
+assert (
+    'chain gateway { type nat hook postrouting priority 100; policy accept; iifname "mb0" oifname != "mb0" ip daddr { 10.3.0.0/24 } masquerade; }'
+    in gw
+)
+assert "chain mesh" not in gw and did("c", "sysctl", "-qw", "net.ipv4.ip_forward=1")
+assert ["FORWARD", "-i", "mb0", "-j", "ACCEPT"] in json.load(open(D("c") + "/fw.json"))
+use("c")
+m.cmd_local(A(listen_port=None, mtu=None, nat="off"))
+assert did("c", "nft", "delete", "table", "inet", "meshbone") and not os.path.exists(
+    D("c") + "/policy.nft"
+)  # routed, not hidden
+m.cmd_local(A(listen_port=None, mtu=None, nat="on"))
+assert "masquerade" in nft("c")[-1]
+use("adm")
 expect_exit(lambda: m.cmd_policy(P_(add=["sub nets", "nodes", "deny"])), "cannot read selector")
 expect_exit(lambda: m.cmd_policy(P_(add=["subnets", "nodes", "block"])), "allow or deny")
 expect_exit(lambda: m.cmd_policy(P_(add=["subnets", "nodes", "deny"], ports="tcp/99999")), "cannot read ports")
@@ -751,8 +770,9 @@ assert (
 )
 assert 'iifname "mb0" jump mesh' in table and table.startswith("table inet meshbone\ndelete table inet meshbone\n")
 assert (
-    table == nft("c")[-1] == nft("d")[-1] and table.rstrip().count("counter drop") == 1
-)  # same everywhere; default still allow
+    chains(table) == chains(nft("c")[-1]) == chains(nft("d")[-1]) and table.count("counter drop") == 1
+)  # one policy everywhere
+assert "chain gateway" not in table and "chain gateway" in nft("c")[-1]  # and only c is a gateway
 with quiet:
     use("adm")
     m.cmd_set(S("g", label=["edge"]))  # joining the group is enough: the rule now covers g as well
