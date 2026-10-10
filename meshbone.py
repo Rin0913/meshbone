@@ -1,0 +1,2443 @@
+#!/usr/bin/env python3
+"""meshbone - WireGuard mesh backbone without a controller.
+
+Every node has one WireGuard interface (mb0) and, if it is a hub, one UDP
+port. Which peer carries which prefix is computed on every node from a signed
+directory, so there is no routing daemon and no single machine to lose.
+
+Roles
+  hub      public host: other nodes dial its --endpoint (HOST:PORT; one
+           forwarded UDP port is enough) and it relays between them.
+           A hub holds no authority over the mesh.
+  client   node behind NAT. Stays linked to every hub, sends through the one
+           with the best ping and moves to another within seconds if it dies.
+  admin    any node that holds admin.key. The directory is signed with that
+           key, so only admin nodes can add, change or revoke nodes - keep it
+           off the exposed machines.
+  subnet   a network announced into the mesh by a hub or client acting as gateway.
+  cluster IP  an address several nodes hold at once (anycast): traffic goes to
+           one that is alive. Every hub holds the first two: .1 is the mesh
+           map, traffic graphs and JSON API, .2 the Prometheus /metrics
+           (both http, port 7948, read-only).
+
+Addresses come from the mesh range (default 10.253.254.0/23, first /24 for
+hubs, the rest for clients); cluster IPs from 10.253.253.0/24.
+
+Any machine
+  meshbone install              packages + /usr/local/sbin/meshbone, nothing else
+  meshbone create [--endpoint HOST:PORT] [--name N] [--subnet CIDR]... [--mesh NAME] [--net CIDR] [--cluster-net CIDR]
+                                this machine becomes the first node and the first admin
+  meshbone join FILE [--once]   FILE is the mesh config written by `invite`;
+                                --once keeps everything in /run (gone after reboot or `leave`)
+  meshbone local [--listen-port N] [--mtu N]   this machine's own network settings
+                                (also accepted by create, join and deploy)
+  meshbone promote --endpoint HOST:PORT   ask to become a hub at this stable public address
+  meshbone cost NAME MS         local penalty in ms for sending via hub NAME (0 = automatic)
+  meshbone status | leave | upgrade
+
+On an admin node (management page: http://<its mesh address>:7948/admin)
+  meshbone passwd               change the management page's password, on every admin node
+  meshbone invite NAME [--endpoint HOST:PORT] [--subnet CIDR]... [--vip IP]... [--cost MS] [--admin] [-o FILE]
+  meshbone deploy NAME --remote 'USER[:PASSWORD]@HOST[;USER[:PASSWORD]@HOST]...' [invite options] [--once]
+                                invite + install + join over ssh, through any number of jump hosts
+  (invite, deploy and set also take --desc TEXT and --label L...; invite and deploy take --ip ADDRESS.
+   Giving a node an endpoint makes it a hub once a client has reached it there; --endpoint '' makes
+   it a client again. A mesh always keeps at least one hub.)
+  meshbone set NAME [--endpoint HOST:PORT] [--subnet CIDR]... [--no-subnet] [--vip IP]... [--no-vip] [--cost MS]
+  meshbone simple NAME [--hub HUB] [--qr] [-o FILE]
+                                a client for a phone or any device that only runs plain WireGuard:
+                                writes a standard config (and shows a QR code); run it again to re-export
+  meshbone approve NAME         accept a `promote` request
+  meshbone revoke NAME
+"""
+import argparse, base64, contextlib, fcntl, hashlib, hmac, html, io, json, os, random, re
+import secrets, shlex, shutil, socket, sqlite3, subprocess, sys, tarfile, tempfile, time, urllib.parse
+from concurrent.futures import ThreadPoolExecutor
+from ipaddress import IPv4Address, IPv4Network
+
+VERSION = 6
+IFACE = "mb0"
+DEFAULT_PORT = 51820
+GOSSIP_PORT = 7947  # TCP, reachable only from mesh addresses
+ADMIN_PORT = 7948  # HTTP: the mesh map on every hub, plus /admin on the admin nodes
+FRESH = 180  # a WireGuard peer with a handshake this recent (s) counts as reachable
+VERIFY_WAIT = 20  # how long join waits for the first handshakes (s)
+CONFIRM_WAIT = 60  # how long a new hub has to be reached from outside before it is demoted again (s)
+KEEP_FINE = 2 * 86400  # traffic history: per-minute buckets this long, 10-minute buckets after that
+KEEP_ALL = 90 * 86400
+LABEL_RE = r"[A-Za-z0-9][A-Za-z0-9_.:=/-]{0,47}"
+PARALLEL = 16
+SBIN = "/usr/local/sbin/meshbone"
+KEY_RE = r"[A-Za-z0-9+/]{43}="
+NAME_RE = r"[A-Za-z0-9][A-Za-z0-9_.-]{0,31}"
+ENDPOINT_RE = r"(|(\[[0-9A-Fa-f:]+\]|[A-Za-z0-9.-]+):\d{1,5})"
+
+UNITS = {
+    "meshbone.service": """[Unit]
+Description=meshbone: reconcile links and sync the mesh directory
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart={py} {bin} sync
+TimeoutStartSec=120
+""",
+    "meshbone.timer": """[Unit]
+Description=meshbone periodic sync
+
+[Timer]
+OnBootSec=3
+OnCalendar=*:*:0/15
+AccuracySec=1
+RandomizedDelaySec=3
+
+[Install]
+WantedBy=timers.target
+""",
+    # the sockets are started and stopped by `meshbone sync`, only the timer is enabled
+    "meshbone-serve.socket": """[Unit]
+Description=meshbone directory exchange
+
+[Socket]
+ListenStream=0.0.0.0:{port}
+Accept=yes
+MaxConnections=32
+IPAddressDeny=any
+IPAddressAllow={net}
+""",
+    "meshbone-serve@.service": """[Unit]
+Description=meshbone directory exchange (per connection)
+
+[Service]
+ExecStart={py} {bin} serve
+StandardInput=socket
+StandardOutput=journal
+StandardError=journal
+RuntimeMaxSec=60
+""",
+    "meshbone-admin.socket": """[Unit]
+Description=meshbone admin page
+
+[Socket]
+ListenStream=0.0.0.0:{aport}
+Accept=yes
+MaxConnections=16
+IPAddressDeny=any
+IPAddressAllow={net} 127.0.0.0/8
+""",
+    "meshbone-admin@.service": """[Unit]
+Description=meshbone admin page (per connection)
+
+[Service]
+ExecStart={py} {bin} admin
+StandardInput=socket
+StandardOutput=journal
+StandardError=journal
+RuntimeMaxSec=300
+""",
+}
+
+
+def set_mode(once):
+    global ONCE, DIR, UNIT_DIR, BIN
+    ONCE = once
+    if once:
+        DIR, UNIT_DIR, BIN = "/run/meshbone", "/run/systemd/system", "/run/meshbone/meshbone"
+    else:
+        DIR, UNIT_DIR, BIN = "/etc/meshbone", "/etc/systemd/system", SBIN
+
+
+set_mode(os.path.exists("/run/meshbone/node.json"))
+
+
+def joined():
+    return any(os.path.exists(f"{d}/node.json") for d in ("/etc/meshbone", "/run/meshbone"))
+
+
+def log(*a):
+    print(*a, file=sys.stderr, flush=True)
+
+
+def run(*cmd, input=None, check=True):
+    kw = {"input": input} if input is not None else {"stdin": subprocess.DEVNULL}
+    return subprocess.run(cmd, check=check, text=True, capture_output=True, **kw).stdout
+
+
+def read(name):
+    with open(f"{DIR}/{name}") as f:
+        return f.read().strip()
+
+
+def write(path, text, mode=0o600):
+    tmp = path + ".tmp"
+    with open(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode), "w") as f:
+        f.write(text)
+    os.chmod(tmp, mode)
+    os.replace(tmp, path)
+
+
+def read_json(name, default):
+    try:
+        return json.loads(read(name))
+    except (FileNotFoundError, ValueError):
+        return default
+
+
+@contextlib.contextmanager
+def locked():
+    with open(f"{DIR}/lock", "w") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        yield
+
+
+def local():
+    """This node's identity, secrets and own settings: {mesh, key, pub, cost[, wants, listen_port, mtu]}."""
+    return json.loads(read("node.json"))
+
+
+def load():
+    """The mesh directory: {pubkey: {name, id, endpoint, subnets, vips, cost, seq, sig[, gone]}}.
+    Every entry is signed with the admin key."""
+    return json.loads(read("nodes.json"))
+
+
+def save(nodes):
+    write(f"{DIR}/nodes.json", json.dumps(nodes, indent=1, sort_keys=True))
+
+
+def load_nets():
+    """What each node reports about itself: {pubkey: {nets, wants, sees, rtt, primary, admin, seq}} -
+    the local networks it sits on, the endpoint it asks to be a hub at, the ids of the nodes a
+    hub currently reaches, its ping to each hub, the hub it sends through and whether it is an
+    admin node. Each record is written by its own node and is not signed: it feeds the map and
+    hub selection, never authority."""
+    return json.loads(read("nets.json"))
+
+
+def save_nets(nets):
+    write(f"{DIR}/nets.json", json.dumps(nets, indent=1, sort_keys=True))
+
+
+def load_conf():
+    """Mesh-wide settings, each signed with the admin key: {name: {value, seq, sig}}."""
+    return read_json("conf.json", {})
+
+
+def state():
+    return {"v": VERSION, "nodes": load(), "nets": load_nets(), "conf": load_conf()}
+
+
+def live(nodes):
+    """Nodes that are part of the mesh. Should two ever be given the same id (invited on
+    two admin nodes in the same instant), everyone deterministically keeps the smaller key."""
+    out, taken = {}, set()
+    for pk in sorted(nodes):
+        n = nodes[pk]
+        if not n.get("gone") and n["id"] not in taken:
+            taken.add(n["id"])
+            out[pk] = n
+    return out
+
+
+def by_name(nodes, name):
+    hits = [(pk, n) for pk, n in live(nodes).items() if n["name"] == name]
+    if not hits:
+        sys.exit(f"no node named {name}")
+    return hits[0]
+
+
+def mesh_net(mesh):
+    return IPv4Network(mesh["net"])
+
+
+def cluster_net(mesh):
+    return IPv4Network(mesh["cluster_net"])
+
+
+def admin_vip(mesh):
+    return cluster_net(mesh).network_address + 1
+
+
+def metrics_vip(mesh):
+    return cluster_net(mesh).network_address + 2
+
+
+def router_ip(mesh, node_id):
+    return mesh_net(mesh).network_address + node_id
+
+
+def held_vips(mesh, node):
+    """A node's cluster IPs; every hub also holds the two service addresses (map and metrics)."""
+    return node["vips"] + ([str(admin_vip(mesh)), str(metrics_vip(mesh))] if node["endpoint"] else [])
+
+
+def prefixes(mesh, node):
+    """Everything a node owns: its address, its cluster IPs, the subnets behind it."""
+    return [IPv4Network(f"{ip}/32") for ip in [router_ip(mesh, node["id"])] + held_vips(mesh, node)] + [
+        IPv4Network(s) for s in node["subnets"]
+    ]
+
+
+def id_pool(mesh, hub):
+    """A node's id is its offset in the mesh range: invited hubs get one from the first /24,
+    clients from the rest. (A client promoted to hub keeps its address.)"""
+    ids = range(1, 255) if hub else range(256, mesh_net(mesh).num_addresses)
+    return [i for i in ids if i % 256 not in (0, 255)]
+
+
+def next_seq(old=0):
+    # wall clock, but never going backwards for a record: a Lamport clock with readable values
+    return max(int(time.time()), old + 1)
+
+
+def norm_endpoint(text):
+    """'' | HOST | HOST:PORT | [v6]:PORT -> '' or 'HOST:PORT'."""
+    m = re.fullmatch(r"(\[[0-9A-Fa-f:]+\]|[A-Za-z0-9.-]+)(?::(\d{1,5}))?", text or "")
+    if text and (not m or not 0 < int(m[2] or DEFAULT_PORT) < 65536):
+        sys.exit(f"bad endpoint {text!r}: use HOST or HOST:PORT")
+    return f"{m[1]}:{m[2] or DEFAULT_PORT}" if text else ""
+
+
+# --- directory -----------------------------------------------------------------
+
+
+def valid_mesh(mesh):
+    try:
+        assert re.fullmatch(NAME_RE, mesh["name"]) and re.fullmatch(KEY_RE, mesh["psk"])
+        net, cluster = IPv4Network(mesh["net"]), IPv4Network(mesh["cluster_net"])
+        assert 20 <= net.prefixlen <= 23 and 20 <= cluster.prefixlen <= 29 and not net.overlaps(cluster)
+        assert re.fullmatch(r"[0-9a-f]{64}", mesh["admin"]) and len(base64.b64decode(mesh["admin_pub"])) == 32
+        return True
+    except Exception:
+        return False
+
+
+def canonical(nets):
+    return all(isinstance(s, str) and str(IPv4Network(s)) == s for s in nets)
+
+
+def ed25519():
+    # imported late so that `install` can fetch the package first
+    from cryptography.hazmat.primitives.asymmetric import ed25519
+
+    return ed25519
+
+
+def signable(pk, n):
+    # the WireGuard key is part of what is signed, or an entry could be re-used under another key
+    return json.dumps({**{k: v for k, v in n.items() if k != "sig"}, "pk": pk}, sort_keys=True).encode()
+
+
+def sign(pk, n):
+    key = ed25519().Ed25519PrivateKey.from_private_bytes(base64.b64decode(read("admin.key")))
+    n["sig"] = base64.b64encode(key.sign(signable(pk, n))).decode()
+    return n
+
+
+def valid(mesh, pk, n):
+    """A directory entry is only accepted if the mesh's admin key signed it."""
+    try:
+        assert wellformed(pk, n)
+        key = ed25519().Ed25519PublicKey.from_public_bytes(base64.b64decode(mesh["admin_pub"]))
+        key.verify(base64.b64decode(n["sig"]), signable(pk, n))
+        return True
+    except Exception:
+        return False
+
+
+def wellformed(pk, n):
+    """Entries end up in the WireGuard config, so reject anything malformed."""
+    try:
+        assert re.fullmatch(KEY_RE, pk) and re.fullmatch(NAME_RE, n["name"])
+        assert type(n["seq"]) is int and type(n["id"]) is int and 1 <= n["id"] < 4096
+        assert type(n["cost"]) is int and 0 <= n["cost"] <= 10000
+        assert re.fullmatch(ENDPOINT_RE, n["endpoint"])
+        assert canonical(n["subnets"])
+        assert all(isinstance(v, str) and str(IPv4Address(v)) == v for v in n["vips"])
+        assert isinstance(n.get("desc", ""), str) and len(n.get("desc", "")) <= 200 and n.get("desc", "").isprintable()
+        assert type(n.get("simple", False)) is bool
+        assert len(n.get("labels", [])) <= 16 and all(
+            isinstance(l, str) and re.fullmatch(LABEL_RE, l) for l in n.get("labels", [])
+        )
+        return True
+    except Exception:
+        return False
+
+
+def valid_nets(pk, r):
+    try:
+        assert re.fullmatch(KEY_RE, pk) and type(r["seq"]) is int
+        assert len(r["nets"]) <= 64 and canonical(r["nets"])
+        assert re.fullmatch(ENDPOINT_RE, r.get("wants", ""))
+        assert all(type(i) is int for i in r.get("sees", [])) and len(r.get("sees", [])) < 4096
+        assert all(k.isdigit() and type(v) is int for k, v in r.get("rtt", {}).items()) and len(r.get("rtt", {})) < 256
+        assert type(r.get("primary", 0)) in (int, type(None)) and type(r.get("admin", False)) is bool
+        return True
+    except Exception:
+        return False
+
+
+def conf_signable(name, r):
+    return json.dumps({"conf": name, "value": r["value"], "seq": r["seq"]}, sort_keys=True).encode()
+
+
+def valid_conf(mesh, name, r):
+    try:
+        assert re.fullmatch(r"[a-z0-9_]{1,40}", name) and type(r["seq"]) is int
+        assert isinstance(r["value"], str) and len(r["value"]) < 4096
+        key = ed25519().Ed25519PublicKey.from_public_bytes(base64.b64decode(mesh["admin_pub"]))
+        key.verify(base64.b64decode(r["sig"]), conf_signable(name, r))
+        return True
+    except Exception:
+        return False
+
+
+def checked(mesh, nodes, nets, pk, n, keep=()):
+    """Vet an entry an admin is about to write; exits with a message instead of saving garbage.
+    Subnets the node already had (`keep`) are not re-examined, so a conflict that appeared
+    later elsewhere does not block unrelated edits."""
+    try:
+        n["subnets"] = [str(IPv4Network(s)) for s in n["subnets"]]
+        n["vips"] = [str(IPv4Address(v)) for v in n["vips"]]
+    except ValueError as e:
+        sys.exit(f"bad address: {e}")
+    n["endpoint"] = norm_endpoint(n["endpoint"])
+    if not wellformed(pk, n) or not n["id"] < mesh_net(mesh).num_addresses:
+        sys.exit("bad name, endpoint, cost, description (200 printable characters) or label (letters, digits, _.:=/-)")
+    others = {k: o for k, o in live(nodes).items() if k != pk}
+    if any(o["name"] == n["name"] for o in others.values()):
+        sys.exit(f"name {n['name']} is already taken")
+    for v in map(IPv4Address, n["vips"]):
+        if v not in cluster_net(mesh) or v in (admin_vip(mesh), metrics_vip(mesh)):
+            sys.exit(
+                f"{v} is not a free address in the cluster range {mesh['cluster_net']} "
+                f"({admin_vip(mesh)} and {metrics_vip(mesh)} belong to the hubs: map and metrics)"
+            )
+    for s in (IPv4Network(s) for s in n["subnets"] if s not in keep):
+        for reserved in (mesh_net(mesh), cluster_net(mesh)):
+            if s.overlaps(reserved):
+                sys.exit(f"{s} overlaps the mesh's own range {reserved}")
+        for k, o in others.items():
+            for t in o["subnets"]:
+                if s.overlaps(IPv4Network(t)):
+                    sys.exit(f"{s} overlaps {t}, announced by {o['name']}")
+            for t in nets.get(k, {}).get("nets", []):
+                if s.overlaps(IPv4Network(t)):
+                    sys.exit(f"{s} overlaps {t}, a local network of {o['name']} (not announced)")
+    return n
+
+
+def rank(record):
+    # last writer wins; equal seqs are broken by content so every replica picks the same winner
+    return (record["seq"], json.dumps(record, sort_keys=True)) if record else (-1, "")
+
+
+def lww(mine, incoming, ok):
+    changed = False
+    if isinstance(incoming, dict):
+        for k, v in incoming.items():
+            try:
+                newer = rank(v) > rank(mine.get(k))
+            except (TypeError, KeyError):
+                continue
+            if newer and ok(k, v):  # in this order: signatures are only checked for news
+                mine[k], changed = v, True
+    return changed
+
+
+def merge(msg, only=None):
+    """Fold a peer's state into ours. True if anything changed.
+
+    Both maps are last-writer-wins per key, so merging is commutative and
+    idempotent and replicas converge whatever order messages arrive in.
+    Directory entries are taken from anyone because each carries the admin
+    signature. Self-reported records are not signed: a client peer (`only`)
+    may update just its own, hubs relay everyone's.
+    """
+    if not isinstance(msg, dict) or msg.get("v") != VERSION:
+        return False
+    mesh, nodes, nets = local()["mesh"], load(), load_nets()
+    theirs = msg.get("nets")
+    if only:
+        theirs = {only: theirs[only]} if isinstance(theirs, dict) and only in theirs else {}
+    conf = load_conf()
+    a = lww(nodes, msg.get("nodes"), lambda pk, n: valid(mesh, pk, n))
+    b = lww(nets, theirs, valid_nets)
+    c = lww(conf, msg.get("conf"), lambda name, r: valid_conf(mesh, name, r))
+    if a:
+        save(nodes)
+    if b:
+        save_nets(nets)
+    if c:
+        write(f"{DIR}/conf.json", json.dumps(conf, indent=1, sort_keys=True))
+    return a or b or c
+
+
+def handle(ip, line):
+    """Answer one exchange -> (reply, changed).
+
+    There is no application-level auth: WireGuard only lets a packet in if its
+    source address belongs to the peer it came from, so inside the mesh the
+    source address *is* the peer's identity.
+    """
+    try:
+        node_id = int(IPv4Address(ip)) - int(mesh_net(local()["mesh"]).network_address)
+    except ValueError:
+        return None, False
+    with locked():
+        nodes = load()
+        peer = next((pk for pk, n in live(nodes).items() if n["id"] == node_id), None)
+        if not peer:
+            return None, False
+        try:
+            msg = json.loads(line)
+            changed = merge(msg, None if nodes[peer]["endpoint"] else peer)
+        except ValueError:
+            return None, False
+        reply, me = state(), nodes[local()["pub"]]
+        if isinstance(msg, dict) and type(msg.get("stats_since")) is int and me["endpoint"] and nodes[peer]["endpoint"]:
+            reply.update(stats_export(me["id"], msg["stats_since"]))  # hubs keep each other's traffic history
+        return json.dumps(reply).encode() + b"\n", changed
+
+
+def exchange(mesh, peer, msg):
+    """Send our state to a peer over the mesh and return its state."""
+    with socket.create_connection((str(router_ip(mesh, peer["id"])), GOSSIP_PORT), timeout=3) as s:
+        s.sendall(json.dumps(msg).encode() + b"\n")
+        return json.loads(s.makefile("rb").readline(8 << 20))
+
+
+def gossip(flood=False):
+    """Push-pull with every hub; a hub that has news (flood) also pushes it down to its clients."""
+    loc = local()
+    mypk, nodes = loc["pub"], load()
+    hub = bool(nodes[mypk]["endpoint"])
+    peers = [
+        (pk, n)
+        for pk, n in live(nodes).items()  # simple clients run no meshbone, nothing to tell them
+        if pk != mypk and not n.get("simple") and (n["endpoint"] or (hub and flood))
+    ]
+    msg = state()
+    since = stats_cursors() if hub else {}
+
+    def one(peer):
+        try:
+            ask = {**msg, "stats_since": since.get(peer[1]["id"], 0)} if hub and peer[1]["endpoint"] else msg
+            return peer[0], exchange(loc["mesh"], peer[1], ask)
+        except (OSError, ValueError):
+            return peer[0], None  # down or not linked yet; the next round will do
+
+    with ThreadPoolExecutor(PARALLEL) as pool:
+        results = list(pool.map(one, peers))
+    with locked():
+        changed = [merge(got, None if nodes[pk]["endpoint"] else pk) for pk, got in results]
+        for pk, got in results:
+            if hub and nodes[pk]["endpoint"] and isinstance(got, dict):
+                stats_import(nodes[pk]["id"], got)
+        if any(changed):
+            reconcile()
+    if any(changed) and hub:
+        gossip(flood=True)
+
+
+def settle(changed):
+    """After accepting news: apply it here and, on a hub, pass it on to everyone."""
+    if changed:
+        with locked():
+            reconcile()
+        gossip(flood=True)
+
+
+# --- system state --------------------------------------------------------------
+
+
+def local_nets():
+    """IPv4 networks this machine is directly attached to, outside the mesh."""
+    out = set()
+    for link in json.loads(run("ip", "-j", "-4", "addr", "show", "scope", "global") or "[]"):
+        if link["ifname"] in (IFACE, "mbvip"):
+            continue
+        for a in link.get("addr_info", []):
+            if a.get("family") == "inet" and a["prefixlen"] < 32:
+                out.add(str(IPv4Network(f"{a['local']}/{a['prefixlen']}", strict=False)))
+    return sorted(out)[:64]
+
+
+def sync_vips(want):
+    """Hold exactly these cluster IPs on a dummy interface so local services can bind them."""
+    links = json.loads(run("ip", "-j", "-4", "addr", "show", "dev", "mbvip", check=False) or "[]")
+    have = {a["local"] for l in links for a in l.get("addr_info", [])}
+    if want and not links:
+        run("ip", "link", "add", "mbvip", "type", "dummy", check=False)
+        run("ip", "link", "set", "mbvip", "up", check=False)
+    for ip in want - have:
+        run("ip", "addr", "add", f"{ip}/32", "dev", "mbvip", check=False)
+    for ip in have - want:
+        run("ip", "addr", "del", f"{ip}/32", "dev", "mbvip", check=False)
+
+
+def sync_routes(want, src):
+    """Route exactly these prefixes into the mesh, without touching routes that are not ours."""
+    have = set()
+    for r in json.loads(run("ip", "-j", "-4", "route", "show", "dev", IFACE, check=False) or "[]"):
+        with contextlib.suppress(ValueError):
+            have.add(IPv4Network(r["dst"]))
+    for p in want - have:
+        try:
+            run("ip", "route", "add", str(p), "dev", IFACE, "src", str(src))
+        except subprocess.CalledProcessError as e:
+            # e.g. the prefix is already routed elsewhere on this machine: leave that alone
+            log(f"route {p}: {e.stderr.strip()}")
+    for p in have - want:
+        run("ip", "route", "del", str(p), "dev", IFACE, check=False)
+
+
+def firewall(want):
+    """Keep exactly our iptables rules in place (for hosts whose policy is DROP, e.g. with Docker)."""
+    if not shutil.which("iptables"):
+        return
+    had = read_json("fw.json", [])
+    for rule in had:
+        if rule not in want:
+            run("iptables", "-D", *rule, check=False)
+    for rule in want:
+        try:
+            run("iptables", "-C", *rule)
+        except subprocess.CalledProcessError:
+            run("iptables", "-I", *rule, check=False)
+    if had != want:
+        write(f"{DIR}/fw.json", json.dumps(want))
+
+
+def resolve(host, port):
+    """host -> 'ip:port', or None while DNS is unavailable (e.g. early at boot)."""
+    try:
+        family, _, _, _, addr = socket.getaddrinfo(host.strip("[]"), port, type=socket.SOCK_DGRAM)[0]
+    except OSError:
+        return None
+    return f"[{addr[0]}]:{port}" if family == socket.AF_INET6 else f"{addr[0]}:{port}"
+
+
+def loosen_rp_filter():
+    # the way out and the way back can use different hubs; strict reverse-path filtering would drop that
+    try:
+        path = "/proc/sys/net/ipv4/conf/all/rp_filter"
+        if open(path).read().strip() == "1":
+            open(path, "w").write("2")
+    except OSError:
+        pass
+
+
+def handshakes():
+    """{pubkey: seconds since the last WireGuard handshake}, for peers that ever had one."""
+    out = {}
+    for line in run("wg", "show", IFACE, "latest-handshakes", check=False).splitlines():
+        pk, _, ts = line.partition("\t")
+        if ts.strip().isdigit() and int(ts):
+            out[pk] = time.time() - int(ts)
+    return out
+
+
+def probe(mesh, hubs):
+    """{pubkey: rtt in ms} for the hubs that answer a ping through the tunnel."""
+
+    def one(item):
+        out = run(
+            "ping",
+            "-n",
+            "-c",
+            "2",
+            "-i",
+            "0.2",
+            "-W",
+            "1",
+            "-I",
+            IFACE,
+            str(router_ip(mesh, item[1]["id"])),
+            check=False,
+        )
+        times = [float(t) for t in re.findall(r"time=([\d.]+)", out)]
+        return item[0], min(times) if times else None
+
+    with ThreadPoolExecutor(PARALLEL) as pool:
+        return {pk: rtt for pk, rtt in pool.map(one, hubs.items()) if rtt is not None}
+
+
+def stats_db():
+    """Traffic and latency history. Every row belongs to the hub that measured it (reporter):
+    what it received from and sent to one peer in one time bucket, and the ping across that link."""
+    db = sqlite3.connect(f"{DIR}/stats.db", timeout=10)
+    db.executescript(
+        "CREATE TABLE IF NOT EXISTS link(reporter INT, peer INT, ts INT, rx INT, tx INT, ms INT, "
+        "PRIMARY KEY(reporter, peer, ts)) WITHOUT ROWID;"
+        "CREATE TABLE IF NOT EXISTS total(reporter INT, peer INT, rx INT, tx INT, PRIMARY KEY(reporter, peer)) WITHOUT ROWID;"
+    )
+    return db
+
+
+def record_stats(my_id, alive, nets, rtt):
+    """On a hub: add what crossed each link since the last run. Must never get in the tunnel's way."""
+    try:
+        last, now, bucket = read_json("counters.json", {}), {}, int(time.time()) // 60 * 60
+        db = stats_db()
+        for line in run("wg", "show", IFACE, "transfer", check=False).splitlines():
+            pk, rx, tx = line.split("\t")
+            if pk not in alive:
+                continue
+            now[pk] = [int(rx), int(tx)]
+            was = last.get(pk, now[pk])  # a peer seen for the first time starts counting from here
+            got, sent = (c - w if c >= w else c for c, w in zip(now[pk], was))  # counters restart with the interface
+            ms = round(rtt[pk]) if pk in rtt else nets.get(pk, {}).get("rtt", {}).get(str(my_id))
+            db.execute(
+                "INSERT INTO link VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(reporter, peer, ts) DO UPDATE SET "
+                "rx = rx + excluded.rx, tx = tx + excluded.tx, ms = excluded.ms",
+                (my_id, alive[pk]["id"], bucket, got, sent, ms),
+            )
+            db.execute(
+                "INSERT INTO total VALUES (?, ?, ?, ?) ON CONFLICT(reporter, peer) DO UPDATE SET "
+                "rx = rx + excluded.rx, tx = tx + excluded.tx",
+                (my_id, alive[pk]["id"], got, sent),
+            )
+        if bucket % 3600 == 0:  # hourly: fold old minutes into 10-minute buckets, drop what is too old
+            cut = bucket - KEEP_FINE
+            db.execute(
+                "INSERT INTO link SELECT reporter, peer, ts / 600 * 600, sum(rx), sum(tx), CAST(avg(ms) AS INT) FROM link "
+                "WHERE ts < ? AND ts % 600 != 0 GROUP BY 1, 2, 3 ON CONFLICT(reporter, peer, ts) DO UPDATE SET "
+                "rx = rx + excluded.rx, tx = tx + excluded.tx",
+                (cut,),
+            )
+            db.execute("DELETE FROM link WHERE ts < ? AND ts % 600 != 0", (cut,))
+            db.execute("DELETE FROM link WHERE ts < ?", (bucket - KEEP_ALL,))
+        db.commit()
+        db.close()
+        write(f"{DIR}/counters.json", json.dumps(now))
+    except (sqlite3.Error, ValueError) as e:
+        log(f"stats: {e}")
+
+
+def stats_cursors():
+    """{reporter id: newest bucket we hold from it}"""
+    try:
+        db = stats_db()
+        out = dict(db.execute("SELECT reporter, max(ts) FROM link GROUP BY reporter").fetchall())
+        db.close()
+        return out
+    except sqlite3.Error:
+        return {}
+
+
+def stats_export(my_id, since):
+    try:
+        db = stats_db()
+        out = {
+            "stats": db.execute(
+                "SELECT peer, ts, rx, tx, ms FROM link WHERE reporter = ? AND ts >= ? ORDER BY ts LIMIT 3000",
+                (my_id, since),
+            ).fetchall(),
+            "totals": db.execute("SELECT peer, rx, tx FROM total WHERE reporter = ?", (my_id,)).fetchall(),
+        }
+        db.close()
+        return out
+    except sqlite3.Error:
+        return {}
+
+
+def stats_import(reporter, got):
+    """Take another hub's own measurements; it can only speak for itself."""
+    ints = lambda row, n: isinstance(row, list) and len(row) == n and all(type(v) is int or v is None for v in row)
+    try:
+        db = stats_db()
+        db.executemany(
+            "INSERT OR REPLACE INTO link VALUES (?, ?, ?, ?, ?, ?)",
+            [(reporter, *r) for r in got.get("stats", []) if ints(r, 5) and None not in r[:4]],
+        )
+        db.executemany(
+            "INSERT OR REPLACE INTO total VALUES (?, ?, ?, ?)",
+            [(reporter, *r) for r in got.get("totals", []) if ints(r, 3) and None not in r],
+        )
+        db.commit()
+        db.close()
+    except (sqlite3.Error, TypeError) as e:
+        log(f"stats: {e}")
+
+
+def pair_psk(loc, peer):
+    """The preshared key for one link. It is derived from the mesh secret *and* the two nodes'
+    own key exchange, so it differs per pair and no third node - mesh member or not - can
+    compute it; WireGuard then refuses any handshake that does not know it."""
+    from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X25519PublicKey
+
+    shared = X25519PrivateKey.from_private_bytes(base64.b64decode(loc["key"])).exchange(
+        X25519PublicKey.from_public_bytes(base64.b64decode(peer))
+    )
+    return base64.b64encode(
+        hmac.new(base64.b64decode(loc["mesh"]["psk"]), b"meshbone link psk" + shared, "sha256").digest()
+    ).decode()
+
+
+def plan(loc, nodes, nets, rtt, seen, previous=None):
+    """Which peer carries which prefix -> ({peer: [prefixes]}, primary hub).
+
+    WireGuard sends a packet to the one peer whose AllowedIPs cover it and drops
+    packets that arrive from a peer with a source outside them, so this table is
+    the routing table and the anti-spoofing filter at once - and it is derived
+    from the signed directory, not from anything a neighbour claims.
+
+    A hub hands every prefix to its owner. A client keeps each hub's own prefixes
+    on that hub and sends everything else through its primary hub: the reachable
+    one with the best ping (plus cost), unless that hub does not currently see
+    the destination and another one does.
+    """
+    mesh, mypk, alive = loc["mesh"], loc["pub"], live(nodes)
+    hub = bool(alive[mypk]["endpoint"])
+    peers = {pk: n for pk, n in alive.items() if pk != mypk and (hub or n["endpoint"])}
+    table = {pk: [] for pk in peers}
+    if not peers:
+        return table, None
+    owners = {}
+    for pk, n in alive.items():
+        for p in prefixes(mesh, n):
+            owners.setdefault(p, []).append(pk)
+    if hub:
+        for p, own in owners.items():
+            if mypk not in own:  # among several holders of a cluster IP: the one heard from last
+                table[min(own, key=lambda pk: (seen.get(pk, float("inf")), pk))].append(p)
+        return table, None
+
+    def score(pk):
+        return rtt.get(pk, 0) + peers[pk]["cost"] + loc["cost"].get(peers[pk]["name"], 0)
+
+    up = [pk for pk in peers if pk in rtt] or list(peers)  # nothing answers yet: try them all
+    primary = min(up, key=lambda pk: (score(pk), pk))
+    if previous in up and score(previous) <= score(primary) + 5:
+        primary = previous  # do not flap between hubs that are about equally good
+    for p, own in owners.items():
+        if mypk in own:
+            continue
+        direct = [pk for pk in own if pk in up]
+        if direct:  # the destination is a reachable hub itself
+            table[min(direct, key=lambda pk: (score(pk), pk))].append(p)
+        elif all(pk in peers for pk in own):  # only on hubs that are down; keeps their address probed
+            table[own[0]].append(p)
+        else:
+            ids = {alive[pk]["id"] for pk in own}
+            via = [h for h in up if ids & set(nets.get(h, {}).get("sees", []))]
+            table[primary if primary in via or not via else min(via, key=lambda pk: (score(pk), pk))].append(p)
+    return table, primary
+
+
+def reconcile():
+    """Make the WireGuard link, routes, cluster IPs and firewall match the directory. Idempotent."""
+    loc, nodes, nets = local(), load(), load_nets()
+    mesh, mypk, me = loc["mesh"], loc["pub"], nodes[loc["pub"]]
+    alive = live(nodes)
+    hub, active = bool(me["endpoint"]), mypk in alive
+    my_ip = router_ip(mesh, me["id"])
+    attached = local_nets()
+    seen = handshakes()
+    was = read_json("state.json", {})
+    rtt = probe(mesh, {pk: n for pk, n in alive.items() if n["endpoint"] and pk != mypk}) if active else {}
+    table, primary = plan(loc, nodes, nets, rtt, seen, was.get("primary")) if active else ({}, None)
+
+    old = nets.get(mypk, {})
+    ms = {str(alive[pk]["id"]): round(v) for pk, v in rtt.items()}
+    told = old.get("rtt", {})
+    if ms.keys() == told.keys() and all(abs(v - told[k]) <= max(3, v // 4) for k, v in ms.items()):
+        ms = told  # ordinary jitter is not news worth telling the whole mesh
+    report = {
+        "nets": attached,
+        "wants": loc.get("wants", ""),
+        "rtt": ms,
+        "sees": sorted(alive[pk]["id"] for pk in table if seen.get(pk, FRESH) < FRESH) if hub else [],
+        "primary": alive[primary]["id"] if primary else None,
+        "admin": os.path.exists(f"{DIR}/admin.key"),
+    }
+    if {k: v for k, v in old.items() if k != "seq"} != report:
+        nets[mypk] = {**report, "seq": next_seq(nets.get(mypk, {}).get("seq", 0))}
+        save_nets(nets)  # travels with the next gossip round
+
+    sync_vips(set(held_vips(mesh, me)) if active else set())
+    if not active:  # revoked: take everything down
+        run("ip", "link", "del", IFACE, check=False)
+        firewall([])
+        for unit in ("meshbone-serve.socket", "meshbone-admin.socket"):
+            run("systemctl", "stop", unit, check=False)
+        return
+
+    loosen_rp_filter()
+    if hub or me["subnets"]:
+        run("sysctl", "-qw", "net.ipv4.ip_forward=1", check=False)
+    port = loc.get("listen_port") or (int(me["endpoint"].rpartition(":")[2]) if hub else None)
+    conf = f"[Interface]\nPrivateKey = {loc['key']}\n" + (f"ListenPort = {port}\n" if port else "")
+    for pk, carried in sorted(table.items()):
+        n = alive[pk]
+        conf += (
+            f"[Peer]\nPublicKey = {pk}\nPresharedKey = {pair_psk(loc, pk)}\n"
+            f"AllowedIPs = {', '.join(str(p) for p in sorted(carried))}\n"
+        )
+        if n["endpoint"]:
+            host, _, peer_port = n["endpoint"].rpartition(":")
+            endpoint = resolve(host, int(peer_port))  # on DNS failure keep whatever endpoint wg has
+            conf += (f"Endpoint = {endpoint}\n" if endpoint else "") + "PersistentKeepalive = 25\n"
+    try:
+        if not run("ip", "-j", "link", "show", "dev", IFACE, check=False):
+            run("ip", "link", "add", IFACE, "type", "wireguard")
+        run("wg", "syncconf", IFACE, "/dev/stdin", input=conf)
+        run("ip", "addr", "replace", f"{my_ip}/32", "dev", IFACE)
+        run("ip", "link", "set", "dev", IFACE, "mtu", str(loc.get("mtu") or 1420), "up")
+        run("sysctl", "-qw", f"net.ipv4.conf.{IFACE}.rp_filter=2", check=False)
+    except subprocess.CalledProcessError as e:
+        log(f"{IFACE}: {e.stderr.strip()}")
+    # send the mesh ranges and other nodes' subnets into the tunnel - but never a network this
+    # machine is itself attached to
+    routes = {mesh_net(mesh), cluster_net(mesh)} | {
+        IPv4Network(s)
+        for pk, n in alive.items()
+        if pk != mypk
+        for s in n["subnets"]
+        if not any(IPv4Network(s).overlaps(IPv4Network(l)) for l in attached)
+    }
+    sync_routes(routes, my_ip)
+    if hub:
+        record_stats(me["id"], alive, nets, rtt)
+
+    serves_admin = hub or os.path.exists(f"{DIR}/admin.key")  # hubs: the map; admin nodes: also /admin
+    rules = [["INPUT", "-i", IFACE, "-p", "tcp", "--dport", str(GOSSIP_PORT), "-j", "ACCEPT"]]
+    if serves_admin:
+        rules.append(["INPUT", "-i", IFACE, "-p", "tcp", "--dport", str(ADMIN_PORT), "-j", "ACCEPT"])
+    if port:
+        rules.append(["INPUT", "-p", "udp", "--dport", str(port), "-j", "ACCEPT"])
+    if hub or me["subnets"]:
+        rules += [["FORWARD", "-i", IFACE, "-j", "ACCEPT"], ["FORWARD", "-o", IFACE, "-j", "ACCEPT"]]
+    firewall(rules)
+    if {"primary": primary, "rtt": rtt} != was:
+        write(f"{DIR}/state.json", json.dumps({"primary": primary, "rtt": rtt}))
+    run("systemctl", "start", "meshbone-serve.socket", check=False)
+    run("systemctl", "start" if serves_admin else "stop", "meshbone-admin.socket", check=False)
+
+
+def install_packages():
+    try:
+        ed25519()
+        if shutil.which("wg"):
+            return
+    except ImportError:
+        pass
+    if shutil.which("apt-get"):
+        env = {**os.environ, "DEBIAN_FRONTEND": "noninteractive"}
+        subprocess.run(["apt-get", "update", "-q"], env=env)
+        subprocess.run(
+            ["apt-get", "install", "-y", "-q", "wireguard-tools", "python3-cryptography"], env=env, check=True
+        )
+    elif shutil.which("dnf"):
+        subprocess.run(["dnf", "install", "-y", "wireguard-tools", "python3-cryptography"], check=True)
+    else:
+        sys.exit("unsupported package manager: install wireguard-tools and python3-cryptography, then re-run")
+
+
+def install_self(dst):
+    src = os.path.realpath(__file__)
+    if src != dst:
+        shutil.copy(src, dst)
+        os.chmod(dst, 0o755)
+
+
+def install_units():
+    install_self(BIN)
+    mesh = local()["mesh"]
+    for name, text in UNITS.items():
+        # sys.executable: /run is mounted noexec, so --once can't exec the script directly
+        write(
+            f"{UNIT_DIR}/{name}",
+            text.format(
+                py=sys.executable, bin=BIN, port=GOSSIP_PORT, net=mesh["net"], vip=admin_vip(mesh), aport=ADMIN_PORT
+            ),
+            0o644,
+        )
+    run("systemctl", "daemon-reload")
+    run("systemctl", *(["start"] if ONCE else ["enable", "--now"]), "meshbone.timer")
+
+
+def verify_links():
+    """Wait for the first WireGuard handshakes: one proves the endpoint, the port forward, both
+    keys and the preshared key in a single step."""
+    loc, nodes = local(), load()
+    mine = bool(nodes[loc["pub"]]["endpoint"])
+    hubs = {pk: n for pk, n in live(nodes).items() if pk != loc["pub"] and n["endpoint"]}
+    deadline = time.time() + VERIFY_WAIT
+    while hubs and time.time() < deadline and not set(hubs) <= set(handshakes()):
+        time.sleep(1)
+    seen = handshakes()
+    for pk, n in hubs.items():
+        print(
+            f"  link to hub {n['name']} ({n['endpoint']}): "
+            + (
+                "verified"
+                if pk in seen
+                else "NO HANDSHAKE yet - check its endpoint, UDP port forward and firewall"
+                + (" (or this hub's own)" if mine else "")
+            )
+        )
+    if hubs:
+        with locked():
+            reconcile()
+        gossip()
+
+
+def bootstrap(mesh, key, nodes, nets, a, admin_key=None, conf=None):
+    if joined():
+        sys.exit("this machine is already in a mesh; run `meshbone leave` first")
+    install_packages()
+    pub = run("wg", "pubkey", input=key + "\n").strip()
+    if pub not in nodes:
+        sys.exit("this config's key does not match any node in it")
+    for l in map(IPv4Network, local_nets()):
+        for reserved in (mesh_net(mesh), cluster_net(mesh)):
+            if l.overlaps(reserved):
+                sys.exit(f"this machine is attached to {l}, which overlaps the mesh's own range {reserved}")
+        for k, n in live(nodes).items():
+            if k != pub and any(l.overlaps(IPv4Network(s)) for s in n["subnets"]):
+                print(
+                    f"warning: local network {l} overlaps a subnet of {n['name']}; "
+                    f"this machine will keep using its local network for it"
+                )
+    set_mode(getattr(a, "once", False))
+    os.makedirs(DIR, mode=0o700, exist_ok=True)
+    opts = {k: getattr(a, k) for k in ("listen_port", "mtu") if getattr(a, k, None)}
+    write(f"{DIR}/node.json", json.dumps({"mesh": mesh, "key": key, "pub": pub, "cost": {}, **opts}))
+    if admin_key:
+        write(f"{DIR}/admin.key", admin_key)
+    save(nodes)
+    save_nets(nets)
+    write(f"{DIR}/conf.json", json.dumps(conf or {}))
+    install_units()
+    with locked():
+        reconcile()
+    me = nodes[pub]
+    print(
+        f"{me['name']}: {'hub' if me['endpoint'] else 'client'} in mesh {mesh['name']}, "
+        f"address {router_ip(mesh, me['id'])}"
+    )
+    if me["endpoint"]:
+        print(
+            f"  listening on UDP {opts.get('listen_port') or me['endpoint'].rpartition(':')[2]}; "
+            f"others dial {me['endpoint']}"
+        )
+    verify_links()
+
+
+def admin():
+    """State for a directory-changing command; needs the key every entry is signed with."""
+    if not os.path.exists(f"{DIR}/admin.key"):
+        sys.exit("run this on an admin node: this machine does not hold the mesh's admin.key")
+    return local(), load(), load_nets()
+
+
+@contextlib.contextmanager
+def editing():
+    """Change the directory on an admin node. Yields (loc, nodes, nets); when the block ends
+    normally the result is saved, applied here and pushed to the whole mesh."""
+    with locked():
+        loc, nodes, nets = admin()
+        had_hub = any(n["endpoint"] for n in live(nodes).values())
+        yield loc, nodes, nets
+        if had_hub and not any(n["endpoint"] for n in live(nodes).values()):
+            sys.exit("that would leave the mesh without a hub; make another node a hub first")
+        save(nodes)
+        reconcile()
+    gossip(flood=True)
+
+
+def rows():
+    """One dict per live node: the directory entry plus role, ip, eff (cost with the local
+    override), wants (pending hub request) and link - how *this machine* reaches it."""
+    loc, nodes, nets = local(), load(), load_nets()
+    seen, st, alive = handshakes(), read_json("state.json", {}), live(nodes)
+    hub = bool(nodes[loc["pub"]]["endpoint"])
+    for pk, n in sorted(alive.items(), key=lambda kv: kv[1]["id"]):
+        if pk == loc["pub"]:
+            link = "this machine"
+        elif hub or n["endpoint"]:
+            link = "linked" if seen.get(pk, FRESH) < FRESH else "no link"
+            if pk in st.get("rtt", {}):
+                link += f", ping {st['rtt'][pk]:.0f} ms"
+            if pk == st.get("primary"):
+                link += ", sending through it"
+        else:
+            link = "via " + alive.get(st.get("primary"), {"name": "a hub"})["name"]
+        wants = nets.get(pk, {}).get("wants", "")
+        yield {
+            **n,
+            "role": "hub" if n["endpoint"] else "client",
+            "ip": str(router_ip(loc["mesh"], n["id"])),
+            "link": link,
+            "eff": max(n["cost"], loc["cost"].get(n["name"], 0)),
+            "wants": wants if wants != n["endpoint"] else "",
+        }
+
+
+def topology():
+    """The whole mesh as its nodes report it: every node, and every link with state and latency."""
+    loc, nodes, nets = local(), load(), load_nets()
+    mesh, alive = loc["mesh"], live(nodes)
+    out = {"nodes": [], "links": []}
+    try:  # bytes over the last hour, as counted by the hub end: {(hub id, peer id): (received, sent)}
+        db = stats_db()
+        hour = {
+            (r, p): (rx, tx)
+            for r, p, rx, tx in db.execute(
+                "SELECT reporter, peer, sum(rx), sum(tx) FROM link WHERE ts >= ? GROUP BY 1, 2",
+                (int(time.time()) - 3600,),
+            )
+        }
+        db.close()
+    except sqlite3.Error:
+        hour = {}
+    for pk, n in sorted(alive.items(), key=lambda kv: kv[1]["id"]):
+        mine = nets.get(pk, {})
+        out["nodes"].append(
+            {
+                "id": n["id"],
+                "name": n["name"],
+                "hub": bool(n["endpoint"]),
+                "me": pk == loc["pub"],
+                "ip": str(router_ip(mesh, n["id"])),
+                "endpoint": n["endpoint"],
+                "subnets": n["subnets"],
+                "vips": n["vips"],
+                "admin": bool(mine.get("admin")),
+                "labels": n.get("labels", []),
+                "desc": n.get("desc", ""),
+                "simple": bool(n.get("simple")),
+            }
+        )
+        for hpk, h in alive.items():
+            if not h["endpoint"] or hpk == pk or (n["endpoint"] and pk > hpk):  # hub pairs once
+                continue
+            theirs = nets.get(hpk, {})
+            ms = mine.get("rtt", {}).get(str(h["id"]), theirs.get("rtt", {}).get(str(n["id"])))
+            to_hub, from_hub = hour.get((h["id"], n["id"]), hour.get((n["id"], h["id"]), (None, None))[::-1])
+            out["links"].append(
+                {
+                    "a": n["id"],
+                    "b": h["id"],
+                    "ms": ms,
+                    "to_hub_1h": to_hub,
+                    "from_hub_1h": from_hub,
+                    "up": n["id"] in theirs.get("sees", []) or h["id"] in mine.get("sees", []),
+                    "primary": not n["endpoint"]
+                    and (
+                        mine.get("primary") == h["id"]  # a simple client has one hub
+                        or bool(n.get("simple"))
+                        and n["id"] in theirs.get("sees", [])
+                    ),
+                }
+            )
+    return out
+
+
+# --- commands ------------------------------------------------------------------
+
+
+def cmd_install():
+    install_packages()
+    install_self(SBIN)
+    print(f"installed {SBIN}; next: `meshbone create ...` or `meshbone join FILE`")
+
+
+def cmd_create(a):
+    install_packages()
+    from cryptography.hazmat.primitives import serialization as ser
+
+    key, psk = run("wg", "genkey").strip(), run("wg", "genpsk").strip()
+    pub = run("wg", "pubkey", input=key + "\n").strip()
+    password = secrets.token_urlsafe(16)
+    signer = ed25519().Ed25519PrivateKey.generate()
+    admin_key = base64.b64encode(
+        signer.private_bytes(ser.Encoding.Raw, ser.PrivateFormat.Raw, ser.NoEncryption())
+    ).decode()
+    admin_pub = base64.b64encode(signer.public_key().public_bytes(ser.Encoding.Raw, ser.PublicFormat.Raw)).decode()
+    try:
+        mesh = {
+            "name": a.mesh,
+            "psk": psk,
+            "net": str(IPv4Network(a.net)),
+            "cluster_net": str(IPv4Network(a.cluster_net)),
+            "admin": hashlib.sha256(password.encode()).hexdigest(),
+            "admin_pub": admin_pub,
+        }
+    except ValueError as e:
+        sys.exit(f"bad --net or --cluster-net: {e}")
+    if not valid_mesh(mesh):
+        sys.exit("bad --mesh, --net (a /20 to /23) or --cluster-net (must not overlap --net)")
+    me = checked(
+        mesh,
+        {},
+        {},
+        pub,
+        {
+            "name": a.name,
+            "id": id_pool(mesh, bool(a.endpoint))[0],
+            "endpoint": a.endpoint,
+            "subnets": a.subnet,
+            "vips": [],
+            "cost": 0,
+            "seq": next_seq(),
+            "desc": getattr(a, "desc", None) or "",
+            "labels": getattr(a, "label", None) or [],
+        },
+    )
+    me["sig"] = base64.b64encode(signer.sign(signable(pub, me))).decode()
+    bootstrap(mesh, key, {pub: me}, {}, a, admin_key)
+    print(
+        f"mesh map: http://{admin_vip(mesh)}:{ADMIN_PORT}/ (any hub answers, from inside the mesh)\n"
+        f"management: http://{router_ip(mesh, me['id'])}:{ADMIN_PORT}/admin, user admin, password {password}\n"
+        f"(change it there or with `meshbone passwd`)\n"
+        f"this machine holds {DIR}/admin.key, the key that controls the mesh"
+    )
+
+
+def cmd_invite(a):
+    with editing() as (loc, nodes, nets):
+        mesh = loc["mesh"]
+        key = run("wg", "genkey").strip()
+        pub = run("wg", "pubkey", input=key + "\n").strip()
+        used = {n["id"] for n in nodes.values()}  # ids of revoked nodes are never reused
+        if getattr(a, "ip", ""):
+            try:
+                node_id = int(IPv4Address(a.ip)) - int(mesh_net(mesh).network_address)
+            except ValueError as e:
+                sys.exit(f"bad --ip: {e}")
+            if not 0 < node_id < mesh_net(mesh).num_addresses - 1 or node_id in used:
+                sys.exit(f"{a.ip} is not a free address in {mesh['net']}")
+        else:
+            # random so that two admins inviting at the same moment rarely collide
+            free = sorted(set(id_pool(mesh, bool(a.endpoint))) - used)
+            if not free:
+                sys.exit("the mesh range has no free address for this role")
+            node_id = random.choice(free)
+        simple = getattr(a, "simple", False)
+        if simple and (a.endpoint or a.subnet or a.vip or a.admin):
+            sys.exit("a simple client only gets an address: no endpoint, subnets, cluster IPs or admin key")
+        nodes[pub] = sign(
+            pub,
+            checked(
+                mesh,
+                nodes,
+                nets,
+                pub,
+                {
+                    "name": a.name,
+                    "id": node_id,
+                    "endpoint": a.endpoint,
+                    "subnets": a.subnet,
+                    "vips": a.vip,
+                    "cost": a.cost,
+                    "seq": next_seq(),
+                    "desc": getattr(a, "desc", "") or "",
+                    "labels": getattr(a, "label", []) or [],
+                    **({"simple": True} if simple else {}),
+                },
+            ),
+        )
+        if simple:  # its key stays with the admin nodes, encrypted, so the config can be shown again later
+            conf_put(f"simple_{node_id}", password_box().encrypt(key.encode()).decode())
+    if simple:
+        return
+    out = a.out or f"{a.name}.mesh.json"
+    cfg = {**state(), "mesh": mesh, "key": key}
+    if a.admin:
+        cfg["admin_key"] = read("admin.key")
+    write(out, json.dumps(cfg, indent=1))
+    print(
+        f"wrote {out} - it holds {a.name}'s private key: copy it over a secure channel, "
+        f"run `meshbone join {os.path.basename(out)}` there, then delete it"
+    )
+
+
+def conf_put(name, value):
+    """Store one mesh-wide setting, signed (call it on an admin node, under the lock)."""
+    conf = load_conf()
+    r = {"value": value, "seq": next_seq(conf.get(name, {}).get("seq", 0))}
+    key = ed25519().Ed25519PrivateKey.from_private_bytes(base64.b64decode(read("admin.key")))
+    r["sig"] = base64.b64encode(key.sign(conf_signable(name, r))).decode()
+    conf[name] = r
+    write(f"{DIR}/conf.json", json.dumps(conf, indent=1, sort_keys=True))
+
+
+def simple_config(name, hub=None):
+    """A standard WireGuard config for a simple client -> (text, hub used, all hub names).
+
+    Plain WireGuard cannot choose between hubs, so the device sends everything through
+    one of them; pick another and import again if that hub is ever down. The config
+    lists the networks known right now - it does not follow later changes by itself.
+    """
+    loc, nodes, nets = admin()
+    mesh, alive = loc["mesh"], live(nodes)
+    pk, n = by_name(nodes, name)
+    if not n.get("simple"):
+        sys.exit(f"{name} is not a simple client")
+    try:
+        key = password_box().decrypt(load_conf()[f"simple_{n['id']}"]["value"].encode()).decode()
+    except Exception:
+        sys.exit(f"the key of {name} is not on this admin node yet; try again in a moment")
+    hubs = {
+        h["name"]: (k, h)
+        for k, h in sorted(alive.items(), key=lambda kv: (kv[1]["cost"], kv[1]["id"]))
+        if h["endpoint"]
+    }
+    if hub not in hubs:
+        if hub:
+            sys.exit(f"{hub} is not a hub")
+        if not hubs:
+            sys.exit("the mesh has no hub to connect to")
+        hub = next((h for h, (k, o) in hubs.items() if n["id"] in nets.get(k, {}).get("sees", [])), next(iter(hubs)))
+    hub_pk, h = hubs[hub]
+    reach = [mesh["net"], mesh["cluster_net"]] + sorted({s for o in alive.values() for s in o["subnets"]})
+    text = (
+        f"# mesh {mesh['name']}: {name} via {hub}\n[Interface]\nPrivateKey = {key}\n"
+        f"Address = {router_ip(mesh, n['id'])}/32\n\n[Peer]\nPublicKey = {hub_pk}\n"
+        f"PresharedKey = {pair_psk({'key': key, 'mesh': mesh}, hub_pk)}\nEndpoint = {h['endpoint']}\n"
+        f"AllowedIPs = {', '.join(reach)}\nPersistentKeepalive = 25\n"
+    )
+    return text, hub, list(hubs)
+
+
+def qr(text, kind):
+    """A QR code of text: kind 'SVG' for a page, 'ansiutf8' for a terminal. None without qrencode."""
+    if not shutil.which("qrencode"):
+        installer = [["apt-get", "install", "-y", "-q", "qrencode"], ["dnf", "install", "-y", "qrencode"]]
+        for cmd in installer:
+            if shutil.which(cmd[0]):
+                subprocess.run(cmd, stdin=subprocess.DEVNULL, capture_output=True)
+    try:
+        return run("qrencode", "-t", kind, "-m", "2", "-o", "-", input=text)
+    except (OSError, subprocess.CalledProcessError):
+        return None
+
+
+def cmd_simple(a):
+    """Create a simple client, or export an existing one again (e.g. through another hub)."""
+    if not any(n["name"] == a.name for n in live(load()).values()):
+        cmd_invite(
+            argparse.Namespace(
+                name=a.name,
+                endpoint="",
+                subnet=[],
+                vip=[],
+                cost=0,
+                admin=False,
+                out=None,
+                simple=True,
+                desc=a.desc,
+                label=a.label,
+                ip=a.ip,
+            )
+        )
+    text, hub, hubs = simple_config(a.name, a.hub)
+    out = a.out or f"{a.name}.conf"
+    write(out, text)
+    print(
+        f"wrote {out}: a standard WireGuard config for {a.name}, connecting through {hub}"
+        + (f" (other hubs: {', '.join(h for h in hubs if h != hub)})" if len(hubs) > 1 else "")
+        + ". It holds the device's private key - delete it once imported"
+    )
+    if a.qr:
+        print(qr(text, "ansiutf8") or "(no QR code: qrencode is not installed)")
+
+
+def parse_chain(text):
+    """'user:password@host;user@host2;host3' -> [(ssh destination, password or None)].
+    The older 'user@host:user@host2' spelling (no passwords) still works."""
+    legacy = ";" not in text and ("@" in text.split(":")[0] or "@" not in text)
+    chain = []
+    for part in text.split(":" if legacy else ";"):
+        cred, _, host = part.strip().rpartition("@")
+        user, _, password = cred.partition(":")
+        dest = f"{user}@{host}" if user else host
+        if not re.fullmatch(r"([\w.-]+@)?[\w.-]+", dest):
+            sys.exit(
+                "--remote is USER[:PASSWORD]@HOST[;USER[:PASSWORD]@HOST]... (ports and options belong in ssh_config)"
+            )
+        chain.append((dest, password or None))
+    return chain
+
+
+@contextlib.contextmanager
+def ssh_session(hops):
+    """Yields the argv prefix for ssh. Under sudo it logs in as the person who typed the command
+    (their keys, config and known_hosts). Passwords are answered by an askpass helper, so they
+    never appear on a command line."""
+    user = os.environ.get("SUDO_USER") if os.geteuid() == 0 else None
+    front, ssh = (["sudo", "-u", user] if user else []), ["ssh", "-o", "StrictHostKeyChecking=accept-new"]
+    known = dict(sorted(((d, p) for d, p in hops if p), key=lambda kv: -len(kv[0])))
+    if not known:
+        yield front + ssh
+        return
+    box = tempfile.mkdtemp(prefix="meshbone-ssh-")
+    try:
+        write(
+            f"{box}/askpass",
+            "#!/usr/bin/env python3\nimport sys\nfor who, password in %r.items():\n"
+            "    if who in sys.argv[1]:\n        print(password)\n        break\n" % known,
+            0o700,
+        )
+        if user:
+            shutil.chown(box, user)
+            shutil.chown(f"{box}/askpass", user)
+        yield front + ["env", f"SSH_ASKPASS={box}/askpass", "SSH_ASKPASS_REQUIRE=force"] + ssh + [
+            "-o",
+            "NumberOfPasswordPrompts=1",
+            "-o",
+            "PreferredAuthentications=publickey,password",
+        ]
+    finally:
+        shutil.rmtree(box, ignore_errors=True)
+
+
+def remote_argv(base, chain, command, jump, tty=False):
+    """argv that runs a shell command on the last host of an ssh chain.
+
+    jump: every hop is authenticated from this machine (ssh -J). Otherwise each
+    hop logs in to the next one with its own keys, the way one would by hand -
+    which is what works when only the jump host is authorized on the inner one.
+    """
+    opts = ["-t"] if tty else []
+    if jump:
+        return [*base, *opts, "-J", ",".join(chain[:-1]), chain[-1], command]
+    for hop in reversed(chain[1:]):
+        command = shlex.join(["ssh", *opts, hop, command])
+    return [*base, *opts, chain[0], command]
+
+
+def cmd_deploy(a):
+    """Invite a node and install it over ssh."""
+    hops = parse_chain(a.remote)
+    chain, secret, tmp = [d for d, _ in hops], hops[-1][1], None
+    cfg = f"{DIR}/{a.name}.deploy.json"
+    with contextlib.redirect_stdout(io.StringIO()):
+        cmd_invite(argparse.Namespace(**{**vars(a), "out": cfg}))
+    with ssh_session(hops) as base:
+        try:
+            keys_only = [] if any(p for _, p in hops) else ["-o", "BatchMode=yes"]
+            jump = (
+                len(chain) > 1
+                and subprocess.run(
+                    [*base, *keys_only, "-o", "ConnectTimeout=10", "-J", ",".join(chain[:-1]), chain[-1], "true"],
+                    stdin=subprocess.DEVNULL,
+                    capture_output=True,
+                ).returncode
+                == 0
+            )
+            if not jump and any(p for _, p in hops[1:]):
+                raise OSError(
+                    "a password for an inner hop only works if this machine can log in to it through the hops before it"
+                )
+            # scp cannot follow a chain of logins, a tar stream on stdin can
+            payload = io.BytesIO()
+            with tarfile.open(fileobj=payload, mode="w") as tar:
+                tar.add(os.path.realpath(__file__), "meshbone.py")
+                tar.add(cfg, "mesh.json")
+            made = (
+                subprocess.run(
+                    remote_argv(base, chain, 'umask 077 && d=$(mktemp -d) && tar -xf - -C "$d" && echo "$d"', jump),
+                    input=payload.getvalue(),
+                    stdout=subprocess.PIPE,
+                    check=True,
+                )
+                .stdout.decode()
+                .split()
+            )
+            if not made or not re.fullmatch(r"/[\w./-]+", made[-1]):
+                raise OSError(f"unexpected reply from {chain[-1]}: {made!r}")
+            tmp = made[-1]
+            join = (
+                f"python3 {tmp}/meshbone.py join {tmp}/mesh.json"
+                + (" --once" if a.once else "")
+                + "".join(
+                    f" --{k.replace('_', '-')} {int(getattr(a, k))}" for k in ("listen_port", "mtu") if getattr(a, k)
+                )
+            )
+            sudo = "sudo -S -p ''" if secret else "sudo"  # with a password, sudo reads it from stdin
+            subprocess.run(
+                remote_argv(
+                    base,
+                    chain,
+                    f'S=; [ "$(id -u)" = 0 ] || S="{sudo}"; $S {join}; rc=$?; rm -rf {tmp}; exit $rc',
+                    jump,
+                    tty=not secret and sys.stdin.isatty(),
+                ),
+                check=True,
+                **({"input": (secret + "\n").encode()} if secret else {}),
+            )
+        except (OSError, subprocess.CalledProcessError) as e:
+            if tmp:  # the config holds the node's private key: do not leave it behind
+                subprocess.run(
+                    remote_argv(base, chain, f"rm -rf {tmp}", jump), stdin=subprocess.DEVNULL, capture_output=True
+                )
+            cmd_revoke(argparse.Namespace(name=a.name))
+            sys.exit(f"deploy failed ({e}); {a.name} was revoked again")
+        finally:
+            os.remove(cfg)
+    with locked():
+        reconcile()
+    print(f"{a.name} is installed and has joined")
+    if a.endpoint and getattr(a, "verify", True):
+        confirm_hub(a.name)
+
+
+def cmd_join(a):
+    with open(a.file) as f:
+        cfg = json.load(f)
+    if cfg.get("v") != VERSION or not valid_mesh(cfg.get("mesh")) or not re.fullmatch(KEY_RE, str(cfg.get("key"))):
+        sys.exit(f"{a.file} is not a meshbone v{VERSION} config")
+    nodes = {pk: n for pk, n in cfg["nodes"].items() if valid(cfg["mesh"], pk, n)}
+    nets = {pk: r for pk, r in cfg.get("nets", {}).items() if valid_nets(pk, r)}
+    conf = {k: r for k, r in cfg.get("conf", {}).items() if valid_conf(cfg["mesh"], k, r)}
+    bootstrap(cfg["mesh"], cfg["key"], nodes, nets, a, cfg.get("admin_key"), conf)
+
+
+def confirm_hub(name):
+    """A node only stays a hub if somebody outside can really dial it: wait until a client reports
+    a ping through its endpoint, otherwise take the endpoint away so it is an ordinary client again."""
+    loc, deadline = local(), time.time() + CONFIRM_WAIT
+    while True:
+        with locked():
+            reconcile()
+        gossip()
+        alive, nets = live(load()), load_nets()
+        pk, n = by_name(load(), name)
+        hubs = [k for k, o in alive.items() if o["endpoint"]]
+        online = {i for h in hubs for i in nets.get(h, {}).get("sees", [])}
+        testers = [
+            k
+            for k, o in alive.items()
+            if not o["endpoint"] and not o.get("simple") and (o["id"] in online or k == loc["pub"])
+        ]
+        if not testers or hubs == [pk]:
+            print(f"note: no client is online to test {n['endpoint']} from outside; taking it on trust")
+            return
+        if any(str(n["id"]) in nets.get(k, {}).get("rtt", {}) for k in testers) or (
+            loc["pub"] in testers and pk in read_json("state.json", {}).get("rtt", {})
+        ):
+            print(f"{name} is reachable at {n['endpoint']}: it is a hub now")
+            return
+        if time.time() > deadline:
+            break
+        time.sleep(3)
+    with editing() as (loc, nodes, nets):
+        pk, n = by_name(nodes, name)
+        endpoint, n["endpoint"], n["seq"] = n["endpoint"], "", next_seq(n["seq"])
+        sign(pk, n)
+    sys.exit(
+        f"no client could reach {name} at {endpoint} within {CONFIRM_WAIT}s (port forward? firewall? "
+        f"listen port?), so it stays a client. --no-verify skips this test"
+    )
+
+
+def cmd_set(a):
+    with editing() as (loc, nodes, nets):
+        pk, n = by_name(nodes, a.name)
+        had, was = list(n["subnets"]), n["endpoint"]
+        if a.endpoint is not None:
+            n["endpoint"] = a.endpoint
+        if a.subnet or a.no_subnet:
+            n["subnets"] = a.subnet
+        if a.vip or a.no_vip:
+            n["vips"] = a.vip
+        if a.cost is not None:
+            n["cost"] = a.cost
+        if getattr(a, "desc", None) is not None:
+            n["desc"] = a.desc
+        if getattr(a, "label", None) or getattr(a, "no_label", False):
+            n["labels"] = a.label
+        n["seq"] = next_seq(n["seq"])
+        sign(pk, checked(loc["mesh"], nodes, nets, pk, n, had))
+    if n["endpoint"] and not was and getattr(a, "verify", True):
+        confirm_hub(a.name)
+
+
+def cmd_local(a):
+    with locked():
+        loc = local()
+        for k in ("listen_port", "mtu"):
+            if getattr(a, k) is not None:
+                loc[k] = getattr(a, k)  # 0 puts it back to automatic
+        write(f"{DIR}/node.json", json.dumps(loc))
+        reconcile()
+    print(f"listen port {loc.get('listen_port') or 'automatic'}, mtu {loc.get('mtu') or 1420}")
+
+
+def cmd_promote(a):
+    wants = norm_endpoint(a.endpoint)
+    with locked():
+        loc = local()
+        write(f"{DIR}/node.json", json.dumps({**loc, "wants": wants}))
+        reconcile()
+    gossip()
+    if wants:
+        print(
+            f"asked to become a hub at {wants}; on an admin node run `meshbone approve "
+            f"{load()[loc['pub']]['name']}` (or use the admin page)"
+        )
+
+
+def cmd_approve(a):
+    with editing() as (loc, nodes, nets):
+        pk, n = by_name(nodes, a.name)
+        wants, was = nets.get(pk, {}).get("wants", ""), n["endpoint"]
+        if not wants or wants == n["endpoint"]:
+            sys.exit(f"{a.name} has no pending request")
+        n["endpoint"], n["seq"] = wants, next_seq(n["seq"])
+        sign(pk, checked(loc["mesh"], nodes, nets, pk, n, n["subnets"]))
+    if not was and getattr(a, "verify", True):
+        confirm_hub(a.name)
+
+
+def cmd_revoke(a):
+    with editing() as (loc, nodes, nets):
+        pk, n = by_name(nodes, a.name)
+        if pk == loc["pub"]:
+            sys.exit("revoke this node from another admin node, or run `meshbone leave` here")
+        n["gone"], n["seq"] = True, next_seq(n["seq"])
+        sign(pk, n)
+
+
+def cmd_cost(a):
+    with locked():
+        loc = local()
+        by_name(load(), a.name)
+        loc["cost"] = {k: v for k, v in {**loc["cost"], a.name: a.value}.items() if v}
+        write(f"{DIR}/node.json", json.dumps(loc))
+        reconcile()
+
+
+def cmd_sync():
+    with locked():
+        reconcile()
+    gossip()
+
+
+def cmd_serve():
+    """One exchange on the connection systemd handed us (Accept=yes socket)."""
+    sock = socket.fromfd(0, socket.AF_INET, socket.SOCK_STREAM)
+    reply, changed = handle(sock.getpeername()[0], sock.makefile("rb").readline(8 << 20))
+    if reply:
+        sock.sendall(reply)
+    sock.close()
+    settle(changed)
+
+
+def cmd_status():
+    loc, nodes, nets = local(), load(), load_nets()
+    mesh, alive = loc["mesh"], live(nodes)
+    print(
+        f"mesh {mesh['name']} {mesh['net']}, cluster {mesh['cluster_net']} (map http://{admin_vip(mesh)}:{ADMIN_PORT}/ "
+        f"on every hub){' (--once)' if ONCE else ''}"
+        f"{', admin node' if os.path.exists(f'{DIR}/admin.key') else ''}"
+    )
+    for r in rows():
+        print(
+            f"{r['role']:<6} {r['name']:<16} {r['ip']:<15} {r['endpoint'] or '(nat)':<24} "
+            f"{r['link']:<40} {' '.join(r['subnets'] + r['vips'])}"
+            + (f"  cost {r['eff']}" if r["eff"] else "")
+            + "".join(f" [{l}]" for l in r.get("labels", []))
+            + (f"  # {r['desc']}" if r.get("desc") else "")
+            + (f"  [asks to be a hub at {r['wants']}]" if r["wants"] else "")
+        )
+    for pk, n in nodes.items():
+        if not n.get("gone") and pk not in alive:
+            print(f"warning: {n['name']} was given an id that is already in use; revoke it and invite it again")
+    for pk, n in alive.items():
+        for s in n["subnets"]:
+            for k, o in alive.items():
+                for t in nets.get(k, {}).get("nets", []) if k != pk else []:
+                    if IPv4Network(s).overlaps(IPv4Network(t)):
+                        print(f"warning: subnet {s} of {n['name']} overlaps {t}, a local network of {o['name']}")
+
+
+def cmd_leave():
+    units = ["meshbone.timer", "meshbone.service", "meshbone-serve.socket", "meshbone-admin.socket"]
+    run("systemctl", "disable", "--now", *units, check=False)
+    firewall([])
+    for ifn in (IFACE, "mbvip"):
+        run("ip", "link", "del", ifn, check=False)
+    for path in [f"{UNIT_DIR}/{name}" for name in UNITS]:
+        with contextlib.suppress(FileNotFoundError):
+            os.remove(path)
+    shutil.rmtree(DIR, ignore_errors=True)
+    run("systemctl", "daemon-reload", check=False)
+    print("left the mesh; run `meshbone revoke` for this node on an admin node so its key stops being accepted")
+
+
+def cmd_upgrade():
+    """Run from the new script: replaces the installed copy and units, keeps the mesh state."""
+    install_units()
+    with locked():
+        reconcile()
+
+
+# --- web pages and API ---------------------------------------------------------
+
+
+def password_box():
+    # only admin nodes can read the password record: it is encrypted under the admin key
+    from cryptography.fernet import Fernet
+
+    return Fernet(
+        base64.urlsafe_b64encode(hashlib.sha256(b"meshbone password" + base64.b64decode(read("admin.key"))).digest())
+    )
+
+
+def check_password(password):
+    r = load_conf().get("admin_pw")
+    if not r:  # still the one printed by `create`
+        return hmac.compare_digest(hashlib.sha256(password.encode()).hexdigest(), local()["mesh"]["admin"])
+    try:
+        raw = password_box().decrypt(r["value"].encode())
+    except Exception:
+        return False
+    return hmac.compare_digest(hashlib.scrypt(password.encode(), salt=raw[:16], n=2**14, r=8, p=1, dklen=32), raw[16:])
+
+
+def set_password(new):
+    if len(new) < 8:
+        sys.exit("the password needs at least 8 characters")
+    with locked():
+        admin()
+        salt = secrets.token_bytes(16)
+        hashed = hashlib.scrypt(new.encode(), salt=salt, n=2**14, r=8, p=1, dklen=32)
+        conf_put("admin_pw", password_box().encrypt(salt + hashed).decode())
+    gossip(flood=True)
+
+
+def cmd_passwd():
+    import getpass
+
+    new = getpass.getpass("new management page password: ")
+    if new != getpass.getpass("again: "):
+        sys.exit("the two entries differ")
+    set_password(new)
+    print("password changed; the other admin nodes pick it up within seconds")
+
+
+PAGE_STYLE = """<style>
+:root{color-scheme:light dark;--bg:#fbfbfa;--fg:#1c1c1a;--muted:#6f6f68;--line:#deded7;--ok:#2f7d4f;--bad:#c2413a;--hub:#2d5fa8;--client:#8a8a80;--s1:#2a78d6;--s2:#eb6834}
+@media (prefers-color-scheme:dark){:root{--bg:#161615;--fg:#ecece6;--muted:#9a9a90;--line:#34342f;--ok:#5fbf85;--bad:#f07a70;--hub:#7fa9ea;--client:#8f8f86;--s1:#3987e5;--s2:#d95926}}
+body{font:14px/1.45 system-ui,sans-serif;margin:0;padding:20px;background:var(--bg);color:var(--fg);max-width:1100px;margin-inline:auto}
+h1{font-size:20px;margin:0 0 4px}h2{font-size:15px;margin:28px 0 8px}h3{font-size:14px;margin:0}p{margin:4px 0;color:var(--muted)}a{color:var(--hub)}
+nav{margin:0 0 14px;display:flex;gap:16px;flex-wrap:wrap}nav b{color:var(--fg)}
+canvas{width:100%;display:block}#map{border:1px solid var(--line);border-radius:8px;margin:14px 0 6px}
+.scroll{overflow-x:auto}table{border-collapse:collapse;width:100%}td,th{border-bottom:1px solid var(--line);padding:6px 10px;text-align:left;white-space:nowrap}
+th{font-weight:600;color:var(--muted);font-size:12px}td.n,th.n{text-align:right;font-variant-numeric:tabular-nums}code,td.m{font-family:ui-monospace,monospace;font-size:13px}
+input{font:inherit;padding:3px 5px;width:10em}input[name=cost]{width:4em}input.w{width:16em}button{font:inherit;padding:3px 10px}button.on{font-weight:600;border-color:var(--fg)}
+pre{padding:10px;border:1px solid var(--line);border-radius:6px;white-space:pre-wrap}.key span,.tag{display:inline-block;margin-right:16px}
+.tag{margin-right:4px;padding:0 6px;border:1px solid var(--line);border-radius:10px;font-size:12px}
+.bar{display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin:10px 0}.bar span{color:var(--muted);margin-left:10px}.bar input{width:13em}
+.chart{border:1px solid var(--line);border-radius:8px;padding:12px 14px;margin:12px 0;position:relative}.chart p{font-size:12px}
+.k{display:inline-block;width:14px;height:0;border-top:2px solid;vertical-align:middle;margin:0 5px 0 12px}
+#tip{position:fixed;pointer-events:none;background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:6px 9px;font-size:12px;box-shadow:0 2px 8px #0003;display:none}
+#tip b{font-variant-numeric:tabular-nums}form.grid{display:flex;gap:6px;flex-wrap:wrap}
+</style>"""
+
+MAP_SCRIPT = """<script>
+const T = __DATA__, cv = document.getElementById('map'), g = cv.getContext('2d');
+const css = v => getComputedStyle(document.documentElement).getPropertyValue(v).trim();
+function draw() {
+  const W = cv.clientWidth, H = Math.max(380, Math.min(680, W * 0.62)), k = devicePixelRatio || 1;
+  cv.width = W * k; cv.height = H * k; cv.style.height = H + 'px'; g.setTransform(k, 0, 0, k, 0, 0); g.clearRect(0, 0, W, H);
+  const hubs = T.nodes.filter(n => n.hub), pos = {}, cx = W / 2, cy = H / 2;
+  const sendsVia = n => { const l = T.links.find(l => l.a === n.id && l.primary); return l ? hubs.findIndex(h => h.id === l.b) : hubs.length; };
+  const clients = T.nodes.filter(n => !n.hub).sort((a, b) => sendsVia(a) - sendsVia(b) || a.id - b.id);
+  const r1 = hubs.length > 1 ? Math.min(W, H) * 0.24 : 0;
+  hubs.forEach((n, i) => { const a = 2 * Math.PI * i / hubs.length - Math.PI / 2; pos[n.id] = [cx + r1 * Math.cos(a), cy + r1 * Math.sin(a)]; });
+  clients.forEach((n, i) => { const a = 2 * Math.PI * (i + 0.5) / clients.length - Math.PI / 2; pos[n.id] = [cx + W * 0.36 * Math.cos(a), cy + H * 0.33 * Math.sin(a)]; });
+  g.textAlign = 'center'; g.textBaseline = 'middle';
+  for (const l of T.links) {                       // links first, nodes on top
+    const [x1, y1] = pos[l.a], [x2, y2] = pos[l.b], hubLink = hubs.some(h => h.id === l.a);
+    g.beginPath(); g.moveTo(x1, y1); g.lineTo(x2, y2);
+    g.strokeStyle = css(l.up ? '--ok' : '--bad'); g.setLineDash(l.up ? [] : [5, 5]);
+    g.lineWidth = l.up && (hubLink || l.primary) ? 2.5 : 1; g.globalAlpha = !l.up ? 0.4 : !hubLink && !l.primary ? 0.45 : 1; g.stroke();
+    g.globalAlpha = 1; g.setLineDash([]);
+    if (l.up && l.ms != null) {                   // the ping sits near the client end, clear of the middle
+      g.font = '12px system-ui, sans-serif';
+      const label = l.ms + ' ms', t = hubLink ? 0.5 : 0.3, mx = x1 + (x2 - x1) * t, my = y1 + (y2 - y1) * t, w = g.measureText(label).width + 8;
+      g.fillStyle = css('--bg'); g.fillRect(mx - w / 2, my - 8, w, 16); g.fillStyle = css('--fg'); g.fillText(label, mx, my);
+    }
+  }
+  for (const n of T.nodes) {
+    const [x, y] = pos[n.id], r = n.hub ? 15 : 9, linked = n.hub || T.links.some(l => l.a === n.id && l.up);
+    g.beginPath(); g.arc(x, y, r, 0, 2 * Math.PI); g.fillStyle = css(n.hub ? '--hub' : linked ? '--client' : '--bg'); g.fill();
+    g.lineWidth = n.me ? 3 : 1.5; g.strokeStyle = css(n.me ? '--fg' : n.hub ? '--hub' : '--client'); g.stroke();
+    if (n.admin) { g.beginPath(); g.arc(x, y, r + 4, 0, 2 * Math.PI); g.lineWidth = 1; g.setLineDash([2, 3]); g.strokeStyle = css('--fg'); g.stroke(); g.setLineDash([]); }
+    const up = y < cy - 1 ? -1 : 1, lines = [n.name, n.ip].concat(n.subnets.map(s => 'net ' + s), n.vips.map(v => 'vip ' + v));
+    lines.forEach((t, i) => {
+      g.font = (i ? '11px ui-monospace, monospace' : '600 13px system-ui, sans-serif');
+      const ty = y + up * (r + 13) + (up > 0 ? i : i - lines.length + 1) * 14, w = g.measureText(t).width + 6;
+      g.fillStyle = css('--bg'); g.globalAlpha = 0.85; g.fillRect(x - w / 2, ty - 7, w, 14); g.globalAlpha = 1;
+      g.fillStyle = css(i ? '--muted' : '--fg'); g.fillText(t, x, ty);
+    });
+  }
+}
+draw(); addEventListener('resize', draw); matchMedia('(prefers-color-scheme: dark)').addEventListener('change', draw);
+</script>"""
+
+TRAFFIC_SCRIPT = """<script>
+const $ = s => document.querySelector(s), css = v => getComputedStyle(document.documentElement).getPropertyValue(v).trim();
+const PRESETS = [['1 h', 3600], ['6 h', 21600], ['24 h', 86400], ['7 d', 604800], ['30 d', 2592000], ['90 d', 7776000]];
+let range = {span: 3600}, D = null, charts = [];
+const rate = v => { v = Math.abs(v); const u = ['b/s', 'kb/s', 'Mb/s', 'Gb/s']; let i = 0; while (v >= 1000 && i < 3) { v /= 1000; i++; } return (v >= 100 || i === 0 ? v.toFixed(0) : v.toFixed(1)) + ' ' + u[i]; };
+const size = v => { const u = ['B', 'kB', 'MB', 'GB', 'TB']; let i = 0; while (v >= 1000 && i < 4) { v /= 1000; i++; } return (v >= 100 || i === 0 ? v.toFixed(0) : v.toFixed(1)) + ' ' + u[i]; };
+const clock = (t, long) => { const d = new Date(t * 1000), p = n => String(n).padStart(2, '0'), hm = p(d.getHours()) + ':' + p(d.getMinutes());
+  return long || D.to - D.from > 86400 ? (d.getMonth() + 1) + '/' + d.getDate() + ' ' + hm : hm; };
+const el = (tag, text, cls) => { const e = document.createElement(tag); if (text != null) e.textContent = text; if (cls) e.className = cls; return e; };
+const local = t => { const d = new Date(t * 1000 - new Date().getTimezoneOffset() * 60000); return d.toISOString().slice(0, 16); };
+
+function bar() {
+  const b = $('#bar'); b.textContent = '';
+  for (const [name, span] of PRESETS) {
+    const x = el('button', name, range.span === span ? 'on' : ''); x.onclick = () => { range = {span}; load(); }; b.append(x);
+  }
+  const f = el('input'), t = el('input'), go = el('button', 'show'); f.type = t.type = 'datetime-local';
+  if (D) { f.value = local(D.from); t.value = local(D.to); }
+  go.onclick = () => { const a = Date.parse(f.value) / 1000, z = Date.parse(t.value) / 1000; if (a < z) { range = {from: a, to: z}; load(); } };
+  b.append(el('span', 'or from'), f, el('span', 'to'), t, go);
+}
+
+async function load() {
+  const now = Math.floor(Date.now() / 1000), to = range.to || now, from = range.from || to - range.span;
+  D = await (await fetch('/api/traffic?from=' + from + '&to=' + to)).json();
+  const first = Math.min(...D.links.flatMap(l => l.points.map(p => p[0])));   // history may be younger than the window
+  D.since = isFinite(first) && first - D.from > (D.to - D.from) * 0.2 ? first : null; if (D.since) D.from = D.since - D.step;
+  bar(); render();
+}
+
+function render() {
+  const sum = $('#sum'), box = $('#charts'); sum.textContent = ''; box.textContent = ''; charts = [];
+  $('#note').textContent = D.links.length ? 'one point = ' + (D.step >= 3600 ? D.step / 3600 + ' h' : D.step / 60 + ' min') + ' average' + (D.since ? ' \u00b7 nothing was recorded before ' + clock(D.since, true) + ', so the charts start there' : '') : 'no traffic recorded in this period';
+  const head = el('tr'); ['link', 'to the hub', 'from the hub', 'peak', 'average ping'].forEach((h, i) => head.append(el('th', h, i ? 'n' : ''))); sum.append(head);
+  const rows = D.links.map(l => {
+    const a = D.names[l.peer] || '#' + l.peer, b = D.names[l.reporter] || '#' + l.reporter, bps = l.points.map(p => [p[0], p[1] * 8 / D.step, p[2] * 8 / D.step]);
+    const rx = l.points.reduce((s, p) => s + p[1], 0), tx = l.points.reduce((s, p) => s + p[2], 0), ms = l.points.filter(p => p[3] != null);
+    return {a, b, bps, rx, tx, peak: Math.max(0, ...bps.map(p => Math.max(p[1], p[2]))), ms: ms.length ? ms.reduce((s, p) => s + p[3], 0) / ms.length : null};
+  }).sort((x, y) => y.rx + y.tx - x.rx - x.tx);
+  for (const r of rows) {
+    const tr = el('tr'); tr.append(el('td', r.a + ' \\u21c4 ' + r.b), el('td', size(r.rx), 'n'), el('td', size(r.tx), 'n'), el('td', rate(r.peak), 'n'), el('td', r.ms == null ? '-' : r.ms.toFixed(0) + ' ms', 'n')); sum.append(tr);
+    const card = el('div', null, 'chart'), cv = el('canvas'), key = el('p');
+    const k1 = el('i', null, 'k'), k2 = el('i', null, 'k'); k1.style.borderColor = css('--s1'); k2.style.borderColor = css('--s2');
+    key.append(k1, r.a + ' \\u2192 ' + r.b + ' (' + size(r.rx) + ')', k2, r.b + ' \\u2192 ' + r.a + ' (' + size(r.tx) + ')');
+    card.append(el('h3', r.a + ' \\u21c4 ' + r.b), key, cv); box.append(card); charts.push([cv, r]);
+  }
+  charts.forEach(c => draw(...c));
+}
+
+function draw(cv, r, hover) {
+  const W = cv.clientWidth, H = 190, k = devicePixelRatio || 1, g = cv.getContext('2d'), L = 62, R = 8, T = 8, B = 22;
+  cv.width = W * k; cv.height = H * k; cv.style.height = H + 'px'; g.setTransform(k, 0, 0, k, 0, 0); g.clearRect(0, 0, W, H);
+  let top = Math.max(1000, r.peak), mag = Math.pow(10, Math.floor(Math.log10(top))); top = Math.ceil(top / mag) * mag;   // a clean axis maximum
+  const mid = T + (H - T - B) / 2, x = t => L + (t - D.from) / (D.to - D.from) * (W - L - R), y = v => mid - v / top * (H - T - B) / 2;
+  g.font = '11px system-ui, sans-serif'; g.textBaseline = 'middle'; g.lineWidth = 1;
+  for (const v of [top, top / 2, 0, -top / 2, -top]) {            // one axis: up is towards the hub, down is from it
+    g.strokeStyle = css('--line'); g.beginPath(); g.moveTo(L, y(v)); g.lineTo(W - R, y(v)); g.stroke();
+    g.fillStyle = css('--muted'); g.textAlign = 'right'; g.fillText(rate(v), L - 8, y(v));
+  }
+  g.textAlign = 'center';
+  for (let i = 0; i <= 4; i++) { const t = D.from + (D.to - D.from) * i / 4; g.fillText(clock(t), Math.min(W - R - 22, Math.max(L + 22, x(t))), H - 9); }
+  [[1, '--s1', 1], [2, '--s2', -1]].forEach(([col, color, sign]) => {
+    let seg = [];
+    const flush = () => {
+      if (!seg.length) return;
+      g.beginPath(); seg.forEach((p, i) => i ? g.lineTo(x(p[0]), y(sign * p[col])) : g.moveTo(x(p[0]), y(sign * p[col])));
+      g.strokeStyle = css(color); g.lineWidth = 2; g.lineJoin = g.lineCap = 'round'; g.stroke();
+      g.lineTo(x(seg[seg.length - 1][0]), mid); g.lineTo(x(seg[0][0]), mid); g.closePath(); g.globalAlpha = 0.1; g.fillStyle = css(color); g.fill(); g.globalAlpha = 1; seg = [];
+    };
+    r.bps.forEach((p, i) => { if (i && p[0] - r.bps[i - 1][0] > D.step * 1.5) flush(); seg.push(p); }); flush();   // a gap means nobody was measuring
+  });
+  if (hover) {
+    g.strokeStyle = css('--muted'); g.lineWidth = 1; g.beginPath(); g.moveTo(x(hover[0]), T); g.lineTo(x(hover[0]), H - B); g.stroke();
+    [[1, '--s1', 1], [2, '--s2', -1]].forEach(([col, color, sign]) => { g.beginPath(); g.arc(x(hover[0]), y(sign * hover[col]), 4, 0, 7); g.fillStyle = css(color); g.fill(); g.lineWidth = 2; g.strokeStyle = css('--bg'); g.stroke(); });
+  }
+  cv.onpointermove = e => {
+    if (!r.bps.length) return;
+    const box = cv.getBoundingClientRect(), t = D.from + (e.clientX - box.left - L) / (W - L - R) * (D.to - D.from);
+    const p = r.bps.reduce((a, b) => Math.abs(b[0] - t) < Math.abs(a[0] - t) ? b : a); draw(cv, r, p);
+    const tip = $('#tip'); tip.textContent = '';
+    const row = (color, value, label) => { const d = el('div'), key = el('i', null, 'k'); key.style.borderColor = css(color); key.style.marginLeft = 0; d.append(key, el('b', value), ' ' + label); return d; };
+    tip.append(el('div', clock(p[0], true)), row('--s1', rate(p[1]), r.a + ' \\u2192 ' + r.b), row('--s2', rate(p[2]), r.b + ' \\u2192 ' + r.a));
+    tip.style.display = 'block'; tip.style.left = Math.min(innerWidth - tip.offsetWidth - 8, e.clientX + 14) + 'px'; tip.style.top = e.clientY + 14 + 'px';
+  };
+  cv.onpointerleave = () => { $('#tip').style.display = 'none'; draw(cv, r); };
+}
+load(); setInterval(() => { if (range.span) load(); }, 60000); addEventListener('resize', () => charts.forEach(c => draw(...c)));
+</script>"""
+
+
+def esc(v):
+    return html.escape(str(v), quote=True)
+
+
+def human(n):
+    if n is None:
+        return "-"
+    for unit in ("B", "kB", "MB", "GB"):
+        if n < 1000:
+            return f"{n:.0f} {unit}" if unit == "B" or n >= 100 else f"{n:.1f} {unit}"
+        n /= 1000
+    return f"{n:.1f} TB"
+
+
+def page_head(loc, title, here):
+    mesh = loc["mesh"]
+    tabs = [("/", "map"), ("/traffic", "traffic"), ("/metrics", "metrics"), ("/api", "API")]
+    return (
+        f"<!doctype html><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'>"
+        f"<title>{esc(title)} - mesh {esc(mesh['name'])}</title>{PAGE_STYLE}<nav><b>mesh {esc(mesh['name'])}</b>"
+        + "".join(f"<b>{t}</b>" if t == here else f"<a href='{u}'>{t}</a>" for u, t in tabs)
+        + "</nav>"
+    )
+
+
+def tags(labels):
+    return "".join(f"<span class=tag>{esc(l)}</span>" for l in labels) or "-"
+
+
+def map_page(loc):
+    """The whole mesh at a glance. Readable by anything inside the mesh, changes nothing."""
+    mesh, topo = loc["mesh"], topology()
+    here = next(n for n in topo["nodes"] if n["me"])
+    out = [
+        page_head(loc, "map", "map").replace("<title>", "<meta http-equiv=refresh content=20><title>"),
+        f"<p>nodes <code>{esc(mesh['net'])}</code> &middot; cluster IPs <code>{esc(mesh['cluster_net'])}</code> &middot; "
+        f"this page is <code>{admin_vip(mesh)}</code> on every hub, answered now by <b>{esc(here['name'])}</b></p>"
+        "<canvas id=map></canvas><p class=key><span>large dot: hub</span><span>small dot: client</span>"
+        "<span>thick line: hub-to-hub, or the hub a client sends through</span><span>thin line: standby link</span>"
+        "<span>faint dashed red: no link</span><span>number: ping across that link</span>"
+        "<span>dotted ring: admin node</span><span>bold outline: the node answering</span></p>",
+        "<h2>nodes</h2><div class=scroll><table><tr><th>role<th>name<th>address<th>endpoint<th>subnets<th>sends through<th>seen by<th>labels<th>description",
+    ]
+    names = {n["id"]: n["name"] for n in topo["nodes"]}
+    for n in topo["nodes"]:
+        mine = [l for l in topo["links"] if l["a"] == n["id"] or (n["hub"] and l["b"] == n["id"])]
+        via = next((names[l["b"]] for l in mine if l["primary"] and l["a"] == n["id"]), "")
+        seen_by = ", ".join(sorted(names[l["b"] if l["a"] == n["id"] else l["a"]] for l in mine if l["up"])) or "nobody"
+        out.append(
+            f"<tr><td>{'hub' if n['hub'] else 'client'}{' · admin' if n['admin'] else ''}{' · simple' if n['simple'] else ''}<td><b>{esc(n['name'])}</b>"
+            f"<td class=m>{n['ip']}<td class=m>{esc(n['endpoint'] or 'behind NAT')}"
+            f"<td class=m>{esc(' '.join(n['subnets'] + ['vip ' + v for v in n['vips']]) or '-')}"
+            f"<td>{esc(via or ('-' if n['hub'] else 'not connected'))}<td>{esc(seen_by)}<td>{tags(n['labels'])}<td>{esc(n['desc'] or '-')}"
+        )
+    out.append(
+        "</table></div><h2>links</h2><div class=scroll><table><tr><th>from<th>to<th>state<th class=n>ping"
+        "<th class=n>sent, last hour<th class=n>received, last hour<th>"
+    )
+    for l in topo["links"]:
+        out.append(
+            f"<tr><td>{esc(names[l['a']])}<td>{esc(names[l['b']])}<td>{'up' if l['up'] else 'down'}"
+            f"<td class=n>{str(l['ms']) + ' ms' if l['ms'] is not None else '-'}"
+            f"<td class=n>{human(l['to_hub_1h'])}<td class=n>{human(l['from_hub_1h'])}<td>{'in use' if l['primary'] else ''}"
+        )
+    admins = [n for n in topo["nodes"] if n["admin"]]
+    out.append(
+        "</table></div><p>Sent and received are from the first node's side; <a href=/traffic>graphs over time</a>.</p>"
+        "<h2>manage</h2><p>"
+        + (
+            " &middot; ".join(f"<a href='http://{n['ip']}:{ADMIN_PORT}/admin'>{esc(n['name'])}</a>" for n in admins)
+            or "no admin node is online"
+        )
+        + "</p><p>Changes are signed on an admin node; hubs only show the mesh.</p>"
+    )
+    out.append(MAP_SCRIPT.replace("__DATA__", json.dumps(topo).replace("</", "<\\/")))
+    return "".join(out).encode()
+
+
+def traffic_page(loc):
+    return (
+        page_head(loc, "traffic", "traffic")
+        + "<p>Bytes carried by each link, as counted by the hub at one end. Traffic between two clients shows up on "
+        "both of their links to the hub that relayed it.</p><div class=bar id=bar></div><p id=note></p>"
+        "<div class=scroll><table id=sum></table></div><div id=charts></div><div id=tip></div>" + TRAFFIC_SCRIPT
+    ).encode()
+
+
+def api_page(loc):
+    mesh = loc["mesh"]
+    base = f"http://{admin_vip(mesh)}:{ADMIN_PORT}"
+    rows_ = [
+        (
+            "/api/nodes",
+            "every node: name, role, ip, endpoint, subnets, vips, labels, desc, admin. Filters: "
+            "<code>?label=X</code> (repeatable, all must match), <code>?role=hub|client</code>, <code>?name=N</code>",
+        ),
+        ("/api/topology", "nodes plus every link with state, ping and whether it is in use (what the map draws)"),
+        (
+            "/api/traffic",
+            "per-link byte counts in buckets. <code>?from=UNIX&amp;to=UNIX</code> (default: last 6 h), "
+            "<code>&amp;step=SECONDS</code> (default: about 240 points)",
+        ),
+        (
+            "/metrics",
+            f"the same in Prometheus text format; also reachable as <code>http://{metrics_vip(mesh)}:{ADMIN_PORT}/metrics</code>",
+        ),
+    ]
+    return (
+        page_head(loc, "API", "API")
+        + f"<p>Read-only, JSON, no login, reachable only from inside the mesh. Any hub answers on <code>{base}</code>.</p>"
+        "<div class=scroll><table><tr><th>path<th>returns"
+        + "".join(f"<tr><td class=m><a href='{p}'>{p}</a><td style='white-space:normal'>{d}" for p, d in rows_)
+        + "</table></div>"
+    ).encode()
+
+
+def api_nodes(query):
+    topo = topology()["nodes"]
+    want = query.get("label", [])
+    return [
+        n
+        for n in topo
+        if all(l in n["labels"] for l in want)
+        and query.get("role", ["hub" if n["hub"] else "client"])[0] == ("hub" if n["hub"] else "client")
+        and query.get("name", [n["name"]])[0] == n["name"]
+    ]
+
+
+def api_traffic(query):
+    now = int(time.time())
+    try:
+        to = int(query.get("to", [now])[0])
+        frm = int(query.get("from", [to - 21600])[0])
+        step = int(query.get("step", [0])[0])
+    except ValueError:
+        frm, to, step = now - 21600, now, 0
+    frm, to = max(0, min(frm, to - 60)), max(to, 60)
+    fine = 60 if frm >= now - KEEP_FINE else 600  # older data only exists in 10-minute buckets
+    step = max(fine, -(-max(step, (to - frm) // 240) // fine) * fine)
+    alive = live(load())
+    hubs = {n["id"] for n in alive.values() if n["endpoint"]}
+    links = {}
+    try:
+        db = stats_db()
+        for reporter, peer, t, rx, tx, ms in db.execute(
+            "SELECT reporter, peer, ts / ? * ?, sum(rx), sum(tx), CAST(avg(ms) AS INT) FROM link "
+            "WHERE ts >= ? AND ts <= ? GROUP BY 1, 2, 3 ORDER BY 3",
+            (step, step, frm, to),
+        ):  # <=: the bucket still filling counts
+            links.setdefault((reporter, peer), []).append([t, rx, tx, ms])
+        db.close()
+        for reporter, peer in list(links):  # two hubs both count their link: show it once
+            if peer in hubs and reporter > peer and (peer, reporter) in links:
+                del links[(reporter, peer)]
+    except sqlite3.Error as e:
+        log(f"stats: {e}")
+    return {
+        "from": frm,
+        "to": to,
+        "step": step,
+        "names": {n["id"]: n["name"] for n in alive.values()},
+        "links": [{"reporter": r, "peer": p, "points": pts} for (r, p), pts in sorted(links.items())],
+    }
+
+
+def metrics_text():
+    topo, out = topology(), []
+    names = {n["id"]: n["name"] for n in topo["nodes"]}
+    q = lambda v: str(v).replace("\\", "\\\\").replace('"', '\\"')
+
+    def family(name, kind, text, samples):
+        out.extend([f"# HELP {name} {text}", f"# TYPE {name} {kind}"])
+        for labels, value in samples:  # no backslashes inside f-strings: nodes may run Python older than 3.12
+            out.append("%s{%s} %s" % (name, ",".join('%s="%s"' % (k, q(v)) for k, v in labels.items()), value))
+
+    family(
+        "meshbone_node_info",
+        "gauge",
+        "One per node in the mesh.",
+        [
+            (
+                {
+                    "node": n["name"],
+                    "role": "hub" if n["hub"] else "client",
+                    "ip": n["ip"],
+                    "labels": ",".join(n["labels"]),
+                },
+                1,
+            )
+            for n in topo["nodes"]
+        ],
+    )
+    pairs = [({"from": names[l["a"]], "to": names[l["b"]]}, l) for l in topo["links"]]
+    family(
+        "meshbone_link_up",
+        "gauge",
+        "1 if the hub at the far end currently sees the node.",
+        [(k, int(l["up"])) for k, l in pairs],
+    )
+    family(
+        "meshbone_link_in_use",
+        "gauge",
+        "1 if the client sends through this hub.",
+        [(k, int(l["primary"])) for k, l in pairs],
+    )
+    family(
+        "meshbone_link_ping_ms",
+        "gauge",
+        "Round-trip time across the link.",
+        [(k, l["ms"]) for k, l in pairs if l["ms"] is not None],
+    )
+    try:
+        db = stats_db()
+        totals = db.execute("SELECT reporter, peer, rx, tx FROM total").fetchall()
+        db.close()
+    except sqlite3.Error:
+        totals = []
+    known = [(names[r], names[p], rx, tx) for r, p, rx, tx in totals if r in names and p in names]
+    family(
+        "meshbone_link_received_bytes_total",
+        "counter",
+        "Bytes the hub received from the peer.",
+        [({"hub": h, "peer": p}, rx) for h, p, rx, tx in known],
+    )
+    family(
+        "meshbone_link_sent_bytes_total",
+        "counter",
+        "Bytes the hub sent to the peer.",
+        [({"hub": h, "peer": p}, tx) for h, p, rx, tx in known],
+    )
+    return ("\n".join(out) + "\n").encode()
+
+
+def admin_page(loc, csrf, note):
+    out = [
+        page_head(loc, "manage", ""),
+        f"<h1>manage</h1><p>on admin node <b>{esc(load()[loc['pub']]['name'])}</b></p>",
+    ]
+    if note:
+        out.append(f"<pre>{esc(note)}</pre>")
+    hidden = f"<input type=hidden name=csrf value={csrf}>"
+    out.append(
+        "<h2>nodes</h2><p>A node with an endpoint is a hub: enter one and it becomes a hub once a client has reached it "
+        "there; clear it and it is a client again.</p><div class=scroll><table>"
+        "<tr><th>role<th>name<th>address<th>endpoint<th>subnets<th>labels<th>description<th>cost (ms)<th>"
+    )
+    for i, r in enumerate(rows()):
+        approve = f" <button name=action value=approve>make hub at {esc(r['wants'])}</button>" if r["wants"] else ""
+        simple = (
+            f" &middot; <a href='/admin/simple?name={urllib.parse.quote(r['name'])}'>QR / config</a>"
+            if r.get("simple")
+            else ""
+        )
+        out.append(
+            f"<tr><td>{r['role']}{simple}<td><b>{esc(r['name'])}</b><td class=m>{r['ip']}"
+            f"<td><input form=f{i} name=endpoint value=\"{esc(r['endpoint'])}\" placeholder='host:port'>"
+            f"<td><input form=f{i} name=subnets value=\"{esc(' '.join(r['subnets']))}\">"
+            f"<td><input form=f{i} name=labels value=\"{esc(' '.join(r.get('labels', [])))}\">"
+            f"<td><input form=f{i} class=w name=desc value=\"{esc(r.get('desc', ''))}\">"
+            f"<td><input form=f{i} name=cost value={r['cost']}>"
+            f"<td><form id=f{i} method=post>{hidden}<input type=hidden name=name value=\"{esc(r['name'])}\">"
+            f"<button name=action value=set>save</button> <button name=action value=revoke>revoke</button>"
+            f"{approve}</form>"
+        )
+    out.append(
+        f"</table></div><h2>add a node</h2><form method=post class=grid>{hidden}"
+        "<input name=name placeholder=name required> <input name=endpoint placeholder='host:port (hub only)'> "
+        f"<input name=ip placeholder='address (automatic)'> <input name=subnets placeholder=subnets> "
+        "<input name=labels placeholder=labels> <input class=w name=desc placeholder=description> "
+        "<input class=w name=remote placeholder='ssh: user:password@host;user@host2' autocomplete=off> "
+        "<label><input type=checkbox name=simple value=1 style='width:auto'> simple client (phone, plain WireGuard)</label> "
+        "<button name=action value=invite>add</button></form>"
+        "<p>With an ssh destination the node is installed and joined right away; several hops are separated by "
+        "<code>;</code>, each with or without a password, and each is reached through the one before it. "
+        "Without one you get a config file to carry over (it holds the new node's private key).</p>"
+        f"<h2>password</h2><form method=post class=grid>{hidden}"
+        "<input type=password name=new1 placeholder='new password' required minlength=8 autocomplete=new-password> "
+        "<input type=password name=new2 placeholder='again' required autocomplete=new-password> "
+        "<button name=action value=passwd>change</button></form>"
+        "<p>Applies to this page on every admin node. Your browser will ask for it again.</p>"
+    )
+    return "".join(out).encode()
+
+
+def simple_page(loc, query):
+    name, hub = query.get("name", [""])[0], query.get("hub", [None])[0]
+    try:
+        text, hub, hubs = simple_config(name, hub)
+    except SystemExit as e:
+        return "404 Not Found", f"{e}\n".encode(), "text/plain; charset=utf-8", ""
+    if "download" in query:
+        return (
+            "200 OK",
+            text.encode(),
+            "text/plain; charset=utf-8",
+            f'Content-Disposition: attachment; filename="{name}.conf"\r\n',
+        )
+    link = "/admin/simple?name=" + urllib.parse.quote(name)
+    code = qr(text, "SVG")
+    code = (
+        code[code.index("<svg") :]
+        if code and "<svg" in code
+        else "<p>No QR code: qrencode is not installed on this node.</p>"
+    )
+    others = " &middot; ".join(
+        f"<b>{esc(h)}</b>" if h == hub else f"<a href='{link}&hub={urllib.parse.quote(h)}'>{esc(h)}</a>" for h in hubs
+    )
+    return (
+        "200 OK",
+        (
+            page_head(loc, name, "")
+            + f"<h1>{esc(name)}</h1><p>A plain WireGuard client. Scan this with the WireGuard app, "
+            f"or <a href='{link}&hub={urllib.parse.quote(hub)}&download=1'>download {esc(name)}.conf</a>. <a href=/admin>back</a></p>"
+            f"<p>connects through: {others}</p>"
+            f"<div style='background:#fff;display:inline-block;padding:10px;border-radius:8px;margin:12px 0;width:min(320px,90vw)'>{code}</div>"
+            "<p>Plain WireGuard uses one hub and cannot switch by itself: if that hub is down, pick another one above and import "
+            "again. The config lists the networks known now; export it again after adding subnets or hubs.</p>"
+            f"<details><summary>show the config (contains the private key)</summary><pre>{esc(text)}</pre></details>"
+        ).encode(),
+        "text/html; charset=utf-8",
+        "",
+    )
+
+
+def web_passwd(a):
+    if a.new1 != a.new2:
+        sys.exit("the two entries differ")
+    set_password(a.new1)
+    print("password changed - log in again with the new one")
+
+
+def web_set(a):
+    vips = by_name(load(), a.name)[1]["vips"]  # the page has no field for these; leave them alone
+    cmd_set(argparse.Namespace(**{**vars(a), "vip": vips, "no_vip": not vips}))
+
+
+def web_invite(a):
+    if a.simple and a.remote:
+        sys.exit("a simple client is not installed over ssh: scan its QR code or import its config")
+    cmd_deploy(a) if a.remote else cmd_invite(a)
+
+
+def admin_response(method, path, headers, body):
+    """-> (status, body, content type, extra headers).
+
+    Everything but /admin is read-only and open to the mesh: the map, traffic,
+    the JSON API and /metrics. /admin exists only where admin.key is and asks
+    for the password (HTTP Basic), so the password is never typed into a hub.
+    """
+    loc = local()
+    route, _, qs = path.partition("?")
+    route, query = route.rstrip("/") or "/", urllib.parse.parse_qs(qs)
+    as_json = lambda v: ("200 OK", json.dumps(v, indent=1).encode(), "application/json", "")
+    if route == "/metrics":
+        return "200 OK", metrics_text(), "text/plain; version=0.0.4; charset=utf-8", ""
+    if route == "/api/nodes":
+        return as_json(api_nodes(query))
+    if route == "/api/topology":
+        return as_json(topology())
+    if route == "/api/traffic":
+        return as_json(api_traffic(query))
+    if route not in ("/admin", "/admin/simple"):
+        page = {"/traffic": traffic_page, "/api": api_page}.get(route, map_page)
+        return "200 OK", page(loc), "text/html; charset=utf-8", ""
+    if not os.path.exists(f"{DIR}/admin.key"):
+        return (
+            "404 Not Found",
+            b"this node cannot manage the mesh; open /admin on an admin node (see the map)\n",
+            "text/plain",
+            "",
+        )
+    try:
+        password = base64.b64decode(headers.get("authorization", "").split()[1]).decode().partition(":")[2]
+    except Exception:
+        password = ""
+    if not password or not check_password(password):
+        return (
+            "401 Unauthorized",
+            b"authentication required\n",
+            "text/plain",
+            'WWW-Authenticate: Basic realm="meshbone"\r\n',
+        )
+    # browsers resend Basic credentials on cross-site requests; this token is what a forged form cannot know
+    csrf = hashlib.sha256(("csrf:" + password).encode()).hexdigest()
+    note = ""
+    if route == "/admin/simple":
+        return simple_page(loc, query)
+    if method == "POST":
+        form = {k: v[0] for k, v in urllib.parse.parse_qs(body.decode("utf-8", "replace")).items()}
+        if not hmac.compare_digest(form.get("csrf", ""), csrf):
+            return "403 Forbidden", b"bad form token\n", "text/plain", ""
+        subnets, labels = form.get("subnets", "").split(), form.get("labels", "").split()
+        a = argparse.Namespace(
+            name=form.get("name", ""),
+            endpoint=form.get("endpoint", ""),
+            admin=False,
+            verify=True,
+            subnet=subnets,
+            no_subnet=not subnets,
+            vip=[],
+            no_vip=False,
+            label=labels,
+            no_label=not labels,
+            desc=form.get("desc", ""),
+            ip=form.get("ip", ""),
+            remote=form.get("remote", ""),
+            once=False,
+            listen_port=None,
+            mtu=None,
+            simple=form.get("simple") == "1",
+            new1=form.get("new1", ""),
+            new2=form.get("new2", ""),
+            out=f"{DIR}/.invite-{os.getpid()}.json",
+        )
+        action = {
+            "set": web_set,
+            "revoke": cmd_revoke,
+            "approve": cmd_approve,
+            "invite": web_invite,
+            "passwd": web_passwd,
+        }.get(form.get("action"))
+        try:
+            a.cost = int(form.get("cost") or 0)
+            if not action:
+                sys.exit("unknown action")
+            with contextlib.redirect_stdout(io.StringIO()) as said:
+                action(a)
+            if action is web_invite and a.simple:
+                return simple_page(loc, {"name": [a.name]})
+            if action is web_invite and not a.remote:
+                with open(a.out, "rb") as f:
+                    return (
+                        "200 OK",
+                        f.read(),
+                        "application/json",
+                        f'Content-Disposition: attachment; filename="{a.name}.mesh.json"\r\n',
+                    )
+            note = said.getvalue().strip() or "saved"
+        except (SystemExit, ValueError) as e:
+            note = f"error: {e}"
+        finally:
+            with contextlib.suppress(FileNotFoundError):
+                os.remove(a.out)
+    return "200 OK", admin_page(loc, csrf, note), "text/html; charset=utf-8", ""
+
+
+def cmd_admin():
+    """One HTTP request on the connection systemd handed us."""
+    sock = socket.fromfd(0, socket.AF_INET, socket.SOCK_STREAM)
+    f = sock.makefile("rb")
+    try:
+        method, path = f.readline(4096).decode("ascii").split()[:2]
+        headers = {}
+        for _ in range(100):
+            k, sep, v = f.readline(8192).decode("latin-1").partition(":")
+            if not sep:
+                break
+            headers[k.strip().lower()] = v.strip()
+        body = f.read(min(int(headers.get("content-length", 0)), 1 << 16))
+        status, out, ctype, extra = admin_response(method, path, headers, body)
+    except (IndexError, ValueError):
+        status, out, ctype, extra = "400 Bad Request", b"bad request\n", "text/plain", ""
+    sock.sendall(
+        f"HTTP/1.0 {status}\r\nContent-Type: {ctype}\r\nContent-Length: {len(out)}\r\n"
+        f"Cache-Control: no-store\r\n{extra}\r\n".encode() + out
+    )
+    sock.close()
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    def node_options(s):
+        s.add_argument("--subnet", action="append", default=[], help="network behind the node to announce")
+        s.add_argument("--vip", action="append", default=[], help="cluster IP the node holds")
+        s.add_argument("--cost", type=int, default=0, help="ms added when choosing this hub")
+        s.add_argument("--desc", default="", help="free-text description")
+        s.add_argument("--label", action="append", default=[], help="label, repeatable")
+        s.add_argument("--ip", default="", help="mesh address to give the node (default: a free one)")
+        s.add_argument(
+            "--no-verify",
+            dest="verify",
+            action="store_false",
+            help="keep a new hub's endpoint even if no client could reach it",
+        )
+
+    def local_options(s):
+        s.add_argument("--listen-port", type=int, help="local UDP port, if it differs from the endpoint's")
+        s.add_argument("--mtu", type=int, help="tunnel MTU (default 1420)")
+
+    s = sub.add_parser("create")
+    s.add_argument("--endpoint", default="", help="public HOST:PORT of this machine, if it is to be a hub")
+    s.add_argument("--name", default=socket.gethostname().split(".")[0])
+    s.add_argument("--subnet", action="append", default=[], help="network behind this node to announce")
+    s.add_argument("--desc", default="")
+    s.add_argument("--label", action="append", default=[])
+    s.add_argument("--mesh", default="mesh")
+    s.add_argument("--net", default="10.253.254.0/23", help="node addresses: first /24 hubs, rest clients")
+    s.add_argument("--cluster-net", default="10.253.253.0/24", help="cluster (anycast) IPs")
+    local_options(s)
+    s = sub.add_parser("invite")
+    s.add_argument("name")
+    s.add_argument("--endpoint", default="", help="public HOST:PORT; makes the new node a hub")
+    node_options(s)
+    s.add_argument("--admin", action="store_true", help="the new node also gets admin.key and can manage the mesh")
+    s.add_argument("-o", "--out")
+    s = sub.add_parser("deploy")
+    s.add_argument("name")
+    s.add_argument(
+        "--remote",
+        required=True,
+        metavar="USER[:PASSWORD]@HOST[;...]",
+        help="ssh destination, optionally behind jump hosts separated by ';'",
+    )
+    s.add_argument("--endpoint", default="")
+    node_options(s)
+    local_options(s)
+    s.add_argument("--admin", action="store_true")
+    s.add_argument("--once", action="store_true")
+    s = sub.add_parser("join")
+    s.add_argument("file")
+    s.add_argument("--once", action="store_true")
+    local_options(s)
+    s = sub.add_parser("set")
+    s.add_argument("name")
+    s.add_argument("--endpoint")
+    s.add_argument("--subnet", action="append", default=[])
+    s.add_argument("--no-subnet", action="store_true")
+    s.add_argument("--vip", action="append", default=[])
+    s.add_argument("--no-vip", action="store_true")
+    s.add_argument("--cost", type=int)
+    s.add_argument("--desc")
+    s.add_argument("--label", action="append", default=[])
+    s.add_argument("--no-label", action="store_true")
+    s.add_argument("--no-verify", dest="verify", action="store_false")
+    local_options(sub.add_parser("local"))
+    s = sub.add_parser("promote")
+    s.add_argument("--endpoint", required=True, help="stable public HOST:PORT of this node; '' withdraws")
+    s = sub.add_parser("simple")
+    s.add_argument("name")
+    s.add_argument("--hub", help="hub to connect through (default: the one that sees the device, else the cheapest)")
+    s.add_argument("--qr", action="store_true", help="also print a QR code for the WireGuard phone app")
+    s.add_argument("-o", "--out")
+    s.add_argument("--desc", default="")
+    s.add_argument("--label", action="append", default=[])
+    s.add_argument("--ip", default="")
+    s = sub.add_parser("approve")
+    s.add_argument("name")
+    s.add_argument("--no-verify", dest="verify", action="store_false")
+    sub.add_parser("revoke").add_argument("name")
+    s = sub.add_parser("cost")
+    s.add_argument("name")
+    s.add_argument("value", type=int)
+    plain = ("install", "sync", "serve", "admin", "status", "leave", "upgrade", "passwd")
+    for c in plain:
+        sub.add_parser(c)
+    a = p.parse_args()
+    if os.geteuid() != 0:
+        sys.exit("meshbone must run as root")
+    if a.cmd not in ("install", "create", "join") and not joined():
+        sys.exit("this machine is not in a mesh yet (see `meshbone create` / `meshbone join`)")
+    fn = globals()[f"cmd_{a.cmd}"]
+    fn() if a.cmd in plain else fn(a)
+
+
+if __name__ == "__main__":
+    main()
