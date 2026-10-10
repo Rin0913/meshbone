@@ -88,11 +88,21 @@ def live(nodes):
     return out
 
 
+def same_name(a, b):
+    """Node names are DNS names, so they are the same regardless of case."""
+    return a.casefold() == b.casefold()
+
+
+def named(nodes, name):
+    """(pk, node) of the live node of this name, or (None, None)."""
+    return next(((pk, n) for pk, n in live(nodes).items() if same_name(n["name"], name)), (None, None))
+
+
 def by_name(nodes, name):
-    hits = [(pk, n) for pk, n in live(nodes).items() if n["name"] == name]
-    if not hits:
+    pk, n = named(nodes, name)
+    if not n:
         sys.exit(f"no node named {name}")
-    return hits[0]
+    return pk, n
 
 
 def mesh_net(mesh):
@@ -520,7 +530,7 @@ def checked(mesh, nodes, nets, pk, n, keep=()):
     if n.get("transit"):
         n["transit"] = norm_endpoint(n["transit"])
         n["public_nets"] = [str(IPv4Network(p)) for p in listed(n.get("public_nets", []))]
-        gateway = next((o for o in live(nodes).values() if o["name"] == n.get("via")), None)
+        gateway = named(nodes, n.get("via") or "")[1]
         if not gateway or not gateway["endpoint"]:
             sys.exit(f"{n.get('via')!r} is not a hub; a transit router links to one hub")
         if n["endpoint"] or n["subnets"] or n["vips"]:
@@ -528,7 +538,7 @@ def checked(mesh, nodes, nets, pk, n, keep=()):
     if not wellformed(pk, n) or not n["id"] < mesh_net(mesh).num_addresses:
         sys.exit("bad name, endpoint, cost, description (200 printable characters) or label (letters, digits, _.:=/-)")
     others = {k: o for k, o in live(nodes).items() if k != pk}
-    if any(o["name"] == n["name"] for o in others.values()):
+    if any(same_name(o["name"], n["name"]) for o in others.values()):
         sys.exit(f"name {n['name']} is already taken")
     if n.get("public") and any(o.get("public") == n["public"] for o in others.values()):
         sys.exit(f"public address {n['public']} already belongs to another node")

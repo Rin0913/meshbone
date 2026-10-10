@@ -611,6 +611,28 @@ with quiet:
     m.cmd_simple(A(name="phone", hub="d", qr=True, out=out, desc="", label=[], ip=""))  # same device, other hub
 again = open(out).read()
 assert "Endpoint = d.example:40000" in again and key in again and re.search(r"PresharedKey = (\S+)", again)[1] != psk
+with quiet:
+    m.cmd_simple(A(name="PHONE", hub="d", qr=False, out=out, desc="", label=[], ip=""))  # names are DNS names: no case
+assert key in open(out).read() and len([n for n in m.live(m.load()).values() if n["name"].lower() == "phone"]) == 1
+expect_exit(
+    lambda: m.cmd_invite(
+        A(
+            name="Phone",
+            endpoint="",
+            subnet=[],
+            vip=[],
+            cost=0,
+            admin=False,
+            out=None,
+            simple=True,
+            desc="",
+            label=[],
+            ip="",
+        )
+    ),
+    "already taken",
+)
+assert m.by_name(m.load(), "Phone")[1]["name"] == "phone"
 use("adm")
 expect_exit(lambda: m.simple_config("c"), "not a simple client")
 expect_exit(lambda: m.simple_config("phone", "nope"), "not a hub")

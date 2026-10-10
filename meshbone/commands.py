@@ -579,7 +579,10 @@ def cmd_dns(a):
 
 def cmd_transit(a):
     """Add a transit router, or print its WireGuard configuration again."""
-    if not any(n["name"] == a.name for n in store.live(store.load()).values()):
+    known = store.named(store.load(), a.name)[1]
+    if known:
+        a.name = known["name"]  # as spelled when it was added
+    else:
         if not (a.endpoint and a.via and a.net):
             sys.exit("a new transit router needs --endpoint HOST:PORT, --via HUB and at least one --net")
         cmd_invite(
@@ -610,7 +613,10 @@ def cmd_transit(a):
 
 def cmd_simple(a):
     """Create a simple client, or export an existing one again (e.g. through another hub)."""
-    if not any(n["name"] == a.name for n in store.live(store.load()).values()):
+    known = store.named(store.load(), a.name)[1]
+    if known:
+        a.name = known["name"]  # as spelled when it was added
+    else:
         cmd_invite(
             argparse.Namespace(
                 name=a.name,

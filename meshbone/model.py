@@ -98,7 +98,7 @@ def transit_config(name):
     pk, n = store.by_name(nodes, name)
     if not n.get("transit"):
         sys.exit(f"{name} is not a transit router")
-    gpk, gateway = next(((k, o) for k, o in alive.items() if o["name"] == n["via"]), (None, None))
+    gpk, gateway = store.named(alive, n["via"])
     if not gateway:
         sys.exit(f"the hub {n['via']} that {name} links to is gone; revoke the router and add it again")
     key = store.kept_key(n["id"])
@@ -195,7 +195,7 @@ def members(selector, mesh, alive):
     if name in ("nodes", "hubs", "clients"):
         chosen = [n for n in alive.values() if name == "nodes" or (name == "hubs") == bool(n["endpoint"])]
     elif name.startswith("@"):
-        chosen = [n for n in alive.values() if n["name"] == name[1:]]
+        chosen = [n for n in alive.values() if store.same_name(n["name"], name[1:])]
     elif re.fullmatch(settings.LABEL_RE, name):
         chosen = [n for n in alive.values() if name in n.get("labels", [])]
     else:
