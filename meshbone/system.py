@@ -508,6 +508,9 @@ def install_units():
             0o644,
         )
     run("systemctl", "daemon-reload")
+    unit(
+        "try-restart", "meshbone-dns.service", "meshbone-https.service"
+    )  # long-running services pick up the new program
     run("systemctl", "--no-block", *(["start"] if settings.ONCE else ["enable", "--now"]), "meshbone.timer")
 
 
