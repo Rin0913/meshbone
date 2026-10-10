@@ -213,7 +213,7 @@ expect_exit(
     ),
     "not a free address",
 )
-expect_exit(lambda: m.cmd_set(S("c", label=["bad label"])), "label")
+expect_exit(lambda: m.cmd_set(S("c", label=["bad!label"])), "label")
 
 # --- one interface, one port per node; hubs hold the service cluster IPs
 head, peers = wg("a")
@@ -440,8 +440,38 @@ expect_exit(lambda: m.cmd_set(S("c", cost=1)), "no admin key")
 # --- subnets, cluster IPs
 sync("c", "d")
 use("adm")
-expect_exit(lambda: m.cmd_set(S("a", subnet=["172.16.0.0/16"])), "local network of d (not announced)")
+# what somebody already has cannot be announced again - whole or in part...
+expect_exit(lambda: m.cmd_set(S("a", subnet=["172.16.5.0/25"])), "local network of d (not announced)")
+expect_exit(lambda: m.cmd_set(S("a", subnet=["172.16.5.0/24"])), "local network of d (not announced)")
 expect_exit(lambda: m.cmd_set(S("d", subnet=["10.3.0.0/25"])), "announced by c")
+expect_exit(lambda: m.cmd_set(S("d", subnet=["10.3.0.0/24"])), "announced by c")
+expect_exit(lambda: m.cmd_set(S("d", subnet=["10.253.254.0/24"])), "inside the mesh's own range")
+expect_exit(lambda: m.cmd_set(S("d", subnet=["192.168.9.0/24,10.1.1.300/24"])), "bad address")
+# ...but a wide network may contain more specific ones, even the mesh's own range: the specific one wins.
+# Lists may be separated by commas, spaces, or by repeating the option.
+with quiet:
+    m.cmd_set(S("a", subnet=["10.128.0.0/9,192.168.53.0/24  34.168.251.0/24", "10.0.0.0/8"], label=["prod,site=home"]))
+a_now = m.load()[P["a"]]
+assert a_now["subnets"] == ["10.128.0.0/9", "192.168.53.0/24", "34.168.251.0/24", "10.0.0.0/8"] and a_now["labels"] == [
+    "prod",
+    "site=home",
+]
+wide = m.members("subnets", mesh_ := m.local()["mesh"], m.live(m.load()))
+inside = lambda ip_: any(m.IPv4Address(ip_) in net for net in wide)
+assert (
+    inside("10.200.1.1") and inside("10.3.0.9") and not inside(IP["c"]) and not inside("10.253.253.1")
+)  # mesh nodes are no "subnet hosts"
+sync("c", "d")
+assert did("d", "ip", "route", "add", "10.128.0.0/9") and did(
+    "d", "ip", "route", "add", "10.0.0.0/8"
+)  # d's 172.16.5.0/24 is elsewhere
+assert "10.128.0.0/9" in wg("c")[1][P["a"]]["allowed"]
+assert m.carve(m.IPv4Network("10.0.0.0/8"), [m.IPv4Network("10.3.0.0/24")]) and not m.carve(
+    m.IPv4Network("10.3.0.0/25"), [m.IPv4Network("10.3.0.0/24")]
+)
+with quiet:
+    use("adm")
+    m.cmd_set(S("a", no_subnet=True))
 expect_exit(lambda: m.cmd_set(S("c", vip=["10.9.9.9"])), "cluster range")
 expect_exit(lambda: m.cmd_set(S("c", vip=["10.253.253.2"])), "belong to the hubs")
 with quiet:

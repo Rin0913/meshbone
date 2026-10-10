@@ -247,6 +247,25 @@ def next_seq(old=0):
     return max(int(time.time()), old + 1)
 
 
+def listed(values):
+    """Every item of a list a person typed, whether they separated them with commas, spaces, or by
+    repeating the option: ['a,b', 'c d'] -> ['a', 'b', 'c', 'd'], in order, without repeats."""
+    values = [values] if isinstance(values, str) else values
+    return list(dict.fromkeys(item for value in values for item in re.split(r"[\s,]+", value) if item))
+
+
+def carve(net, holes):
+    """A network without the parts that are `holes` -> list of networks."""
+    out = [net]
+    for hole in holes:
+        out = [
+            piece
+            for n in out
+            for piece in ([] if n.subnet_of(hole) else n.address_exclude(hole) if hole.subnet_of(n) else [n])
+        ]
+    return out
+
+
 def norm_endpoint(text):
     """'' | HOST | HOST:PORT | [v6]:PORT -> '' or 'HOST:PORT'."""
     m = re.fullmatch(r"(\[[0-9A-Fa-f:]+\]|[A-Za-z0-9.-]+)(?::(\d{1,5}))?", text or "")
@@ -409,10 +428,12 @@ def checked(mesh, nodes, nets, pk, n, keep=()):
     Subnets the node already had (`keep`) are not re-examined, so a conflict that appeared
     later elsewhere does not block unrelated edits."""
     try:
-        n["subnets"] = [str(IPv4Network(s)) for s in n["subnets"]]
-        n["vips"] = [str(IPv4Address(v)) for v in n["vips"]]
+        n["subnets"] = [str(IPv4Network(s)) for s in listed(n["subnets"])]
+        n["vips"] = [str(IPv4Address(v)) for v in listed(n["vips"])]
     except ValueError as e:
         sys.exit(f"bad address: {e}")
+    if "labels" in n:
+        n["labels"] = listed(n["labels"])
     n["endpoint"] = norm_endpoint(n["endpoint"])
     if not wellformed(pk, n) or not n["id"] < mesh_net(mesh).num_addresses:
         sys.exit("bad name, endpoint, cost, description (200 printable characters) or label (letters, digits, _.:=/-)")
@@ -425,17 +446,19 @@ def checked(mesh, nodes, nets, pk, n, keep=()):
                 f"{v} is not a free address in the cluster range {mesh['cluster_net']} "
                 f"({admin_vip(mesh)} and {metrics_vip(mesh)} belong to the hubs: map and metrics)"
             )
+    # A network may *contain* something more specific that exists elsewhere - the more specific one
+    # keeps winning, on every node - but it may not be, or lie inside, what somebody already has.
     for s in (IPv4Network(s) for s in n["subnets"] if s not in keep):
         for reserved in (mesh_net(mesh), cluster_net(mesh)):
-            if s.overlaps(reserved):
-                sys.exit(f"{s} overlaps the mesh's own range {reserved}")
+            if s.subnet_of(reserved):
+                sys.exit(f"{s} lies inside the mesh's own range {reserved}")
         for k, o in others.items():
             for t in o["subnets"]:
-                if s.overlaps(IPv4Network(t)):
-                    sys.exit(f"{s} overlaps {t}, announced by {o['name']}")
+                if s.subnet_of(IPv4Network(t)):
+                    sys.exit(f"{s} is already covered by {t}, announced by {o['name']}")
             for t in nets.get(k, {}).get("nets", []):
-                if s.overlaps(IPv4Network(t)):
-                    sys.exit(f"{s} overlaps {t}, a local network of {o['name']} (not announced)")
+                if s.subnet_of(IPv4Network(t)):
+                    sys.exit(f"{s} is, or lies inside, {t}: a local network of {o['name']} (not announced)")
     return n
 
 
@@ -925,8 +948,8 @@ def warnings():
         for s in n["subnets"]:
             for k, o in alive.items():
                 for t in nets.get(k, {}).get("nets", []) if k != pk else []:
-                    if IPv4Network(s).overlaps(IPv4Network(t)):
-                        out.append(f"subnet {s} of {n['name']} overlaps {t}, a local network of {o['name']}")
+                    if IPv4Network(s).subnet_of(IPv4Network(t)):
+                        out.append(f"subnet {s} of {n['name']} lies inside {t}, a local network of {o['name']}")
     return out
 
 
@@ -1090,7 +1113,8 @@ def members(selector, mesh, alive):
     nets = []
     for n in chosen:
         if part:
-            nets += [IPv4Network(s) for s in n["subnets"]]
+            for s in n["subnets"]:  # a wide announced network still does not make mesh nodes "subnet hosts"
+                nets += carve(IPv4Network(s), [mesh_net(mesh), cluster_net(mesh)])
         else:
             nets += [IPv4Network(f"{ip}/32") for ip in [router_ip(mesh, n["id"])] + held_vips(mesh, n)]
     return list(collapse_addresses(nets))
@@ -1368,6 +1392,7 @@ def reconcile():
         run("sysctl", "-qw", "net.ipv4.ip_forward=1", check=False)
     port = loc.get("listen_port") or (int(me["endpoint"].rpartition(":")[2]) if hub else None)
     conf = f"[Interface]\nPrivateKey = {loc['key']}\n" + (f"ListenPort = {port}\n" if port else "")
+    underlay = []  # public addresses of the hubs we dial
     for pk, carried in sorted(table.items()):
         n = alive[pk]
         conf += (
@@ -1377,6 +1402,8 @@ def reconcile():
         if n["endpoint"]:
             host, _, peer_port = n["endpoint"].rpartition(":")
             endpoint = resolve(host, int(peer_port))  # on DNS failure keep whatever endpoint wg has
+            with contextlib.suppress(ValueError, AttributeError):
+                underlay.append(IPv4Address(endpoint.rpartition(":")[0]))
             conf += (f"Endpoint = {endpoint}\n" if endpoint else "") + "PersistentKeepalive = 25\n"
     try:
         if not run("ip", "-j", "link", "show", "dev", IFACE, check=False):
@@ -1387,14 +1414,17 @@ def reconcile():
         run("sysctl", "-qw", f"net.ipv4.conf.{IFACE}.rp_filter=2", check=False)
     except subprocess.CalledProcessError as e:
         log(f"{IFACE}: {e.stderr.strip()}")
-    # send the mesh ranges and other nodes' subnets into the tunnel - but never a network this
-    # machine is itself attached to
+    # Send the mesh ranges and other nodes' subnets into the tunnel. Not a subnet that lies within a
+    # network this machine is attached to (the local one wins), and not one that contains a hub's
+    # public address (the tunnel would try to carry itself). A subnet that merely *contains* a local
+    # network is fine: the kernel prefers the more specific local route.
     routes = {mesh_net(mesh), cluster_net(mesh)} | {
         IPv4Network(s)
         for pk, n in alive.items()
         if pk != mypk
         for s in n["subnets"]
-        if not any(IPv4Network(s).overlaps(IPv4Network(l)) for l in attached)
+        if not any(IPv4Network(s).subnet_of(IPv4Network(l)) for l in attached)
+        and not any(u in IPv4Network(s) for u in underlay)
     }
     sync_routes(routes, my_ip)
     if hub:
@@ -2392,10 +2422,10 @@ def bootstrap(mesh, key, nodes, nets, a, admin_key=None, conf=None):
         sys.exit("this config's key does not match any node in it")
     for l in map(IPv4Network, local_nets()):
         for reserved in (mesh_net(mesh), cluster_net(mesh)):
-            if l.overlaps(reserved):
-                sys.exit(f"this machine is attached to {l}, which overlaps the mesh's own range {reserved}")
+            if l.subnet_of(reserved):
+                sys.exit(f"this machine is attached to {l}, which lies inside the mesh's own range {reserved}")
         for k, n in live(nodes).items():
-            if k != pub and any(l.overlaps(IPv4Network(s)) for s in n["subnets"]):
+            if k != pub and any(IPv4Network(s).subnet_of(l) for s in n["subnets"]):
                 print(
                     f"warning: local network {l} overlaps a subnet of {n['name']}; "
                     f"this machine will keep using its local network for it"
@@ -3155,7 +3185,7 @@ def respond(method, path, headers, body, peer="127.0.0.1"):
     if method == "POST":
         if not hmac.compare_digest(form.get("csrf", ""), csrf):
             return "403 Forbidden", b"bad form token\n", "text/plain", ""
-        subnets, labels = form.get("subnets", "").split(), form.get("labels", "").split()
+        subnets, labels = listed(form.get("subnets", "")), listed(form.get("labels", ""))
         a = argparse.Namespace(
             action=form.get("action"),
             name=form.get("name", ""),
