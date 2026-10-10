@@ -598,18 +598,33 @@ def sync_resolver(on):
     wanted = resolver_wanted({**loc, "resolver": True})
     servers, zone, how = wanted["servers"], wanted["zone"], resolver_manager()
     if how == "resolved":
+        # the link's servers and routing live in /run (set again after boot, see resolver_in_place);
+        # the search domain is global, since resolved writes only global ones into resolv.conf
+        dropin = "/etc/systemd/resolved.conf.d/meshbone.conf"
+        text = f"# written by meshbone: the mesh's zone as a search domain\n[Resolve]\nDomains={zone}\n"
+        try:
+            current = open(dropin).read()
+        except OSError:
+            current = ""
         if on:
             run("resolvectl", "dns", settings.IFACE, *servers, check=False)
-            run("resolvectl", "domain", settings.IFACE, "~.", zone, check=False)  # no ~: a search domain too
+            run("resolvectl", "domain", settings.IFACE, "~.", f"~{zone}", check=False)
             run("resolvectl", "default-route", settings.IFACE, "yes", check=False)
             if not glibc_asks_resolved():  # resolved runs but nothing asks it: point /etc/resolv.conf at its stub
                 keep_resolv_conf()
                 if os.path.lexists("/etc/resolv.conf"):
                     os.remove("/etc/resolv.conf")
                 os.symlink("/run/systemd/resolve/stub-resolv.conf", "/etc/resolv.conf")
+            if current != text:
+                os.makedirs(os.path.dirname(dropin), exist_ok=True)
+                store.write(dropin, text, 0o644)
+                unit("try-restart", "systemd-resolved")  # keeps the links' settings; no reload before v253
         else:
             run("resolvectl", "revert", settings.IFACE, check=False)
             restore_resolv_conf()
+            if current:
+                os.remove(dropin)
+                unit("try-restart", "systemd-resolved")
     elif how == "resolvconf":
         if on:  # named lo.* so that resolvconf puts it before the DHCP-provided ones
             text = "".join(f"nameserver {s}\n" for s in servers) + f"search {zone}\noptions timeout:2 attempts:1\n"
