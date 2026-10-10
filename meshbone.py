@@ -1195,10 +1195,20 @@ def run(*cmd, input=None, check=True):
     return subprocess.run(cmd, check=check, text=True, capture_output=True, **kw).stdout
 
 
+def ip_json(*args):
+    """`ip -j ...` as a list. Empty when there is nothing to list - or when an older ip answers a
+    question about something that does not exist yet with words instead of JSON."""
+    try:
+        found = json.loads(run("ip", "-j", *args, check=False) or "[]")
+        return found if isinstance(found, list) else []
+    except ValueError:
+        return []
+
+
 def local_nets():
     """IPv4 networks this machine is directly attached to, outside the mesh."""
     out = set()
-    for link in json.loads(run("ip", "-j", "-4", "addr", "show", "scope", "global") or "[]"):
+    for link in ip_json("-4", "addr", "show", "scope", "global"):
         if link["ifname"] in (IFACE, "mbvip"):
             continue
         for a in link.get("addr_info", []):
@@ -1209,7 +1219,7 @@ def local_nets():
 
 def sync_vips(want):
     """Hold exactly these cluster IPs on a dummy interface so local services can bind them."""
-    links = json.loads(run("ip", "-j", "-4", "addr", "show", "dev", "mbvip", check=False) or "[]")
+    links = ip_json("-4", "addr", "show", "dev", "mbvip")
     have = {a["local"] for l in links for a in l.get("addr_info", [])}
     if want and not links:
         run("ip", "link", "add", "mbvip", "type", "dummy", check=False)
@@ -1231,8 +1241,8 @@ def sync_routes(want, src):
 
     def held(*where):
         out = set()
-        for r in json.loads(run("ip", "-j", "-4", "route", "show", *where, check=False) or "[]"):
-            with contextlib.suppress(ValueError, KeyError):
+        for r in ip_json("-4", "route", "show", *where):
+            with contextlib.suppress(ValueError, KeyError, TypeError):
                 out.add(IPv4Network(r["dst"]))
         return out
 
@@ -1241,7 +1251,7 @@ def sync_routes(want, src):
         run("ip", "route", "replace", str(p), "dev", IFACE, "table", str(MESH_TABLE), check=False)
     for p in ours - want:
         run("ip", "route", "del", str(p), "table", str(MESH_TABLE), check=False)
-    if not run("ip", "-j", "rule", "show", "pref", str(MESH_TABLE), check=False).strip("[]\n "):
+    if not ip_json("rule", "show", "pref", str(MESH_TABLE)):
         run("ip", "rule", "add", "iif", IFACE, "lookup", str(MESH_TABLE), "pref", str(MESH_TABLE), check=False)
 
     main, elsewhere = held("dev", IFACE), set()
