@@ -1348,9 +1348,23 @@ def mesh_table(*chains):
 # ==============================================================================
 
 
-def run(*cmd, input=None, check=True):
+def run(*cmd, input=None, check=True, timeout=60):
+    """A system command's output. No command may hold the node up for good: one that does not
+    finish in `timeout` seconds counts as failed."""
     kw = {"input": input} if input is not None else {"stdin": subprocess.DEVNULL}
-    return subprocess.run(cmd, check=check, text=True, capture_output=True, **kw).stdout
+    try:
+        return subprocess.run(cmd, check=check, text=True, capture_output=True, timeout=timeout, **kw).stdout
+    except subprocess.TimeoutExpired:
+        log(f"{cmd[0]} did not finish in {timeout}s: {' '.join(cmd[:4])}")
+        if check:
+            raise subprocess.CalledProcessError(124, cmd, "", f"timed out after {timeout}s")
+        return ""
+
+
+def unit(action, *names):
+    """Start, stop or restart systemd units without waiting for the job: this very code often runs
+    inside a unit of its own (the timer's), and a blocking request for a job can then wait on itself."""
+    run("systemctl", "--no-block", action, *names, check=False)
 
 
 def ip_json(*args):
@@ -1669,8 +1683,8 @@ def reconcile():
         run("ip", "rule", "del", "pref", str(MESH_TABLE), check=False)
         firewall([])
         apply_table(None)
-        for unit in ("meshbone-serve.socket", "meshbone-admin.socket", "meshbone-dns.service"):
-            run("systemctl", "stop", unit, check=False)
+        for name in ("meshbone-serve.socket", "meshbone-admin.socket", "meshbone-dns.service"):
+            unit("stop", name)
         return
 
     loosen_rp_filter()
@@ -1730,9 +1744,9 @@ def reconcile():
     apply_table(mesh_table(policy_ruleset(mesh, alive, policy()), gateway_ruleset(mesh, me, loc.get("nat", True))))
     if {"primary": primary, "rtt": rtt, "elsewhere": elsewhere} != was:
         write(f"{DIR}/state.json", json.dumps({"primary": primary, "rtt": rtt, "elsewhere": elsewhere}))
-    run("systemctl", "start", "meshbone-serve.socket", check=False)
-    run("systemctl", "start" if serves_admin else "stop", "meshbone-admin.socket", check=False)
-    run("systemctl", "start" if hub else "stop", "meshbone-dns.service", check=False)
+    unit("start", "meshbone-serve.socket")
+    unit("start" if serves_admin else "stop", "meshbone-admin.socket")
+    unit("start" if hub else "stop", "meshbone-dns.service")
 
 
 UNITS = {
@@ -1850,7 +1864,7 @@ def install_units():
             0o644,
         )
     run("systemctl", "daemon-reload")
-    run("systemctl", *(["start"] if ONCE else ["enable", "--now"]), "meshbone.timer")
+    run("systemctl", "--no-block", *(["start"] if ONCE else ["enable", "--now"]), "meshbone.timer")
 
 
 def exchange(mesh, peer, msg):

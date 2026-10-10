@@ -919,10 +919,10 @@ use("adm")
 text = m.simple_config("phone")[0]
 assert "DNS = 10.253.253.3, home.mesh" in text
 assert did("a", "ip", "addr", "add", "10.253.253.3/32", "dev", "mbvip") and did(
-    "a", "systemctl", "start", "meshbone-dns.service"
+    "a", "systemctl", "--no-block", "start", "meshbone-dns.service"
 )
 assert ["INPUT", "-i", "mb0", "-p", "udp", "--dport", "53", "-j", "ACCEPT"] in json.load(open(D("a") + "/fw.json"))
-assert not did("c", "systemctl", "start", "meshbone-dns.service")
+assert not did("c", "systemctl", "--no-block", "start", "meshbone-dns.service")
 page = R(pw="correct-horse")[1].decode()
 assert "<h2>DNS</h2>" in page and "home.mesh" in page and 'name=dns value="files nas.example.org"' in page
 R("POST", "correct-horse", form(csrf=csrf("correct-horse"), action="dns", zone="lab.test", upstream="1.1.1.1"))
