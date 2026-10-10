@@ -80,6 +80,7 @@ FRESH = 180  # a WireGuard peer with a handshake this recent (s) counts as reach
 VERIFY_WAIT = 20  # how long join waits for the first handshakes (s)
 CONFIRM_WAIT = 60  # how long a new hub has to be reached from outside before it is demoted again (s)
 UPDATE_SETTLE = 10  # seconds a freshly upgraded node gets before its health is judged
+MESH_TABLE = 7948  # routing table (and rule priority) for packets that arrive from the mesh
 SESSIONS = "/run/meshbone-sessions"  # web sessions that hold a token; gone at reboot
 SESSION_MAX = 12 * 3600  # the longest a token may be valid (s)
 SESSION = None  # (key, delegation) while a command or request may sign changes without the admin key file
@@ -1220,19 +1221,38 @@ def sync_vips(want):
 
 
 def sync_routes(want, src):
-    """Route exactly these prefixes into the mesh, without touching routes that are not ours."""
-    have = set()
-    for r in json.loads(run("ip", "-j", "-4", "route", "show", "dev", IFACE, check=False) or "[]"):
-        with contextlib.suppress(ValueError):
-            have.add(IPv4Network(r["dst"]))
-    for p in want - have:
+    """Route exactly these prefixes into the mesh. Returns the ones this host already sends elsewhere.
+
+    Packets that arrive *from* the mesh are looked up in a table of our own first, so relaying -
+    a hub handing traffic on, a gateway receiving it - never depends on what else the host
+    routes. For traffic the machine itself originates, the prefixes go into the main table,
+    but only where nothing else claims them: a route somebody put there stays.
+    """
+
+    def held(*where):
+        out = set()
+        for r in json.loads(run("ip", "-j", "-4", "route", "show", *where, check=False) or "[]"):
+            with contextlib.suppress(ValueError, KeyError):
+                out.add(IPv4Network(r["dst"]))
+        return out
+
+    ours = held("dev", IFACE, "table", str(MESH_TABLE))
+    for p in want - ours:
+        run("ip", "route", "replace", str(p), "dev", IFACE, "table", str(MESH_TABLE), check=False)
+    for p in ours - want:
+        run("ip", "route", "del", str(p), "table", str(MESH_TABLE), check=False)
+    if not run("ip", "-j", "rule", "show", "pref", str(MESH_TABLE), check=False).strip("[]\n "):
+        run("ip", "rule", "add", "iif", IFACE, "lookup", str(MESH_TABLE), "pref", str(MESH_TABLE), check=False)
+
+    main, elsewhere = held("dev", IFACE), set()
+    for p in want - main:
         try:
             run("ip", "route", "add", str(p), "dev", IFACE, "src", str(src))
-        except subprocess.CalledProcessError as e:
-            # e.g. the prefix is already routed elsewhere on this machine: leave that alone
-            log(f"route {p}: {e.stderr.strip()}")
-    for p in have - want:
+        except subprocess.CalledProcessError:
+            elsewhere.add(p)  # already routed some other way on this machine: leave that alone
+    for p in main - want:
         run("ip", "route", "del", str(p), "dev", IFACE, check=False)
+    return sorted(str(p) for p in elsewhere)
 
 
 def firewall(want):
@@ -1404,6 +1424,7 @@ def reconcile():
     sync_vips(set(held_vips(mesh, me)) if active else set())
     if not active:  # revoked: take everything down
         run("ip", "link", "del", IFACE, check=False)
+        run("ip", "rule", "del", "pref", str(MESH_TABLE), check=False)
         firewall([])
         apply_table(None)
         for unit in ("meshbone-serve.socket", "meshbone-admin.socket"):
@@ -1449,7 +1470,7 @@ def reconcile():
         if not any(IPv4Network(s).subnet_of(IPv4Network(l)) for l in attached)
         and not any(u in IPv4Network(s) for u in underlay)
     }
-    sync_routes(routes, my_ip)
+    elsewhere = sync_routes(routes, my_ip)
     if hub:
         record_stats(me["id"], alive, nets, rtt)
 
@@ -1463,8 +1484,8 @@ def reconcile():
         rules += [["FORWARD", "-i", IFACE, "-j", "ACCEPT"], ["FORWARD", "-o", IFACE, "-j", "ACCEPT"]]
     firewall(rules)
     apply_table(mesh_table(policy_ruleset(mesh, alive, policy()), gateway_ruleset(mesh, me, loc.get("nat", True))))
-    if {"primary": primary, "rtt": rtt} != was:
-        write(f"{DIR}/state.json", json.dumps({"primary": primary, "rtt": rtt}))
+    if {"primary": primary, "rtt": rtt, "elsewhere": elsewhere} != was:
+        write(f"{DIR}/state.json", json.dumps({"primary": primary, "rtt": rtt, "elsewhere": elsewhere}))
     run("systemctl", "start", "meshbone-serve.socket", check=False)
     run("systemctl", "start" if serves_admin else "stop", "meshbone-admin.socket", check=False)
 
@@ -2993,7 +3014,12 @@ def cmd_serve():
 
 def cmd_status():
     loc = local()
-    print(view_status(loc["mesh"], list(rows()), warnings(), ONCE, os.path.exists(f"{DIR}/admin.key"), code_sha()))
+    notes = warnings() + [
+        f"this machine already routes {p} some other way, so its own traffic there does not use the mesh "
+        f"(traffic it relays for others does)"
+        for p in read_json("state.json", {}).get("elsewhere", [])
+    ]
+    print(view_status(loc["mesh"], list(rows()), notes, ONCE, os.path.exists(f"{DIR}/admin.key"), code_sha()))
 
 
 def cmd_leave():
@@ -3001,6 +3027,7 @@ def cmd_leave():
     run("systemctl", "disable", "--now", *units, check=False)
     firewall([])
     apply_table(None)
+    run("ip", "rule", "del", "pref", str(MESH_TABLE), check=False)
     for ifn in (IFACE, "mbvip"):
         run("ip", "link", "del", ifn, check=False)
     for path in [f"{UNIT_DIR}/{name}" for name in UNITS]:

@@ -245,8 +245,13 @@ assert "ListenPort = 40000" in head and did("d", "ip", "link", "set", "dev", "mb
 assert (
     did("d", "ip", "route", "add", "10.3.0.0/24")
     and not did("c", "ip", "route", "add", "10.3.0.0/24")
-    and not did("c", "ip", "route", "replace")
+    and not [
+        c for c in did("c", "ip", "route", "replace") if "table" not in c
+    ]  # the host's main table is never overwritten
 )
+# packets arriving from the mesh are routed by the mesh's own table, whatever else the host routes
+assert did("d", "ip", "route", "replace", "10.3.0.0/24", "dev", "mb0", "table", "7948")
+assert did("d", "ip", "rule", "add", "iif", "mb0", "lookup", "7948", "pref", "7948")
 
 # --- preshared keys: one per link, same on both ends, unknown to third nodes
 mesh_psk = use("a").local()["mesh"]["psk"]
