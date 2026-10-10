@@ -546,10 +546,14 @@ def sync_resolver(on):
         text = f"# written by meshbone: the mesh resolver first, then its fallbacks\n[global-dns-domain-*]\nservers={','.join(servers)}\n"
         if on and (not os.path.exists(path) or open(path).read() != text):
             store.write(path, text, 0o644)
-            run("nmcli", "general", "reload", "dns-full", check=False)
+            run(
+                "nmcli", "general", "reload", "conf,dns-rc,dns-full", check=False
+            )  # the global DNS lives in NM's config
         elif not on and os.path.exists(path):
             os.remove(path)
-            run("nmcli", "general", "reload", "dns-full", check=False)
+            run(
+                "nmcli", "general", "reload", "conf,dns-rc,dns-full", check=False
+            )  # the global DNS lives in NM's config
     else:
         path, saved = "/etc/resolv.conf", f"{settings.DIR}/resolv.conf.saved"
         text = (
