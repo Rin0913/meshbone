@@ -450,12 +450,10 @@ def reconcile():
     }
     if now_state != was:
         store.write(f"{settings.DIR}/state.json", json.dumps(now_state))
-    if loc.get("resolver", True) != was.get("resolver_on"):
-        sync_resolver(loc.get("resolver", True))
-        store.write(
-            f"{settings.DIR}/state.json",
-            json.dumps({**store.read_json("state.json", {}), "resolver_on": loc.get("resolver", True)}),
-        )
+    wanted = resolver_wanted(loc)
+    if wanted != was.get("resolver"):  # first time, switched on or off, or the zone or servers changed
+        sync_resolver(wanted != "off")
+        store.write(f"{settings.DIR}/state.json", json.dumps({**store.read_json("state.json", {}), "resolver": wanted}))
     unit("start", "meshbone-serve.socket")
     unit("start" if serves_admin else "stop", "meshbone-admin.socket")
     unit("start" if hub else "stop", "meshbone-dns.service")
@@ -533,18 +531,28 @@ def resolver_manager():
     return "file"
 
 
+def resolver_wanted(loc):
+    """What this host's DNS should be: "off", or the servers and the search domain (the mesh's
+    zone, so that bare node names resolve). Comparable, so a change of either is applied."""
+    if not loc.get("resolver", True):
+        return "off"
+    d = store.dns_settings(loc["mesh"])
+    fallback = loc.get("fallback") or d["upstream"]  # a host may name its own fallbacks
+    return {"servers": [str(store.dns_vip(loc["mesh"]))] + fallback, "zone": d["zone"]}
+
+
 def sync_resolver(on):
-    """Make the mesh resolver this host's DNS, with the mesh's upstream resolvers as fallback -
-    or undo that. Done through whatever manages the host's DNS, so it survives the manager's
-    own changes; the plain-file case keeps a copy of what was there. Returns what was done."""
-    mesh = store.local()["mesh"]
-    d = store.dns_settings(mesh)
-    fallback = store.local().get("fallback") or d["upstream"]  # a host may name its own fallbacks
-    servers, zone, how = [str(store.dns_vip(mesh))] + fallback, d["zone"], resolver_manager()
+    """Make the mesh resolver this host's DNS, with the mesh's upstream resolvers as fallback and
+    the zone as the search domain - or undo that. Done through whatever manages the host's DNS, so
+    it survives the manager's own changes; the plain-file case keeps a copy of what was there.
+    Returns what was done."""
+    loc = store.local()
+    wanted = resolver_wanted({**loc, "resolver": True})
+    servers, zone, how = wanted["servers"], wanted["zone"], resolver_manager()
     if how == "resolved":
         if on:
             run("resolvectl", "dns", settings.IFACE, *servers, check=False)
-            run("resolvectl", "domain", settings.IFACE, "~.", f"~{zone}", check=False)
+            run("resolvectl", "domain", settings.IFACE, "~.", zone, check=False)  # no ~: a search domain too
             run("resolvectl", "default-route", settings.IFACE, "yes", check=False)
         else:
             run("resolvectl", "revert", settings.IFACE, check=False)
@@ -556,7 +564,10 @@ def sync_resolver(on):
             run("resolvconf", "-d", "lo.meshbone", check=False)
     elif how == "networkmanager":
         path = "/etc/NetworkManager/conf.d/meshbone.conf"
-        text = f"# written by meshbone: the mesh resolver first, then its fallbacks\n[global-dns-domain-*]\nservers={','.join(servers)}\n"
+        text = (
+            "# written by meshbone: the mesh resolver first, then its fallbacks, and the mesh's zone to search\n"
+            f"[global-dns]\nsearches={zone}\n\n[global-dns-domain-*]\nservers={','.join(servers)}\n"
+        )
         if on and (not os.path.exists(path) or open(path).read() != text):
             store.write(path, text, 0o644)
             run(

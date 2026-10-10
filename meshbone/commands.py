@@ -433,9 +433,7 @@ def cmd_local(a):
                 sys.exit(f"bad fallback resolver: {e}")
             if not loc["fallback"]:
                 loc.pop("fallback")
-            st = store.read_json("state.json", {})
-            store.write(f"{settings.DIR}/state.json", json.dumps({**st, "resolver_on": None}))  # apply again
-        store.write(f"{settings.DIR}/node.json", json.dumps(loc))
+        store.write(f"{settings.DIR}/node.json", json.dumps(loc))  # a changed fallback is applied by reconcile
         system.reconcile()
     print(
         f"listen port {loc.get('listen_port') or 'automatic'}, mtu {loc.get('mtu') or 1420}, "
