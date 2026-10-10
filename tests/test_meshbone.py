@@ -71,8 +71,9 @@ m.set_mode = lambda once: None
 m.resolve = lambda host, port: f"{host}:{port}"
 m.loosen_rp_filter = lambda: None
 resolver_calls = []
-real_sync_resolver = m.sync_resolver
+real_sync_resolver, real_in_place = m.sync_resolver, m.resolver_in_place
 m.sync_resolver = lambda on: resolver_calls.append((here(), on)) or "stub"  # the host's DNS is not touched in tests
+m.resolver_in_place = lambda wanted: True  # nor asked
 m.PARALLEL = 1
 m.VERIFY_WAIT = 0
 m.CONFIRM_WAIT = 0
@@ -1415,7 +1416,12 @@ sync("a"), sync("c"), sync("adm")
 vip, told, real_which, real_write = str(m.dns_vip(m.local()["mesh"])), [], shutil.which, m.store.write
 m.run = lambda *argv, **kw: told.append(argv) or ("active" if argv[:2] == ("systemctl", "is-active") else "")
 shutil.which = lambda x: "/usr/bin/" + x  # systemd-resolved
+m.glibc_asks_resolved = lambda: True  # else it would point this host's /etc/resolv.conf at the stub
 real_sync_resolver(True)
+assert not real_in_place({"servers": [vip], "zone": "lab.test"})  # the stub answered nothing for the link
+m.run = lambda *argv, **kw: f"Link 9 (mb0): {vip} 9.9.9.9" if argv[:2] == ("resolvectl", "dns") else "active"
+assert real_in_place({"servers": [vip], "zone": "lab.test"}) and real_in_place("off")
+m.run = lambda *argv, **kw: told.append(argv) or ("active" if argv[:2] == ("systemctl", "is-active") else "")
 assert ("resolvectl", "dns", "mb0", vip, "9.9.9.9") in told
 assert ("resolvectl", "domain", "mb0", "~.", "lab.test") in told  # no ~: the search domain too
 shutil.which = lambda x: None  # NetworkManager
@@ -1426,7 +1432,7 @@ written = [t for t in told if t[0] == "/etc/NetworkManager/conf.d/meshbone.conf"
 assert written and written[-1][1].endswith(
     f"[global-dns]\nsearches=lab.test\n\n[global-dns-domain-*]\nservers={vip},9.9.9.9\n"
 ), written
-del m.system.open
+del m.system.open, m.system.glibc_asks_resolved
 shutil.which, m.store.write, m.run = real_which, real_write, fake_run
 
 # --- the HTTPS gateway: the mesh's own CA, a certificate for every name, a proxy on cluster IP .4

@@ -451,7 +451,7 @@ def reconcile():
     if now_state != was:
         store.write(f"{settings.DIR}/state.json", json.dumps(now_state))
     wanted = resolver_wanted(loc)
-    if wanted != was.get("resolver"):  # first time, switched on or off, or the zone or servers changed
+    if wanted != was.get("resolver") or not resolver_in_place(wanted):  # first time, changed, or lost at boot
         sync_resolver(wanted != "off")
         store.write(f"{settings.DIR}/state.json", json.dumps({**store.read_json("state.json", {}), "resolver": wanted}))
     unit("start", "meshbone-serve.socket")
@@ -541,6 +541,54 @@ def resolver_wanted(loc):
     return {"servers": [str(store.dns_vip(loc["mesh"]))] + fallback, "zone": d["zone"]}
 
 
+def glibc_asks_resolved():
+    """Whether programs on this host (through glibc) actually consult systemd-resolved: via its
+    stub listener in /etc/resolv.conf or the nss-resolve module. If not, resolved's per-link
+    settings change nothing for them."""
+    try:
+        hosts = next((ln for ln in open("/etc/nsswitch.conf") if ln.startswith("hosts:")), "")
+        head = open("/etc/resolv.conf").read(2000)
+    except OSError:
+        return False
+    return "resolve" in hosts.split() or "127.0.0.53" in head
+
+
+def keep_resolv_conf():
+    """Remember what /etc/resolv.conf was (a symlink's target, or the content) - once."""
+    path, saved = "/etc/resolv.conf", f"{settings.DIR}/resolv.conf.saved"
+    if os.path.exists(saved) or "written by meshbone" in (open(path).read() if os.path.exists(path) else ""):
+        return
+    if os.path.islink(path):
+        store.write(saved, "link " + os.readlink(path))
+    elif os.path.exists(path):
+        store.write(saved, open(path).read())
+    else:
+        store.write(saved, "")
+
+
+def restore_resolv_conf():
+    """Put /etc/resolv.conf back the way keep_resolv_conf found it, if it was kept."""
+    path, saved = "/etc/resolv.conf", f"{settings.DIR}/resolv.conf.saved"
+    if not os.path.exists(saved):
+        return
+    kept = open(saved).read()
+    if os.path.lexists(path):
+        os.remove(path)
+    if kept.startswith("link "):
+        os.symlink(kept[5:].strip(), path)
+    elif kept:
+        store.write(path, kept, 0o644)
+    os.remove(saved)
+
+
+def resolver_in_place(wanted):
+    """Whether what sync_resolver did is still in effect. Only systemd-resolved's per-link
+    settings can vanish on their own (with the interface, at boot); the files stay."""
+    if wanted == "off" or resolver_manager() != "resolved":
+        return True
+    return wanted["servers"][0] in run("resolvectl", "dns", settings.IFACE, check=False)
+
+
 def sync_resolver(on):
     """Make the mesh resolver this host's DNS, with the mesh's upstream resolvers as fallback and
     the zone as the search domain - or undo that. Done through whatever manages the host's DNS, so
@@ -554,8 +602,14 @@ def sync_resolver(on):
             run("resolvectl", "dns", settings.IFACE, *servers, check=False)
             run("resolvectl", "domain", settings.IFACE, "~.", zone, check=False)  # no ~: a search domain too
             run("resolvectl", "default-route", settings.IFACE, "yes", check=False)
+            if not glibc_asks_resolved():  # resolved runs but nothing asks it: point /etc/resolv.conf at its stub
+                keep_resolv_conf()
+                if os.path.lexists("/etc/resolv.conf"):
+                    os.remove("/etc/resolv.conf")
+                os.symlink("/run/systemd/resolve/stub-resolv.conf", "/etc/resolv.conf")
         else:
             run("resolvectl", "revert", settings.IFACE, check=False)
+            restore_resolv_conf()
     elif how == "resolvconf":
         if on:  # named lo.* so that resolvconf puts it before the DHCP-provided ones
             text = "".join(f"nameserver {s}\n" for s in servers) + f"search {zone}\noptions timeout:2 attempts:1\n"
@@ -579,7 +633,7 @@ def sync_resolver(on):
                 "nmcli", "general", "reload", "conf,dns-rc,dns-full", check=False
             )  # the global DNS lives in NM's config
     else:
-        path, saved = "/etc/resolv.conf", f"{settings.DIR}/resolv.conf.saved"
+        path = "/etc/resolv.conf"
         text = (
             "# written by meshbone; the original is kept beside its state\n"
             + "".join(f"nameserver {s}\n" for s in servers)
@@ -590,17 +644,13 @@ def sync_resolver(on):
         except OSError:
             current = ""
         if on and current != text:
-            if "written by meshbone" not in current and not os.path.exists(saved):
-                store.write(saved, current)
+            keep_resolv_conf()
             if os.path.islink(path):
                 os.remove(path)
             store.write(path, text, 0o644)
         elif not on and "written by meshbone" in current:
-            if os.path.exists(saved):
-                store.write(path, open(saved).read(), 0o644)
-                os.remove(saved)
-            else:
-                os.remove(path)
+            os.remove(path)
+            restore_resolv_conf()
     return (
         f"DNS: the mesh resolver {servers[0]} first, then {', '.join(servers[1:])} (via {how})"
         if on

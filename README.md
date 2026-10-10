@@ -208,9 +208,10 @@ The zone defaults to `<mesh>.internal`; `meshbone dns --zone home.example
 --upstream '9.9.9.9 1.1.1.1'` changes it for the whole mesh. Every node uses
 the mesh resolver as its DNS, with the upstream resolvers after it as
 fallbacks and the zone as its search domain (so `ssh vpn1` works) - set
-through whatever manages the host's DNS (systemd-resolved, resolvconf,
-NetworkManager, or the file itself, which is kept) and applied again when the
-zone or the resolvers change. Simple clients get the same in their config
+through whatever manages the host's DNS (systemd-resolved - pointed at its
+stub when nothing on the host asked it yet - resolvconf, NetworkManager, or
+the file itself; what was there is kept and put back by `--resolver off` or
+`leave`) and applied again when the zone or the resolvers change. Simple clients get the same in their config
 (`DNS = 10.253.253.3, <zone>`); export them again after changing the zone.
 `meshbone local --resolver off` leaves a host's DNS alone.
 
