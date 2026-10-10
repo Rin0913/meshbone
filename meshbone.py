@@ -744,6 +744,29 @@ def stats_db():
     return db
 
 
+def stats_upkeep(db):
+    """Once an hour: fold minutes that are old into 10-minute buckets and drop what is too old.
+    Every holder of a copy does the same arithmetic, so the copies stay alike."""
+    bucket = int(time.time()) // 60 * 60
+    if bucket % 3600:
+        return
+    cut = bucket - KEEP_FINE
+    db.execute(
+        "INSERT INTO link SELECT reporter, peer, ts / 600 * 600, sum(rx), sum(tx), CAST(avg(ms) AS INT) FROM link "
+        "WHERE ts < ? AND ts % 600 != 0 GROUP BY 1, 2, 3 ON CONFLICT(reporter, peer, ts) DO UPDATE SET "
+        "rx = rx + excluded.rx, tx = tx + excluded.tx",
+        (cut,),
+    )
+    db.execute("DELETE FROM link WHERE ts < ? AND ts % 600 != 0", (cut,))
+    db.execute("DELETE FROM link WHERE ts < ?", (bucket - KEEP_ALL,))
+
+
+def keeps_stats(me):
+    """Does this node hold the traffic history? Hubs measure it; every node that serves the
+    pages keeps a copy, so the graphs look the same whichever of them answers."""
+    return bool(me["endpoint"]) or os.path.exists(f"{DIR}/admin.key")
+
+
 def stats_cursors():
     """{reporter id: newest bucket we hold from it}"""
     try:
@@ -784,6 +807,7 @@ def stats_import(reporter, got):
             "INSERT OR REPLACE INTO total VALUES (?, ?, ?, ?)",
             [(reporter, *r) for r in got.get("totals", []) if ints(r, 3) and None not in r],
         )
+        stats_upkeep(db)
         db.commit()
         db.close()
     except (sqlite3.Error, TypeError) as e:
@@ -1382,16 +1406,7 @@ def record_stats(my_id, alive, nets, rtt):
                 "rx = rx + excluded.rx, tx = tx + excluded.tx",
                 (my_id, alive[pk]["id"], got, sent),
             )
-        if bucket % 3600 == 0:  # hourly: fold old minutes into 10-minute buckets, drop what is too old
-            cut = bucket - KEEP_FINE
-            db.execute(
-                "INSERT INTO link SELECT reporter, peer, ts / 600 * 600, sum(rx), sum(tx), CAST(avg(ms) AS INT) FROM link "
-                "WHERE ts < ? AND ts % 600 != 0 GROUP BY 1, 2, 3 ON CONFLICT(reporter, peer, ts) DO UPDATE SET "
-                "rx = rx + excluded.rx, tx = tx + excluded.tx",
-                (cut,),
-            )
-            db.execute("DELETE FROM link WHERE ts < ? AND ts % 600 != 0", (cut,))
-            db.execute("DELETE FROM link WHERE ts < ?", (bucket - KEEP_ALL,))
+        stats_upkeep(db)
         db.commit()
         db.close()
         write(f"{DIR}/counters.json", json.dumps(now))
@@ -2387,8 +2402,8 @@ def handle(ip, line):
         reply, me = state(), nodes[local()["pub"]]
         if not isinstance(msg, dict):
             msg = {}
-        if type(msg.get("stats_since")) is int and me["endpoint"] and nodes[peer]["endpoint"]:
-            reply.update(stats_export(me["id"], msg["stats_since"]))  # hubs keep each other's traffic history
+        if type(msg.get("stats_since")) is int and me["endpoint"]:
+            reply.update(stats_export(me["id"], msg["stats_since"]))  # for whoever keeps a copy of the traffic history
         if re.fullmatch(r"[0-9a-f]{64}", str(msg.get("want_code"))):
             reply["code"] = offer_code(
                 msg["want_code"]
@@ -2407,13 +2422,14 @@ def gossip(flood=False):
         if pk != mypk and not n.get("simple") and (n["endpoint"] or (hub and flood))
     ]
     msg, want = state(), wanted_code()
-    since = stats_cursors() if hub else {}
+    copies = keeps_stats(nodes[mypk])
+    since = stats_cursors() if copies else {}
     if want:
         msg["want_code"] = want
 
     def one(peer):
         try:
-            ask = {**msg, "stats_since": since.get(peer[1]["id"], 0)} if hub and peer[1]["endpoint"] else msg
+            ask = {**msg, "stats_since": since.get(peer[1]["id"], 0)} if copies and peer[1]["endpoint"] else msg
             return peer[0], exchange(loc["mesh"], peer[1], ask)
         except (OSError, ValueError):
             return peer[0], None  # down or not linked yet; the next round will do
@@ -2423,7 +2439,7 @@ def gossip(flood=False):
     with locked():
         changed = [merge(got, None if nodes[pk]["endpoint"] else pk) for pk, got in results]
         for pk, got in results:
-            if hub and nodes[pk]["endpoint"] and isinstance(got, dict):
+            if copies and nodes[pk]["endpoint"] and isinstance(got, dict):
                 stats_import(nodes[pk]["id"], got)
             if want and isinstance(got, dict) and got.get("code") and not os.path.exists(release_path(want)):
                 store_code(want, got["code"])

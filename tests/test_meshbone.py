@@ -313,10 +313,29 @@ assert db.execute("SELECT sum(rx) FROM link WHERE reporter=? AND peer=?", (ida, 
 db.close()
 use("c")
 st = m.state()
-st["stats_since"] = 0  # a client asking gets no history, and cannot inject any
+st["stats_since"] = 0  # any node may read a hub's history; nobody can write into it
 use("a")
 reply, _ = m.handle(IP["c"], json.dumps(st))
-assert "stats" not in json.loads(reply)
+assert len(json.loads(reply)["stats"]) >= 1
+# a node that serves the pages keeps its own copy, so its graphs are not empty: the admin client here
+sync("adm")
+db = sqlite3.connect(D("adm") + "/stats.db")
+assert db.execute("SELECT sum(rx) FROM link WHERE reporter=? AND peer=?", (ida, idc)).fetchone() == (3100,)
+db.close()
+use("adm")
+assert (
+    sum(
+        p[1]
+        for l in json.loads(m.respond("GET", "/api/traffic", {}, b"")[1])["links"]
+        if (l["reporter"], l["peer"]) == (ida, idc)
+        for p in l["points"]
+    )
+    == 3100
+)
+assert (
+    not os.path.exists(D("c") + "/stats.db")
+    or not sqlite3.connect(D("c") + "/stats.db").execute("SELECT count(*) FROM link").fetchone()[0]
+)
 use("b")
 m.stats_import(idb, {"stats": [[idc, 60, "x", 1, 1], [idc, 60, 5, 5]], "totals": "junk"})
 G = lambda path: m.respond("GET", path, {}, b"")
