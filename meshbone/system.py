@@ -199,6 +199,9 @@ def apply_table(text):
             return
         run("nft", "-f", "-", input=text)
         store.write(path, text)
+        st = store.read_json("state.json", {})
+        if st.get("nft_error"):  # applied again after a failure: the problem is over
+            store.write(f"{settings.DIR}/state.json", json.dumps({**st, "nft_error": ""}))
     except (OSError, subprocess.CalledProcessError) as e:
         why = str(getattr(e, "stderr", "") or e)[:200]
         if store.read_json("state.json", {}).get("nft_error") != why:  # say it once, not every fifteen seconds
