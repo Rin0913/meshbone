@@ -311,7 +311,7 @@ reply, _ = m.handle(IP["c"], json.dumps(st))
 assert "stats" not in json.loads(reply)
 use("b")
 m.stats_import(idb, {"stats": [[idc, 60, "x", 1, 1], [idc, 60, 5, 5]], "totals": "junk"})
-G = lambda path: m.admin_response("GET", path, {}, b"")
+G = lambda path: m.respond("GET", path, {}, b"")
 use("b")
 t = json.loads(G("/api/traffic")[1])
 link = [l for l in t["links"] if (l["reporter"], l["peer"]) == (ida, idc)][0]
@@ -454,9 +454,10 @@ assert m.load()[P["c"]]["cost"] == 9  # g's LAN does not block later edits of c
 
 # --- management page: only on admin nodes, password can be changed
 use("a")
-assert G("/admin")[0].startswith("404")
+st, body, _, extra = G("/admin")  # a hub cannot sign changes: it sends the browser on to an admin node
+assert st.startswith("307") and f"Location: http://{IP['adm']}:7948/admin" in extra
 use("adm")
-R = lambda method="GET", pw="s3cret", body=b"": m.admin_response(
+R = lambda method="GET", pw="s3cret", body=b"": m.respond(
     method, "/admin", {"authorization": "Basic " + base64.b64encode(b"admin:" + pw.encode()).decode()}, body
 )
 assert G("/admin")[0].startswith("401") and R(pw="nope")[0].startswith("401")
@@ -566,18 +567,18 @@ expect_exit(
 )
 AUTH = {"authorization": "Basic " + base64.b64encode(b"admin:correct-horse").decode()}
 use("adm")
-st, body, ctype, extra = m.admin_response("GET", "/admin/simple?name=phone", AUTH, b"")
+st, body, ctype, extra = m.respond("GET", "/admin/simple?name=phone", AUTH, b"")
 assert (
     st == "200 OK"
     and b"download phone.conf" in body
     and b"PrivateKey" in body
-    and m.admin_response("GET", "/admin/simple?name=phone", {}, b"")[0].startswith("401")
+    and m.respond("GET", "/admin/simple?name=phone", {}, b"")[0].startswith("401")
 )
-st, body, ctype, extra = m.admin_response("GET", "/admin/simple?name=phone&hub=d&download=1", AUTH, b"")
+st, body, ctype, extra = m.respond("GET", "/admin/simple?name=phone&hub=d&download=1", AUTH, b"")
 assert body.decode() == again and "phone.conf" in extra
-assert m.admin_response("GET", "/admin/simple?name=c", AUTH, b"")[0].startswith("404")
+assert m.respond("GET", "/admin/simple?name=c", AUTH, b"")[0].startswith("404")
 use("a")
-assert m.admin_response("GET", "/admin/simple?name=phone", AUTH, b"")[0].startswith("404")  # a hub has no admin.key
+assert m.respond("GET", "/admin/simple?name=phone", AUTH, b"")[0].startswith("307")  # a hub has no admin.key
 use("adm")
 body = R(
     "POST", "correct-horse", form(csrf=csrf("correct-horse"), action="invite", name="tablet", simple=1, labels="mobile")
@@ -586,7 +587,7 @@ assert b"download tablet.conf" in body and "tablet" in names("a")
 use("adm")
 assert b"QR / config" in R(pw="correct-horse")[1]
 use("home")
-assert m.admin_response("GET", "/admin/simple?name=tablet", AUTH, b"")[0] == "200 OK"  # the other admin can show it too
+assert m.respond("GET", "/admin/simple?name=tablet", AUTH, b"")[0] == "200 OK"  # the other admin can show it too
 
 # --- deploy over ssh through jump hosts, with and without passwords (ssh stubbed)
 assert m.parse_chain("u1@h1:u2@h2:10.9.9.9") == [("u1@h1", None), ("u2@h2", None), ("10.9.9.9", None)]
@@ -596,6 +597,8 @@ assert m.parse_chain("u1:p@ss:w0rd@h1;u2@h2;h3") == [
     ("h3", None),
 ] and m.parse_chain("root:pw@solo") == [("root@solo", "pw")]
 expect_exit(lambda: m.parse_chain("u@h;rm -rf /"), "--remote is")
+assert m.parse_chain("ssh: rks:pw@10.0.0.8") == [("rks@10.0.0.8", "pw")]
+assert m.parse_chain("ssh me@h1;h2") == [("me@h1", None), ("h2", None)]
 real = subprocess.run
 log = []
 fail = [False]
@@ -690,6 +693,112 @@ assert (
     b"viaweb is installed" in body and log[0][0][-2] == "root@solo" and "viaweb" in names("a")
 )  # the page can deploy too
 m.subprocess.run = real
+
+# --- software updates: proven on the admin node first, then signed and followed by everyone
+base = os.path.join(root, "installed.py")
+open(base, "wb").write(b"# base\n")
+m.BIN, BASE = base, hashlib.sha256(b"# base\n").hexdigest()
+installed, ran, bad_check, bad_health = {}, [], set(), set()
+
+
+def fake_code_sha(path=None):
+    return hashlib.sha256(open(path, "rb").read()).hexdigest() if path else installed.get(here(), BASE)
+
+
+def fake_script(path, *args, timeout=0):
+    ran.append((here(), args[0]))
+    if args[0] == "check":
+        return here() not in bad_check, "boom"
+    if args[0] == "upgrade":
+        installed[here()] = hashlib.sha256(open(path, "rb").read()).hexdigest()
+    if args[0] == "health":
+        return here() not in bad_health, ""
+    return True, ""
+
+
+m.code_sha, m.script, m.reachable, m.UPDATE_SETTLE = fake_code_sha, fake_script, lambda: True, 0
+v2 = os.path.join(root, "v2.py")
+open(v2, "w").write("print('v2')\n")
+V2 = hashlib.sha256(open(v2, "rb").read()).hexdigest()
+U = lambda **k: A(url=k.get("url"), ref=k.get("ref"), file=k.get("file"), rollback=k.get("rollback", False))
+log_of = lambda n: [json.loads(l)["event"] for l in open(D(n) + "/audit.log")]
+use("a")
+expect_exit(lambda: m.cmd_update(U(file=v2)), "admin.key")  # only an admin node can publish
+broken = os.path.join(root, "broken.py")
+open(broken, "w").write("def (:\n")
+use("adm")
+expect_exit(lambda: m.cmd_update(U(file=broken)), "not a program")
+bad_check.add("adm")
+expect_exit(lambda: m.cmd_update(U(file=v2)), "was not accepted")  # fails its own dry run: nothing is installed
+assert installed.get("adm", BASE) == BASE and ("adm", "upgrade") not in ran and log_of("adm")[-1] == "rejected"
+bad_check.clear()
+bad_health.add("adm")
+expect_exit(lambda: m.cmd_update(U(file=v2)), "lost touch")  # installed, unhealthy, put back
+assert (
+    installed["adm"] == BASE and log_of("adm")[-1] == "rolled-back" and use("a").release() is None
+)  # and never published
+bad_health.clear()
+with quiet:
+    use("adm")
+    m.cmd_update(U(file=v2))
+assert installed["adm"] == V2 and log_of("adm")[-2:] == ["updated", "published"]
+use("a")
+assert m.release()["sha"] == V2 and os.path.exists(
+    m.release_path(V2)
+)  # the hub fetched the file while relaying the news
+assert not m.store_code(
+    V2, base64.b64encode(m.zlib.compress(b"evil")).decode()
+)  # a file that is not the signed one is refused
+sync("a")
+assert installed["a"] == V2 and log_of("a")[-1] == "updated"
+bad_check.add("c")
+sync("c")
+sync("c")  # c refuses this version, says so, and does not try it again
+assert installed.get("c", BASE) == BASE and ran.count(("c", "check")) == 1 and log_of("c")[-1] == "rejected"
+sync("d", "a")
+use("adm")
+sync("adm")
+soft = m.software()
+state_of = {n["name"]: n for n in soft["nodes"]}
+assert (
+    state_of["a"]["code"] == V2[:12]
+    and state_of["c"]["update"]["ok"] is False
+    and "dry run failed" in state_of["c"]["update"]["why"]
+)
+assert soft["release"]["sha"] == V2 and soft["previous"] == BASE and "phone" not in state_of
+page = R(pw="correct-horse")[1].decode()
+assert (
+    "<h2>software</h2>" in page
+    and V2[:12] in page
+    and "refused, kept the old version" in page
+    and "roll the mesh back" in page
+)
+# from the page, by URL; the GitHub address becomes a raw link at the chosen ref
+seen_urls = []
+real_open = m.urllib.request.urlopen
+m.urllib.request.urlopen = lambda url, timeout=0: (seen_urls.append(url), io.BytesIO(b"print('v3')\n"))[1]
+V3 = hashlib.sha256(b"print('v3')\n").hexdigest()
+use("adm")
+body = R(
+    "POST",
+    "correct-horse",
+    form(csrf=csrf("correct-horse"), action="update", source="https://github.com/o/r", ref="v1.2"),
+)[1]
+assert (
+    b"is rolling out" in body
+    and seen_urls == ["https://raw.githubusercontent.com/o/r/v1.2/meshbone.py"]
+    and installed["adm"] == V3
+)
+m.urllib.request.urlopen = real_open
+expect_exit(lambda: m.fetch_source("http://plain.example/x.py", None), "must be https")
+sync("a")
+assert installed["a"] == V3
+# roll the whole mesh back to what the admin node ran before
+with quiet:
+    use("adm")
+    m.cmd_update(U(rollback=True))
+sync("a")
+assert installed["adm"] == V2 and installed["a"] == V2 and use("a").release()["source"] == "rollback"
 
 # --- the original admin machine dies; the rest carries on
 shutil.move(D("adm"), D("adm.dead"))

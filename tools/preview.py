@@ -91,7 +91,7 @@ for reporter, peer, scale, ms in [
 db.commit()
 db.close()
 out = sys.argv[1]
-G = lambda path: m.admin_response("GET", path, {}, b"")[1]
+G = lambda path: m.respond("GET", path, {}, b"")[1]
 open(out + "/map.html", "wb").write(G("/").replace(b"<meta http-equiv=refresh content=20>", b""))
 data = G(f"/api/traffic?from={now - 21600}&to={now}")
 open(out + "/traffic.html", "wb").write(

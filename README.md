@@ -92,6 +92,7 @@ On an admin node:
 | `set NAME [options]` | Change a node |
 | `approve NAME`, `revoke NAME` | Accept a `promote` request; remove a node |
 | `passwd` | Change the management page password |
+| `update URL [--ref REF]`, `update --file PATH`, `update --rollback` | Roll out a new version of meshbone itself, see below |
 
 Node options: `--endpoint HOST:PORT`, `--subnet CIDR`, `--vip IP`, `--cost MS`,
 `--desc TEXT`, `--label L`, `--ip ADDRESS`, `--admin`.
@@ -115,11 +116,34 @@ Served on port 7948, reachable only from inside the mesh.
 | `/traffic` | Per-link traffic graphs with a time range |
 | `/api/nodes`, `/api/topology`, `/api/traffic` | Read-only JSON; `/api/nodes` filters by `label`, `role`, `name` |
 | `http://10.253.253.2:7948/metrics` on every hub | Prometheus text format |
-| `http://<admin node>:7948/admin` | Management page, password protected, only on admin nodes |
+| `http://10.253.253.1:7948/admin` | Management page. A hub redirects to an admin node, where it asks for the password |
 
 Traffic is counted per link by the hub at one end. Traffic between two clients
 shows up on both of their links to the hub that relayed it; there is no
 per-pair matrix.
+
+## Updating
+
+```bash
+sudo meshbone update https://github.com/OWNER/REPO --ref v1.2    # or from the management page
+```
+
+1. The admin node fetches `meshbone.py` at that branch, tag or commit.
+2. The new version must pass its own dry run (`check`) against the node's real
+   state and Python. Then it is installed, and the node must still be in touch
+   with the mesh afterwards. If not, the previous version is put back and
+   nothing is published.
+3. Only then is the version's checksum signed with the admin key. Every node
+   fetches the file from its peers, verifies it against the signed checksum and
+   goes through the same steps on its own.
+4. A node where it fails keeps its old version, does not retry that version,
+   and reports why. The management page shows what each node runs.
+
+Every step is appended to `/etc/meshbone/audit.log` on the node it happened
+on. `update --rollback` publishes the version the admin node ran before.
+
+Pin `--ref` to a tag or commit you have reviewed: whatever is at that URL will
+run as root on every node.
 
 ## How it works
 
@@ -148,7 +172,9 @@ not take the mesh down.
 | admin node | | everything |
 
 WireGuard encrypts hop by hop, so a hub sees relayed traffic in clear. Use TLS
-or SSH for anything sensitive. The mesh is a flat network: restrict what each
+or SSH for anything sensitive. That includes the management page: its password
+travels in clear through whichever hub relays it, so open it from the admin
+node itself when you can. The mesh is a flat network: restrict what each
 node exposes on `mb0` with its own firewall.
 
 ## Limitations
@@ -157,8 +183,19 @@ node exposes on `mb0` with its own firewall.
 - A simple client uses one hub and a static config. Export it again after
   adding hubs or subnets.
 - IPv4 only inside the mesh.
-- The script does not update itself. Run `upgrade` on each node.
+- All nodes follow a published version at once; there is no staged rollout beyond "the admin node first".
 - `deploy` accepts host keys it has not seen before.
+
+## Code layout
+
+`meshbone.py` stays a single file because `deploy` and `update` ship exactly
+one file to a node. Inside, it is laid out as model, view, controller:
+
+| Layer | Holds |
+|---|---|
+| **Model** | The signed directory, what nodes report, traffic history, versions, and the rules over them. A second part wraps the machine: WireGuard, routes, firewall, systemd, ssh. |
+| **View** | `view_*` functions and page assets. They format the data they are given and read or change nothing. |
+| **Controller** | `cmd_*` for the command line, `respond` for HTTP, `handle` and `gossip` for other nodes. They change the model, then pick a view. |
 
 ## Development
 
