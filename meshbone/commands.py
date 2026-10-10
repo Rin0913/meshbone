@@ -83,9 +83,13 @@ def editing():
     with store.locked():
         loc, nodes, nets = store.admin()
         had_hub = any(n["endpoint"] for n in store.live(nodes).values())
+        before = json.loads(json.dumps(nodes))
         yield loc, nodes, nets
         if had_hub and not any(n["endpoint"] for n in store.live(nodes).values()):
             sys.exit("that would leave the mesh without a hub; make another node a hub first")
+        changed = [n["name"] for pk, n in nodes.items() if n != before.get(pk)]
+        if changed:
+            store.event("admin", "changed " + ", ".join(sorted(changed)[:6]))
         store.save(nodes)
         system.reconcile()
     wire.gossip(flood=True)
@@ -705,6 +709,10 @@ def cmd_check():
 
 
 def cmd_health():
+    """Exit 0 when the node is in touch with the mesh; print what the checks found either way."""
+    st = store.read_json("state.json", {})
+    for p in st.get("problems", []):
+        print("problem:", p)
     sys.exit(0 if system.reachable() else "this node is not in touch with the mesh")
 
 

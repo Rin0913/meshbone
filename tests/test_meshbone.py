@@ -1316,6 +1316,64 @@ assert "edge" not in names("a") and not m.load()[P["c"]].get("public") and m.exi
 sync("a")
 assert did("a", "nft", "delete", "table", "inet", "meshbone")  # nothing left to map: the table is gone
 
+# --- every node notes events, judges its own health, and hubs report the hosts talking through them
+use("a")
+rep_a = m.load_nets()[P["a"]]
+assert (
+    rep_a["health"]["ok"] in (True, False)
+    and isinstance(rep_a["health"]["problems"], list)
+    and isinstance(rep_a["events"], list)
+)
+assert any(e["k"] == "update" for e in rep_a["events"])  # the update audit lands in the events too
+shakes["a"] = {}  # every link on hub a goes quiet
+sync("a")
+assert any(e["k"] == "link" and "down" in e["m"] for e in m.recent_events(40))
+assert any("no node has reached this hub" in p for p in m.read_json("state.json", {})["problems"])
+shakes["a"] = {P["adm"]: 3}
+sync("a")
+assert any(e["k"] == "link" and e["m"].endswith("adm: up") for e in m.recent_events(40))
+sync("adm")
+page = G("/")[1].decode()
+assert "<h2>health</h2>" in page and "<h2>events</h2>" in page and "no node has reached this hub" in page
+assert (
+    G("/events")[0] == "200 OK"
+    and isinstance(json.loads(G("/api/events")[1]), list)
+    and json.loads(G("/api/health")[1])[0]["name"]
+)
+assert b"meshbone_node_healthy{" in G("/metrics")[1]
+# admin changes become events on the admin node
+use("adm")
+with quiet:
+    m.cmd_set(S("d", desc="tweaked"))
+assert any(e["k"] == "admin" and "changed d" in e["m"] for e in m.recent_events(10))
+# hosts behind nodes, from connection tracking on a hub (the file is stubbed)
+real_open = open
+
+
+def fake_open(path, *a, **k):
+    if path == "/proc/sys/net/netfilter/nf_conntrack_acct":
+        return io.StringIO("1\n")
+    if path == "/proc/net/nf_conntrack" and here() == "a":  # only hub a sees these flows
+        return io.StringIO(
+            f"ipv4 2 tcp 6 431999 ESTABLISHED src=10.3.0.9 dst={IP['adm']} sport=5 dport=22 packets=10 bytes=1500 src={IP['adm']} dst=10.3.0.9 sport=22 dport=5 packets=9 bytes=900 [ASSURED] mark=0 use=1\n"
+            f"ipv4 2 udp 17 29 src={IP['adm']} dst=10.3.0.9 sport=1 dport=53 packets=1 bytes=70 src=10.3.0.9 dst={IP['adm']} sport=53 dport=1 packets=1 bytes=90 mark=0 use=1\n"
+            f"ipv4 2 tcp 6 10 src={IP['c']} dst={IP['adm']} sport=1 dport=2 packets=1 bytes=100 src={IP['adm']} dst={IP['c']} sport=2 dport=1 packets=1 bytes=100 mark=0 use=1\n"
+            f"ipv4 2 tcp 6 10 src=8.8.8.8 dst={IP['c']} sport=1 dport=2 packets=1 bytes=100 src={IP['c']} dst=8.8.8.8 sport=2 dport=1 packets=1 bytes=100 mark=0 use=1\n"
+        )
+    return real_open(path, *a, **k)
+
+
+m.system.open = fake_open
+sync("a")
+edges = m.load_nets()[P["a"]]["edges"]
+assert edges == [
+    {"ip": "10.3.0.9", "via": "c", "peer": "adm", "bytes": 2560}
+], edges  # mesh-to-mesh and unknown-internet flows are not hosts
+sync("adm")
+topo = m.topology()
+assert topo["edges"] == edges and "id=edges" in G("/")[1].decode()
+del m.system.open
+
 # --- the original admin machine dies; the rest carries on
 shutil.move(D("adm"), D("adm.dead"))
 use("home")

@@ -40,12 +40,22 @@ def respond(method, path, headers, body, peer="127.0.0.1"):
         return "200 OK", json.dumps(value, indent=1).encode(), "application/json", ""
 
     public = {
-        "/": lambda: page(views.view_map(mesh, model.topology())),
+        "/": lambda: page(
+            views.view_map(
+                mesh,
+                model.topology(),
+                model.health_table(store.load(), store.load_nets()),
+                model.events_table(store.load(), store.load_nets()),
+            )
+        ),
         "/traffic": lambda: page(views.view_traffic(mesh)),
         "/api": lambda: page(views.view_api(mesh)),
         "/api/nodes": lambda: data(model.api_nodes(query)),
         "/api/topology": lambda: data(model.topology()),
         "/api/policy": lambda: data(store.policy()),
+        "/api/health": lambda: data(model.health_table(store.load(), store.load_nets())),
+        "/api/events": lambda: data(model.events_table(store.load(), store.load_nets(), 500)),
+        "/events": lambda: page(views.view_events(mesh, model.events_table(store.load(), store.load_nets(), 300))),
         "/api/dns": lambda: data(
             {
                 **store.dns_settings(mesh),
@@ -55,7 +65,9 @@ def respond(method, path, headers, body, peer="127.0.0.1"):
         "/api/traffic": lambda: data(model.api_traffic(query)),
         "/metrics": lambda: (
             "200 OK",
-            views.view_metrics(model.topology(), model.traffic_totals()),
+            views.view_metrics(
+                model.topology(), model.traffic_totals(), model.health_table(store.load(), store.load_nets())
+            ),
             "text/plain; version=0.0.4; charset=utf-8",
             "",
         ),

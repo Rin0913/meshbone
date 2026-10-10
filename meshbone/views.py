@@ -59,6 +59,24 @@ function draw() {
       g.fillStyle = css('--bg'); g.fillRect(mx - w / 2, my - 8, w, 16); g.fillStyle = css('--fg'); g.fillText(label, mx, my);
     }
   }
+  if (document.getElementById('edges').checked) {  // hosts behind a node, on a small ring around it
+    const byVia = {};
+    for (const e of T.edges) (byVia[e.via] = byVia[e.via] || []).push(e);
+    g.font = '10px ui-monospace, monospace';
+    for (const [via, list] of Object.entries(byVia)) {
+      const owner = T.nodes.find(n => n.name === via); if (!owner || !pos[owner.id]) continue;
+      const [ox, oy] = pos[owner.id], shown = list.slice(0, 12), ring = 46 + Math.min(30, shown.length * 3);
+      shown.forEach((e, i) => {
+        const a = 2 * Math.PI * i / shown.length + 0.4, x = ox + ring * Math.cos(a), y = oy + ring * Math.sin(a);
+        const peer = T.nodes.find(n => n.name === e.peer);
+        if (peer && pos[peer.id]) { g.beginPath(); g.moveTo(x, y); g.lineTo(pos[peer.id][0], pos[peer.id][1]); g.strokeStyle = css('--muted'); g.lineWidth = 0.6; g.globalAlpha = 0.5; g.stroke(); g.globalAlpha = 1; }
+        g.beginPath(); g.moveTo(x, y); g.lineTo(ox, oy); g.strokeStyle = css('--muted'); g.lineWidth = 0.8; g.stroke();
+        g.beginPath(); g.arc(x, y, 4, 0, 2 * Math.PI); g.fillStyle = css('--bg'); g.fill(); g.strokeStyle = css('--muted'); g.lineWidth = 1; g.stroke();
+        const w = g.measureText(e.ip).width + 4, ty = y + (Math.sin(a) >= 0 ? 10 : -10);
+        g.fillStyle = css('--bg'); g.globalAlpha = 0.85; g.fillRect(x - w / 2, ty - 6, w, 12); g.globalAlpha = 1; g.fillStyle = css('--muted'); g.fillText(e.ip, x, ty);
+      });
+    }
+  }
   for (const n of T.nodes) {
     const [x, y] = pos[n.id], r = n.hub ? 15 : 9, linked = n.hub || T.links.some(l => l.a === n.id && l.up);
     g.beginPath(); g.arc(x, y, r, 0, 2 * Math.PI); g.fillStyle = css(n.hub ? '--hub' : linked ? '--client' : '--bg'); g.fill();
@@ -91,6 +109,9 @@ cv.onpointerup = cv.onpointercancel = e => {
   drag = null; cv.style.cursor = '';
 };
 cv.ondblclick = () => { saved = {}; try { localStorage.removeItem(KEY); } catch (x) {} pos = {}; draw(); };
+const edgesBox = document.getElementById('edges');
+try { edgesBox.checked = localStorage.getItem(KEY + '-edges') === '1'; } catch (e) {}
+edgesBox.onchange = () => { try { localStorage.setItem(KEY + '-edges', edgesBox.checked ? '1' : '0'); } catch (e) {} draw(); };
 draw(); addEventListener('resize', () => { pos = {}; draw(); }); matchMedia('(prefers-color-scheme: dark)').addEventListener('change', draw);
 </script>"""
 
@@ -267,7 +288,7 @@ def tags(labels):
 
 
 def page_head(mesh, title, here):
-    tabs = [("/", "map"), ("/traffic", "traffic"), ("/metrics", "metrics"), ("/api", "API")]
+    tabs = [("/", "map"), ("/traffic", "traffic"), ("/events", "events"), ("/metrics", "metrics"), ("/api", "API")]
     return (
         f"<!doctype html><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'>"
         f"<title>{esc(title)} - mesh {esc(mesh['name'])}</title>{PAGE_STYLE}<nav><b>mesh {esc(mesh['name'])}</b>"
@@ -276,15 +297,31 @@ def page_head(mesh, title, here):
     )
 
 
-def view_map(mesh, topo):
-    """The whole mesh at a glance: the graph, the nodes, the links."""
+def view_events(mesh, events):
+    out = [
+        page_head(mesh, "events", "events"),
+        "<h2>events</h2><p>What every node noted lately, newest first.</p>"
+        "<div class=scroll><table><tr><th>when<th>node<th>kind<th>what",
+    ]
+    for e in events:
+        out.append(
+            f"<tr><td>{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(e['t']))}<td>{esc(e['node'])}<td>{esc(e['k'])}"
+            f"<td style='white-space:normal'>{esc(e['m'])}"
+        )
+    return "".join(out + ["</table></div>"]).encode()
+
+
+def view_map(mesh, topo, health=(), events=()):
+    """The whole mesh at a glance: the graph, the nodes, the links, every node's health and events."""
     here = next(n for n in topo["nodes"] if n["me"])
     names = {n["id"]: n["name"] for n in topo["nodes"]}
     out = [
         page_head(mesh, "map", "map").replace("<title>", "<meta http-equiv=refresh content=60><title>"),
         f"<p>nodes <code>{esc(mesh['net'])}</code> &middot; cluster IPs <code>{esc(mesh['cluster_net'])}</code> &middot; "
         f"this page is <code>{store.admin_vip(mesh)}</code> on every hub, answered now by <b>{esc(here['name'])}</b></p>"
-        "<canvas id=map></canvas><p class=key><span>large dot: hub</span><span>small dot: client</span>"
+        "<canvas id=map></canvas><p class=key><label><input type=checkbox id=edges style='width:auto'> show hosts behind "
+        "nodes (no tunnel of their own, seen talking through a hub)</label></p>"
+        "<p class=key><span>large dot: hub</span><span>small dot: client</span>"
         "<span>thick line: hub-to-hub, or the hub a client sends through</span><span>thin line: standby link</span>"
         "<span>faint dashed red: no link</span><span>number: ping across that link</span>"
         "<span>dotted ring: admin node</span><span>bold outline: the node answering</span>"
@@ -325,6 +362,24 @@ def view_map(mesh, topo):
     )
     out.append(
         "</table></div><p>Sent and received are from the first node's side; <a href=/traffic>graphs over time</a>.</p>"
+        "<h2>health</h2><div class=scroll><table><tr><th>node<th>version<th>state<th>reported"
+    )
+    for h in health:
+        state = "ok" if h["ok"] else "unknown" if h["ok"] is None else "problems"
+        out.append(
+            f"<tr><td><b>{esc(h['name'])}</b><td class=m>{esc(h['version'] or '?')}<td style='white-space:normal'>"
+            + (f"<b>{state}</b><br>" + "<br>".join(esc(p) for p in h["problems"]) if h["problems"] else state)
+            + f"<td>{time.strftime('%m-%d %H:%M', time.localtime(h['reported'])) if h['reported'] else '-'}"
+        )
+    out.append("</table></div><h2>events</h2><div class=scroll><table><tr><th>when<th>node<th>kind<th>what")
+    for e in events[:40]:
+        out.append(
+            f"<tr><td>{time.strftime('%m-%d %H:%M:%S', time.localtime(e['t']))}<td>{esc(e['node'])}<td>{esc(e['k'])}"
+            f"<td style='white-space:normal'>{esc(e['m'])}"
+        )
+    out.append(
+        "</table></div><p><a href=/events>more events</a> &middot; <a href=/api/health>/api/health</a> &middot; "
+        "<a href=/api/events>/api/events</a></p>"
         f"<h2>manage</h2><p>{admins or 'no admin node is online'}</p>"
         "<p>Changes are signed on an admin node; hubs only show the mesh.</p>"
     )
@@ -398,7 +453,7 @@ def view_login(mesh, sid, pub, now, note):
     ).encode()
 
 
-def view_metrics(topo, totals):
+def view_metrics(topo, totals, health=()):
     """The mesh in Prometheus text format."""
     out, names = [], {n["id"]: n["name"] for n in topo["nodes"]}
 
@@ -439,6 +494,12 @@ def view_metrics(topo, totals):
         "gauge",
         "1 if the client sends through this hub.",
         [(k, int(l["primary"])) for k, l in pairs],
+    )
+    family(
+        "meshbone_node_healthy",
+        "gauge",
+        "1 if the node's own checks pass, 0 if not.",
+        [({"node": h["name"]}, int(bool(h["ok"]))) for h in health if h["ok"] is not None],
     )
     family(
         "meshbone_link_ping_ms",

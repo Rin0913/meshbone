@@ -500,6 +500,33 @@ def traffic_totals():
         return []
 
 
+def health_table(nodes, nets):
+    """Every node's state as reported by itself: [{name, version, ok, problems, seen}]."""
+    out = []
+    for pk, n in sorted(store.live(nodes).items(), key=lambda kv: kv[1]["id"]):
+        if n.get("simple") or n.get("transit"):
+            continue
+        r = nets.get(pk, {})
+        h = r.get("health") or {"ok": None, "problems": []}
+        out.append(
+            {
+                "name": n["name"],
+                "version": r.get("code", ""),
+                "ok": h["ok"],
+                "problems": h["problems"],
+                "reported": r.get("seq", 0),
+            }
+        )
+    return out
+
+
+def events_table(nodes, nets, count=60):
+    """The newest events of every node, merged: [{t, node, k, m}]."""
+    names = {pk: n["name"] for pk, n in store.live(nodes).items()}
+    out = [{**e, "node": names[pk]} for pk, r in nets.items() if pk in names for e in r.get("events", [])]
+    return sorted(out, key=lambda e: -e["t"])[:count]
+
+
 def api_nodes(query):
     topo = topology()["nodes"]
     want = query.get("label", [])
@@ -581,7 +608,19 @@ def topology():
     """The whole mesh as its nodes report it: every node, and every link with state and latency."""
     loc, nodes, nets = store.local(), store.load(), store.load_nets()
     mesh, alive = loc["mesh"], store.live(nodes)
-    out = {"nodes": [], "links": [], "mesh": mesh["name"]}
+    out = {"nodes": [], "links": [], "mesh": mesh["name"], "edges": []}
+    merged = {}  # hosts without a tunnel of their own, as the hubs see them talking through
+    for pk, r in nets.items():
+        if pk in alive:
+            for e in r.get("edges", []):
+                key = (e["ip"], e["via"], e["peer"])
+                merged[key] = merged.get(key, 0) + e["bytes"]
+    names_ = {n["name"] for n in alive.values()}
+    out["edges"] = [
+        {"ip": ip, "via": via, "peer": peer, "bytes": b}
+        for (ip, via, peer), b in sorted(merged.items(), key=lambda kv: -kv[1])[:60]
+        if via in names_ and peer in names_
+    ]
     try:  # bytes over the last hour, as counted by the hub end: {(hub id, peer id): (received, sent)}
         db = stats_db()
         hour = {

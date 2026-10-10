@@ -311,19 +311,29 @@ def reconcile():
     told = old.get("rtt", {})
     if ms.keys() == told.keys() and all(abs(v - told[k]) <= max(3, v // 4) for k, v in ms.items()):
         ms = told  # ordinary jitter is not news worth telling the whole mesh
+    # what changed since the last look is worth a line in the events
+    links = {pk: seen.get(pk, settings.FRESH) < settings.FRESH for pk in table}
+    for pk, up in links.items():
+        if was.get("links", {}).get(pk) is not None and was["links"][pk] != up:
+            store.event("link", f"{alive[pk]['name']}: {'up' if up else 'down'}")
+    if primary != was.get("primary") and (primary or was.get("primary")):
+        store.event("route", f"sending through {alive[primary]['name'] if primary else 'no hub'}")
+    for pk, n in alive.items():
+        if pk not in was.get("known", {}) and was.get("known"):
+            store.event("mesh", f"new node {n['name']}")
+    for pk, name in was.get("known", {}).items():
+        if pk not in alive:
+            store.event("mesh", f"node {name} is gone")
     report = {
         "nets": attached,
         "wants": loc.get("wants", ""),
         "rtt": ms,
-        "sees": sorted(alive[pk]["id"] for pk in table if seen.get(pk, settings.FRESH) < settings.FRESH) if hub else [],
+        "sees": sorted(pk_ for pk_ in [alive[pk]["id"] for pk, up in links.items() if up]) if hub else [],
         "primary": alive[primary]["id"] if primary else None,
         "admin": os.path.exists(f"{settings.DIR}/admin.key"),
         "code": store.code_sha()[:12],
         "update": store.update_report(),
     }
-    if {k: v for k, v in old.items() if k != "seq"} != report:
-        nets[mypk] = {**report, "seq": store.next_seq(nets.get(mypk, {}).get("seq", 0))}
-        store.save_nets(nets)  # travels with the next gossip round
 
     sync_vips(set(store.held_vips(mesh, me)) if active else set())
     if not active:  # revoked: take everything down
@@ -389,6 +399,7 @@ def reconcile():
     sync_exit(bool(me.get("public")) and via_exit in rtt)
     if hub:
         record_stats(me["id"], alive, nets, rtt)
+        report["edges"] = edge_hosts(mesh, alive, me)
 
     serves_admin = hub or os.path.exists(f"{settings.DIR}/admin.key")  # hubs: the map; admin nodes: also /admin
     rules = [["INPUT", "-i", settings.IFACE, "-p", "tcp", "--dport", str(settings.GOSSIP_PORT), "-j", "ACCEPT"]]
@@ -407,8 +418,29 @@ def reconcile():
             model.gateway_ruleset(mesh, me, loc.get("nat", True), public, inside),
         )
     )
-    if {"primary": primary, "rtt": rtt, "elsewhere": elsewhere} != was:
-        store.write(f"{settings.DIR}/state.json", json.dumps({"primary": primary, "rtt": rtt, "elsewhere": elsewhere}))
+    problems = health_problems(loc, alive, me, hub, rtt, seen, attached, via_exit, was)
+    if problems != was.get("problems", []):
+        for p in problems:
+            if p not in was.get("problems", []):
+                store.event("health", p)
+        if not problems and was.get("problems"):
+            store.event("health", "all checks pass again")
+    report["health"] = {"ok": not problems, "problems": problems}
+    report["events"] = store.recent_events(30)
+    if {k: v for k, v in old.items() if k != "seq"} != report:
+        nets[mypk] = {**report, "seq": store.next_seq(nets.get(mypk, {}).get("seq", 0))}
+        store.save_nets(nets)  # travels with the next gossip round
+    now_state = {
+        "primary": primary,
+        "rtt": rtt,
+        "elsewhere": elsewhere,
+        "links": links,
+        "known": {pk: n["name"] for pk, n in alive.items()},
+        "problems": problems,
+        "nft_error": was.get("nft_error", ""),
+    }
+    if now_state != was:
+        store.write(f"{settings.DIR}/state.json", json.dumps(now_state))
     unit("start", "meshbone-serve.socket")
     unit("start" if serves_admin else "stop", "meshbone-admin.socket")
     unit("start" if hub else "stop", "meshbone-dns.service")
@@ -491,6 +523,93 @@ def script(path, *args, timeout=240):
         return r.returncode == 0, (r.stdout + r.stderr).strip()[-600:]
     except (OSError, subprocess.TimeoutExpired) as e:
         return False, str(e)
+
+
+def edge_hosts(mesh, alive, me):
+    """Hosts that have no tunnel of their own but talk through this hub: the LAN hosts behind
+    gateways, and the internet behind the exit. From connection tracking: [{ip, via, peer, bytes}]
+    for the busiest, where `via` is the node they sit behind and `peer` the node they talk to.
+    """
+    try:
+        with open("/proc/sys/net/netfilter/nf_conntrack_acct") as f:  # byte counts need accounting switched on
+            if f.read().strip() != "1":
+                run("sysctl", "-qw", "net.netfilter.nf_conntrack_acct=1", check=False)
+        with open("/proc/net/nf_conntrack") as f:
+            flows = f.read().splitlines()
+    except OSError:
+        return []
+    addr = {str(store.router_ip(mesh, n["id"])): n["name"] for n in alive.values()}
+    owners = [(IPv4Network(s), n["name"]) for n in alive.values() for s in n["subnets"]]
+    ranges = (store.mesh_net(mesh), store.cluster_net(mesh))
+    exit_pk = store.exit_node(alive)
+    internet = next((n["name"] for n in store.transits(alive).values()), alive[exit_pk]["name"] if exit_pk else "")
+    seen_ = {}
+    for line in flows:
+        pairs = re.findall(r"src=([\d.]+) dst=([\d.]+)", line)
+        if not pairs or "ipv4" not in line:
+            continue
+        counts = [int(b) for b in re.findall(r"bytes=(\d+)", line)] or [0]
+        src, dst = pairs[0]
+        node, host = (addr[src], dst) if src in addr else (addr[dst], src) if dst in addr else (None, None)
+        if not node or host in addr or any(IPv4Address(host) in r for r in ranges):
+            continue
+        via = next((name for net, name in owners if IPv4Address(host) in net), None)
+        if via is None:
+            if not internet or IPv4Address(host).is_private:
+                continue
+            via = internet
+        key = (host, via, node)
+        seen_[key] = seen_.get(key, 0) + sum(counts)
+    top = sorted(seen_.items(), key=lambda kv: -kv[1])[:40]
+    return [{"ip": ip, "via": via, "peer": peer, "bytes": b} for (ip, via, peer), b in top]
+
+
+def health_problems(loc, alive, me, hub, rtt, seen, attached, via_exit, was):
+    """What is wrong on this node right now, as sentences for the map. Empty when all is well."""
+    out = []
+    others = {pk: n for pk, n in alive.items() if pk != loc["pub"] and not n.get("simple") and not n.get("transit")}
+    hubs = {pk: n for pk, n in others.items() if n["endpoint"]}
+    if not hub and hubs and not rtt:
+        out.append("no hub answers: this node is cut off from the mesh")
+    if hub and others and not any(seen.get(pk, settings.FRESH) < settings.FRESH for pk in others):
+        out.append("no node has reached this hub lately: is its endpoint and UDP port open?")
+    if not shutil.which("nft"):
+        out.append("nftables is not installed: no firewall policy and no gateway NAT here")
+    elif was.get("nft_error"):
+        out.append(f"nftables table not applied: {was['nft_error'][:100]}")
+    for pk, n in hubs.items():
+        host = (n["endpoint"] or n.get("transit", "")).rpartition(":")[0]
+        if host and not re.fullmatch(r"[\d.]+|\[.*\]", host) and not resolve(host, 1):
+            out.append(f"cannot resolve {host}: this host has no working DNS")
+            break
+    if (hub or me["subnets"]) and open("/proc/sys/net/ipv4/ip_forward").read().strip() != "1":
+        out.append("IP forwarding is off, so this node cannot relay or serve as a gateway")
+    if hub or via_exit:  # traffic from the mesh for a network of ours must not go back into the tunnel
+        for net in attached:
+            for r in ip_json(
+                "-4",
+                "route",
+                "get",
+                str(IPv4Network(net).network_address + 1),
+                "from",
+                str(store.router_ip(loc["mesh"], me["id"])),
+                "iif",
+                settings.IFACE,
+            ):
+                if r.get("dev") == settings.IFACE:
+                    out.append(f"traffic from the mesh for {net} would be sent back into the tunnel")
+    u = store.read_json("update.json", {})
+    if u and not u.get("ok"):
+        out.append(f"the last update ({str(u.get('sha', ''))[:12]}) was refused: {u.get('why', '')[:80]}")
+    if not settings.ONCE and run("systemctl", "is-active", "meshbone.timer", check=False).strip() != "active":
+        out.append("the sync timer is not running: nothing keeps this node in step after a change")
+    try:
+        st = os.statvfs(settings.DIR)
+        if st.f_bavail * st.f_frsize < 50 << 20:
+            out.append("less than 50 MB of disk left where meshbone keeps its state")
+    except OSError:
+        pass
+    return out[:20]
 
 
 def reachable():

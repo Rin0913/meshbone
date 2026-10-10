@@ -119,7 +119,8 @@ Served on port 7948, reachable only from inside the mesh.
 |---|---|
 | `http://10.253.253.1:7948/` on every hub | Mesh map, node and link tables |
 | `/traffic` | Per-link traffic graphs with a time range |
-| `/api/nodes`, `/api/topology`, `/api/traffic`, `/api/policy`, `/api/dns` | Read-only JSON; `/api/nodes` filters by `label`, `role`, `name` |
+| `/events` | Every node's recent events, merged |
+| `/api/nodes`, `/api/topology`, `/api/traffic`, `/api/policy`, `/api/dns`, `/api/health`, `/api/events` | Read-only JSON; `/api/nodes` filters by `label`, `role`, `name` |
 | `http://10.253.253.2:7948/metrics` on every hub | Prometheus text format |
 | `http://10.253.253.1:7948/admin` | Management page, on every node (see below) |
 
@@ -273,6 +274,24 @@ on. `update --rollback` publishes the version the admin node ran before.
 
 Pin `--ref` to a tag or commit you have reviewed: whatever is at that URL will
 run as root on every node.
+
+## Health and events
+
+Every node checks itself on each sync - a hub nobody reaches, a client no hub
+answers, missing nftables, a host name it cannot resolve, forwarding off, a
+network of its own that mesh traffic would miss, a refused update, a stopped
+timer, a full disk - and notes what happens to it: links going up or down, the
+hub it sends through changing, nodes appearing and leaving, directory changes
+made on it, updates. The newest of both travel with the node's report, so the
+map shows every node's state and the mesh's recent events wherever it is
+served; `/events`, `/api/health` and `/api/events` give the long form, and
+`meshbone_node_healthy` is in the metrics. On a node, `meshbone health` prints
+its problems and `/etc/meshbone/events.log` holds its history.
+
+Hubs also report the hosts that have no tunnel of their own but talk through
+them - the machines behind a gateway's subnet, and the internet behind the
+exit - from connection tracking. The map's "show hosts behind nodes" toggle
+draws them around the node they sit behind.
 
 ## How it works
 

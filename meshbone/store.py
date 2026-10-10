@@ -320,6 +320,27 @@ def valid_nets(pk, r):
         assert all(k.isdigit() and type(v) is int for k, v in r.get("rtt", {}).items()) and len(r.get("rtt", {})) < 256
         assert type(r.get("primary", 0)) in (int, type(None)) and type(r.get("admin", False)) is bool
         assert isinstance(r.get("code", ""), str) and isinstance(r.get("update") or {}, dict)
+        h = r.get("health") or {"ok": True, "problems": []}
+        assert (
+            type(h["ok"]) is bool
+            and len(h["problems"]) <= 20
+            and all(isinstance(p, str) and len(p) <= 200 for p in h["problems"])
+        )
+        assert len(r.get("edges", [])) <= 40 and all(
+            str(IPv4Address(e["ip"])) == e["ip"]
+            and re.fullmatch(settings.NAME_RE, e["via"])
+            and re.fullmatch(settings.NAME_RE, e["peer"])
+            and type(e["bytes"]) is int
+            for e in r.get("edges", [])
+        )
+        assert len(r.get("events", [])) <= 40 and all(
+            type(e["t"]) is int
+            and isinstance(e["k"], str)
+            and len(e["k"]) <= 16
+            and isinstance(e["m"], str)
+            and len(e["m"]) <= 160
+            for e in r.get("events", [])
+        )
         return True
     except Exception:
         return False
@@ -603,12 +624,37 @@ def release_path(sha):
     return f"{settings.DIR}/releases/{sha}.pyz"
 
 
-def audit(event, **detail):
-    """Append one line to this node's update log."""
-    line = json.dumps({"time": time.strftime("%Y-%m-%d %H:%M:%S"), "event": event, **detail})
+def audit(kind, **detail):
+    """Append one line to this node's update log (and to its events)."""
+    line = json.dumps({"time": time.strftime("%Y-%m-%d %H:%M:%S"), "event": kind, **detail})
     with open(f"{settings.DIR}/audit.log", "a") as f:
         f.write(line + "\n")
     settings.log(f"audit: {line}")
+    event("update", f"{kind}: " + " ".join(f"{k}={str(v)[:40]}" for k, v in detail.items() if k != "node"))
+
+
+def event(kind, text):
+    """Note something that happened on this node: a line in events.log, kept bounded, and the
+    newest lines travel with the node's report so every map can show them."""
+    path, line = f"{settings.DIR}/events.log", json.dumps({"t": int(time.time()), "k": kind[:16], "m": text[:160]})
+    try:
+        with open(path, "a") as f:
+            f.write(line + "\n")
+        if os.path.getsize(path) > 600_000:  # keep the newest half
+            with open(path) as f:
+                lines = f.readlines()
+            write(path, "".join(lines[len(lines) // 2 :]))
+    except OSError:
+        pass
+    settings.log(f"{kind}: {text}")
+
+
+def recent_events(count=30):
+    try:
+        with open(f"{settings.DIR}/events.log") as f:
+            return [json.loads(l) for l in f.readlines()[-count:]]
+    except (OSError, ValueError):
+        return []
 
 
 def audit_tail(count=25):
