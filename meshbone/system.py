@@ -61,28 +61,44 @@ def sync_vips(want):
         run("ip", "addr", "del", f"{ip}/32", "dev", "mbvip", check=False)
 
 
-def sync_routes(want, src, relay=()):
+def sync_routes(want, src, relay=(), own=()):
     """Route exactly these prefixes into the mesh. Returns the ones this host already sends elsewhere.
 
     Packets that arrive *from* the mesh are looked up in a table of our own first, so relaying -
     a hub handing traffic on, a gateway receiving it - never depends on what else the host
-    routes. For traffic the machine itself originates, the prefixes go into the main table,
-    but only where nothing else claims them: a route somebody put there stays. `relay` prefixes
-    (the internet, on a hub) go into the relay table only.
+    routes. That table holds the mesh's prefixes, `relay` prefixes (the internet, on a hub) and
+    `own`: the networks this host is attached to or announces, routed the way the host itself
+    routes them - so that a relay route for the internet never swallows the LAN. For traffic the
+    machine itself originates, the prefixes go into the main table, but only where nothing else
+    claims them: a route somebody put there stays.
     """
 
     def held(*where):
-        out = set()
+        out = {}
         for r in ip_json("-4", "route", "show", *where):
             with contextlib.suppress(ValueError, KeyError, TypeError):
-                out.add(IPv4Network(r["dst"]))
+                out[IPv4Network(r["dst"] if r["dst"] != "default" else "0.0.0.0/0")] = r
         return out
 
-    ours, table = held("dev", settings.IFACE, "table", str(settings.MESH_TABLE)), want | set(relay)
-    for p in table - ours:
-        run("ip", "route", "replace", str(p), "dev", settings.IFACE, "table", str(settings.MESH_TABLE), check=False)
-    for p in ours - table:
-        run("ip", "route", "del", str(p), "table", str(settings.MESH_TABLE), check=False)
+    def host_route(net):  # how the host reaches a network of its own, as route arguments
+        for r in ip_json("-4", "route", "get", str(net.network_address + (1 if net.prefixlen < 31 else 0))):
+            if r.get("dev") and r["dev"] != settings.IFACE:
+                return (["via", r["gateway"]] if r.get("gateway") else []) + ["dev", r["dev"]]
+        return None
+
+    table = str(settings.MESH_TABLE)
+    wanted = {p: ["dev", settings.IFACE] for p in want | set(relay)}
+    for p in own:
+        args = host_route(p)
+        if args:
+            wanted[p] = args
+    ours = held("table", table)
+    for p, args in wanted.items():
+        have = ours.get(p)
+        if not have or have.get("dev") != args[-1] or have.get("gateway") != (args[1] if args[0] == "via" else None):
+            run("ip", "route", "replace", str(p), *args, "table", table, check=False)
+    for p in set(ours) - set(wanted):
+        run("ip", "route", "del", str(p), "table", table, check=False)
     if not ip_json("rule", "show", "pref", str(settings.MESH_TABLE)):
         run(
             "ip",
@@ -97,7 +113,7 @@ def sync_routes(want, src, relay=()):
             check=False,
         )
 
-    main, elsewhere = held("dev", settings.IFACE), set()
+    main, elsewhere = set(held("dev", settings.IFACE)), set()
     for p in want - main:
         try:
             run("ip", "route", "add", str(p), "dev", settings.IFACE, "src", str(src))
@@ -177,10 +193,6 @@ def apply_table(text):
             run("nft", "delete", "table", "inet", "meshbone", check=False)
             os.remove(path)
         return
-    if not shutil.which("nft"):
-        for cmd in (["apt-get", "install", "-y", "-q", "nftables"], ["dnf", "install", "-y", "nftables"]):
-            if shutil.which(cmd[0]):
-                subprocess.run(cmd, stdin=subprocess.DEVNULL, capture_output=True)
     try:
         in_place = os.path.exists(path) and store.read("policy.nft") == text.strip()
         if in_place and run("nft", "list", "table", "inet", "meshbone", check=False):
@@ -188,7 +200,12 @@ def apply_table(text):
         run("nft", "-f", "-", input=text)
         store.write(path, text)
     except (OSError, subprocess.CalledProcessError) as e:
-        settings.log(f"nftables table NOT applied (firewall policy, gateway NAT): {getattr(e, 'stderr', '') or e}")
+        why = str(getattr(e, "stderr", "") or e)[:200]
+        if store.read_json("state.json", {}).get("nft_error") != why:  # say it once, not every fifteen seconds
+            settings.log(f"nftables table NOT applied (firewall policy, gateway NAT): {why}")
+            store.write(
+                f"{settings.DIR}/state.json", json.dumps({**store.read_json("state.json", {}), "nft_error": why})
+            )
 
 
 def resolve(host, port):
@@ -367,7 +384,8 @@ def reconcile():
         else []
     )
     inside = sorted(routes | {IPv4Network(f"{ip}/32") for ip in [my_ip]})
-    elsewhere = sync_routes(routes, my_ip, relay)
+    own = {IPv4Network(l) for l in attached} | {IPv4Network(s) for s in me["subnets"]}
+    elsewhere = sync_routes(routes, my_ip, relay, own)
     sync_exit(bool(me.get("public")) and via_exit in rtt)
     if hub:
         record_stats(me["id"], alive, nets, rtt)
@@ -399,7 +417,7 @@ def reconcile():
 def install_packages():
     try:
         store.ed25519()
-        if shutil.which("wg"):
+        if shutil.which("wg") and shutil.which("nft"):
             return
     except ImportError:
         pass
@@ -407,10 +425,12 @@ def install_packages():
         env = {**os.environ, "DEBIAN_FRONTEND": "noninteractive"}
         subprocess.run(["apt-get", "update", "-q"], env=env)
         subprocess.run(
-            ["apt-get", "install", "-y", "-q", "wireguard-tools", "python3-cryptography"], env=env, check=True
+            ["apt-get", "install", "-y", "-q", "wireguard-tools", "python3-cryptography", "nftables"],
+            env=env,
+            check=True,
         )
     elif shutil.which("dnf"):
-        subprocess.run(["dnf", "install", "-y", "wireguard-tools", "python3-cryptography"], check=True)
+        subprocess.run(["dnf", "install", "-y", "wireguard-tools", "python3-cryptography", "nftables"], check=True)
     else:
         sys.exit("unsupported package manager: install wireguard-tools and python3-cryptography, then re-run")
 
