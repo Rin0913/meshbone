@@ -685,6 +685,18 @@ assert m.parse_chain("u1:p@ss:w0rd@h1;u2@h2;h3") == [
     ("h3", None),
 ] and m.parse_chain("root:pw@solo") == [("root@solo", "pw")]
 expect_exit(lambda: m.parse_chain("u@h;rm -rf /"), "--remote is")
+# as root, ssh runs as the account that set the node up, so the page uses that person's keys
+real_uid, me_now = m.os.geteuid, m.pwd.getpwuid(os.getuid()).pw_name
+m.os.geteuid = lambda: 0
+use("adm")
+assert m.ssh_user() is None
+m.cmd_local(A(listen_port=None, mtu=None, ssh_user=me_now))
+with m.ssh_session([("u@h", None)]) as argv:
+    assert (m.ssh_user(), argv[:4]) == (me_now, ["sudo", "-u", me_now, "ssh"]) or me_now == "root"
+m.cmd_local(A(listen_port=None, mtu=None, ssh_user="no-such-account-xyz"))
+assert m.ssh_user() is None
+m.cmd_local(A(listen_port=None, mtu=None, ssh_user=""))
+m.os.geteuid = real_uid
 assert m.parse_chain("ssh: rks:pw@10.0.0.8") == [("rks@10.0.0.8", "pw")]
 assert m.parse_chain("ssh me@h1;h2") == [("me@h1", None), ("h2", None)]
 real = subprocess.run

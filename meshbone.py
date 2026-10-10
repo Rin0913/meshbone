@@ -29,8 +29,9 @@ Any machine
                                 this machine becomes the first node and the first admin
   meshbone join FILE [--once]   FILE is the mesh config written by `invite`;
                                 --once keeps everything in /run (gone after reboot or `leave`)
-  meshbone local [--listen-port N] [--mtu N]   this machine's own network settings
-                                (also accepted by create, join and deploy)
+  meshbone local [--listen-port N] [--mtu N] [--ssh-user NAME]
+                                this machine's own settings: network (also accepted by create, join and
+                                deploy) and the account whose ssh keys deploys from here use
   meshbone promote --endpoint HOST:PORT   ask to become a hub at this stable public address
   meshbone cost NAME MS         local penalty in ms for sending via hub NAME (0 = automatic)
   meshbone status | leave | upgrade
@@ -61,7 +62,7 @@ The file is laid out as model, view, controller - see the banners below.
 """
 
 
-import argparse, base64, contextlib, fcntl, hashlib, hmac, html, io, json, os, random, re
+import argparse, base64, contextlib, fcntl, hashlib, hmac, html, io, json, os, pwd, random, re
 import secrets, shlex, shutil, socket, sqlite3, subprocess, sys, tarfile, tempfile, time, urllib.parse, urllib.request, zlib
 from concurrent.futures import ThreadPoolExecutor
 from ipaddress import IPv4Address, IPv4Network
@@ -1394,12 +1395,24 @@ def exchange(mesh, peer, msg):
         return json.loads(s.makefile("rb").readline(8 << 20))
 
 
+def ssh_user():
+    """Whose ssh identity deploys use when meshbone runs as root: the person who typed the command
+    under sudo, else the account that set this node up (the page and the timer have no sudo user).
+    None means root's own keys."""
+    if os.geteuid() != 0:
+        return None
+    user = os.environ.get("SUDO_USER") or read_json("node.json", {}).get("ssh_user")
+    try:
+        return user if user and user != "root" and pwd.getpwnam(user) else None
+    except KeyError:
+        return None
+
+
 @contextlib.contextmanager
 def ssh_session(hops):
-    """Yields the argv prefix for ssh. Under sudo it logs in as the person who typed the command
-    (their keys, config and known_hosts). Passwords are answered by an askpass helper, so they
-    never appear on a command line."""
-    user = os.environ.get("SUDO_USER") if os.geteuid() == 0 else None
+    """Yields the argv prefix for ssh, run as ssh_user() with their keys, config and known_hosts.
+    Passwords are answered by an askpass helper, so they never appear on a command line."""
+    user = ssh_user()
     front, ssh = (["sudo", "-u", user] if user else []), ["ssh", "-o", "StrictHostKeyChecking=accept-new"]
     known = dict(sorted(((d, p) for d, p in hops if p), key=lambda kv: -len(kv[0])))
     if not known:
@@ -1924,7 +1937,7 @@ def view_metrics(topo, totals):
     return ("\n".join(out) + "\n").encode()
 
 
-def view_admin(mesh, me, nodes, csrf, note, soft, until, held):
+def view_admin(mesh, me, nodes, csrf, note, soft, until, held, ssh_as):
     """The management page: nodes, adding one, software versions, the password."""
     out = [
         page_head(mesh, "manage", ""),
@@ -1971,7 +1984,8 @@ def view_admin(mesh, me, nodes, csrf, note, soft, until, held):
         "<input class=w name=remote placeholder='install over ssh: user:password@host' autocomplete=off> "
         "<label><input type=checkbox name=simple value=1 style='width:auto'> simple client (phone, plain WireGuard)</label> "
         "<button name=action value=invite>add</button></form>"
-        "<p>With an ssh destination the node is installed and joined right away; several hops are separated by "
+        f"<p>With an ssh destination the node is installed and joined right away. The login starts from <b>{esc(me)}</b> "
+        f"as <b>{esc(ssh_as)}</b>, so it is that account's keys that must be accepted. Several hops are separated by "
         "<code>;</code>, each with or without a password, and each is reached through the one before it. "
         "Without one you get a config file to carry over (it holds the new node's private key).</p>"
     )
@@ -2206,6 +2220,8 @@ def bootstrap(mesh, key, nodes, nets, a, admin_key=None, conf=None):
     set_mode(getattr(a, "once", False))
     os.makedirs(DIR, mode=0o700, exist_ok=True)
     opts = {k: getattr(a, k) for k in ("listen_port", "mtu") if getattr(a, k, None)}
+    if os.environ.get("SUDO_USER", "root") != "root":
+        opts["ssh_user"] = os.environ["SUDO_USER"]  # later deploys from this node log in as this account
     write(f"{DIR}/node.json", json.dumps({"mesh": mesh, "key": key, "pub": pub, "cost": {}, **opts}))
     if admin_key:
         write(f"{DIR}/admin.key", admin_key)
@@ -2591,12 +2607,15 @@ def cmd_set(a):
 def cmd_local(a):
     with locked():
         loc = local()
-        for k in ("listen_port", "mtu"):
+        for k in ("listen_port", "mtu", "ssh_user"):
             if getattr(a, k) is not None:
-                loc[k] = getattr(a, k)  # 0 puts it back to automatic
+                loc[k] = getattr(a, k)  # 0 or '' puts it back to automatic
         write(f"{DIR}/node.json", json.dumps(loc))
         reconcile()
-    print(f"listen port {loc.get('listen_port') or 'automatic'}, mtu {loc.get('mtu') or 1420}")
+    print(
+        f"listen port {loc.get('listen_port') or 'automatic'}, mtu {loc.get('mtu') or 1420}, "
+        f"deploys over ssh as {loc.get('ssh_user') or 'root'}"
+    )
 
 
 def cmd_promote(a):
@@ -2713,6 +2732,9 @@ def cmd_upgrade():
     """Run from the new script: replaces the installed copy and units, keeps the mesh state."""
     install_units()
     with locked():
+        loc = local()
+        if "ssh_user" not in loc and os.environ.get("SUDO_USER", "root") != "root":
+            write(f"{DIR}/node.json", json.dumps({**loc, "ssh_user": os.environ["SUDO_USER"]}))
         reconcile()
 
 
@@ -2743,7 +2765,7 @@ def cmd_check():
     view_map(mesh, topo), view_traffic(mesh), view_api(mesh), view_metrics(topo, traffic_totals())
     view_status(mesh, list(rows()), warnings(), ONCE, False, code_sha())
     if os.path.exists(f"{DIR}/admin.key"):
-        view_admin(mesh, nodes[loc["pub"]]["name"], list(rows()), "x", "", software(), None, True)
+        view_admin(mesh, nodes[loc["pub"]]["name"], list(rows()), "x", "", software(), None, True, "root")
     view_login(mesh, "s", "p", 0, "")
     for text in UNITS.values():
         text.format(py="p", bin="b", port=1, net=mesh["net"], vip="v", aport=2)
@@ -2958,7 +2980,7 @@ def respond(method, path, headers, body, peer="127.0.0.1"):
             with contextlib.suppress(FileNotFoundError):
                 os.remove(a.out)
     me = load()[loc["pub"]]["name"]
-    return page(view_admin(mesh, me, list(rows()), csrf, note, software(), until, held))
+    return page(view_admin(mesh, me, list(rows()), csrf, note, software(), until, held, ssh_user() or "root"))
 
 
 def cmd_admin():
@@ -3051,7 +3073,9 @@ def main():
     s.add_argument("--label", action="append", default=[])
     s.add_argument("--no-label", action="store_true")
     s.add_argument("--no-verify", dest="verify", action="store_false")
-    local_options(sub.add_parser("local"))
+    s = sub.add_parser("local")
+    local_options(s)
+    s.add_argument("--ssh-user", help="account whose ssh keys deploys from this node use ('' = root)")
     s = sub.add_parser("promote")
     s.add_argument("--endpoint", required=True, help="stable public HOST:PORT of this node; '' withdraws")
     s = sub.add_parser("simple")
