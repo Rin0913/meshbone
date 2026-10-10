@@ -1,8 +1,8 @@
 """Logins to other machines: ssh chains with jump hosts and passwords, and the routers we configure (VyOS)."""
 
-import contextlib, hashlib, json, os, re, shlex, shutil, subprocess, sys, tempfile, time
+import contextlib, os, re, shlex, shutil, sys, tempfile
 
-from . import model, settings, store, system
+from . import store, system
 
 
 def parse_chain(text):
@@ -75,71 +75,3 @@ def remote_argv(base, chain, command, jump, tty=False):
     for hop in reversed(chain[1:]):
         command = shlex.join(["ssh", *opts, hop, command])
     return [*base, *opts, chain[0], command]
-
-
-def router_run(opts, identity, command, stdin=None):
-    """Run a command on a managed router over ssh -> its output. Raises on failure."""
-    hops = parse_chain(opts["ssh"])
-    with ssh_session(hops, identity) as base:
-        argv = remote_argv(
-            base + ["-o", "BatchMode=yes", "-o", "ConnectTimeout=15"], [d for d, _ in hops], command, len(hops) > 1
-        )
-        r = subprocess.run(
-            argv,
-            input=(stdin or "").encode(),
-            capture_output=True,
-            timeout=120,
-        )
-        if r.returncode:
-            raise OSError(
-                (r.stderr or r.stdout).decode("utf-8", "replace").strip()[-300:] or f"ssh exit {r.returncode}"
-            )
-        return r.stdout.decode("utf-8", "replace")
-
-
-def manage_routers():
-    """On an admin node: keep every managed router configured, and report what it sees.
-
-    The router's configuration is derived from the directory the same way a hub's own is;
-    it is pushed when it changes (or hourly, in case somebody edited the router by hand),
-    and its WireGuard handshakes stand in for the `sees` report a hub would send itself.
-    """
-    loc, nodes, nets = store.local(), store.load(), store.load_nets()
-    mesh, alive = loc["mesh"], store.live(nodes)
-    state_ = store.read_json("managed.json", {})
-    changed = False
-    for pk, opts in store.managed(mesh, nodes).items():
-        n, st = alive[pk], state_.setdefault(pk, {})
-        try:
-            key = store.kept_key(n["id"])
-            identity = store.managed_ssh_key()[0]
-            sets = model.vyos_commands(mesh, nodes, pk, key, opts)
-            digest = hashlib.sha256("\n".join(sets).encode()).hexdigest()
-            if st.get("applied") != digest or time.time() - st.get("at", 0) > 3600:
-                current = router_run(
-                    opts, identity, "/opt/vyatta/bin/vyatta-op-cmd-wrapper show configuration commands"
-                )
-                out = router_run(opts, identity, "vbash -s", model.vyos_script(model.vyos_deletes(current, opts), sets))
-                if "MESHBONE-APPLIED" not in out:
-                    raise OSError("the router refused the configuration: " + out.strip()[-300:])
-                st.update(applied=digest, at=int(time.time()), error="")
-                store.audit("router-configured", node=n["name"], peers=len(sets))
-            shakes = router_run(opts, identity, f"sudo wg show {opts.get('wg', 'wg0')} latest-handshakes")
-            now, sees = time.time(), []
-            for line in shakes.splitlines():
-                peer, _, ts = line.partition("\t")
-                if ts.strip().isdigit() and int(ts) and now - int(ts) < settings.FRESH and peer in alive:
-                    sees.append(alive[peer]["id"])
-            report = {"nets": [], "wants": "", "sees": sorted(sees), "code": "managed"}
-            if {k: v for k, v in nets.get(pk, {}).items() if k != "seq"} != report:
-                nets[pk] = {**report, "seq": store.next_seq(nets.get(pk, {}).get("seq", 0))}
-                changed = True
-            st["error"] = ""
-        except (OSError, KeyError, ValueError, subprocess.TimeoutExpired) as e:
-            if st.get("error") != str(e)[:200]:
-                settings.log(f"managed router {n['name']}: {e}")
-            st["error"] = str(e)[:200]
-    if changed:
-        store.save_nets(nets)
-    store.write(f"{settings.DIR}/managed.json", json.dumps(state_))
-    return state_

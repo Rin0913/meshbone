@@ -40,7 +40,10 @@ def plan(loc, nodes, nets, rtt, seen, previous=None):
     mesh, mypk, alive = loc["mesh"], loc["pub"], store.live(nodes)
     me = alive[mypk]
     hub = bool(me["endpoint"])
-    peers = {pk: n for pk, n in alive.items() if pk != mypk and (hub or n["endpoint"])}
+    gateway = store.exit_node(alive) == mypk
+    peers = {pk: n for pk, n in alive.items() if pk != mypk and not n.get("transit") and (hub or n["endpoint"])}
+    if gateway:  # only the gateway hub is linked to the transit routers
+        peers.update({pk: n for pk, n in store.transits(alive).items() if n["via"] == me["name"]})
     table = {pk: [] for pk in peers}
     if not peers:
         return table, None
@@ -49,12 +52,20 @@ def plan(loc, nodes, nets, rtt, seen, previous=None):
         for p in store.prefixes(mesh, n):
             owners.setdefault(p, []).append(pk)
     via_exit = store.exit_node(alive)
-    if via_exit in peers and (hub or me.get("public")):
+    if gateway:  # the internet, inbound and outbound, is behind the transit routers
+        for pk in store.transits(alive):
+            if pk in table:
+                table[pk].append(IPv4Network("0.0.0.0/0"))
+    elif via_exit in peers and (hub or me.get("public")):
         table[via_exit].append(IPv4Network("0.0.0.0/0"))
     if hub:
         for p, own in owners.items():
-            if mypk not in own:  # among several holders of a cluster IP: the one heard from last
-                table[min(own, key=lambda pk: (seen.get(pk, float("inf")), pk))].append(p)
+            own = [pk for pk in own if pk in table]  # a transit router is only the gateway's peer
+            if mypk in owners[p] or not own:
+                continue
+            table[min(own, key=lambda pk: (seen.get(pk, float("inf")), pk))].append(
+                p
+            )  # several holders: the one heard from last
         return table, None
 
     def score(pk):
@@ -77,6 +88,27 @@ def plan(loc, nodes, nets, rtt, seen, previous=None):
             via = [h for h in up if ids & set(nets.get(h, {}).get("sees", []))]
             table[primary if primary in via or not via else min(via, key=lambda pk: (score(pk), pk))].append(p)
     return table, primary
+
+
+def transit_config(name):
+    """The WireGuard side of a transit router -> (config text, its entry, the hub it is linked to).
+    The hub's addresses and the public networks are what the router may send through the tunnel."""
+    loc, nodes, nets = store.admin()
+    mesh, alive = loc["mesh"], store.live(nodes)
+    pk, n = store.by_name(nodes, name)
+    if not n.get("transit"):
+        sys.exit(f"{name} is not a transit router")
+    gpk, gateway = next(((k, o) for k, o in alive.items() if o["name"] == n["via"]), (None, None))
+    if not gateway:
+        sys.exit(f"the hub {n['via']} that {name} links to is gone; revoke the router and add it again")
+    key = store.kept_key(n["id"])
+    text = (
+        f"# mesh {mesh['name']}: transit router {name}, linked to hub {gateway['name']}\n[Interface]\nPrivateKey = {key}\n"
+        f"Address = {store.router_ip(mesh, n['id'])}/32\nListenPort = {n['transit'].rpartition(':')[2]}\n\n[Peer]\nPublicKey = {gpk}\n"
+        f"PresharedKey = {pair_psk({'key': key, 'mesh': mesh}, gpk)}\nEndpoint = {gateway['endpoint']}\n"
+        f"AllowedIPs = {', '.join([str(store.router_ip(mesh, gateway['id'])) + '/32'] + n['public_nets'])}\nPersistentKeepalive = 25\n"
+    )
+    return text, n, {**gateway, "pk": gpk}
 
 
 def simple_config(name, hub=None, key=None):
@@ -218,8 +250,13 @@ def policy_ruleset(mesh, alive, pol):
     )
 
 
-def gateway_ruleset(mesh, me, nat):
+def gateway_ruleset(mesh, me, nat, public=(), inside=()):
     """What makes a node a working gateway for the networks it announces -> nftables text, or ''.
+
+    `public`, on the hub a transit router is linked to, maps public addresses 1:1 onto nodes:
+    [(public address, node's mesh address)]. Inbound, a packet for the public address is handed
+    to the node; outbound, what the node sends to the internet (not to `inside`: the mesh and
+    its subnets) leaves as the public address.
 
     The hosts in such a network know nothing about the mesh: they would send their answers to
     their own default router, and the connection would never complete. So whatever comes out of
@@ -232,12 +269,22 @@ def gateway_ruleset(mesh, me, nat):
         for s in me["subnets"]
         for piece in store.carve(IPv4Network(s), [store.mesh_net(mesh), store.cluster_net(mesh)])
     ]
-    if not nets or not nat:
-        return ""
-    return (
-        f'  chain gateway {{ type nat hook postrouting priority 100; policy accept; iifname "{settings.IFACE}" '
-        f'oifname != "{settings.IFACE}" ip daddr {{ {", ".join(nets)} }} masquerade; }}\n'
-    )
+    out = ""
+    if nets and nat:
+        out += (
+            f'  chain gateway {{ type nat hook postrouting priority 100; policy accept; iifname "{settings.IFACE}" '
+            f'oifname != "{settings.IFACE}" ip daddr {{ {", ".join(nets)} }} masquerade; }}\n'
+        )
+    if public:
+        keep = ", ".join(str(n) for n in inside)
+        out += (
+            "  chain public_in { type nat hook prerouting priority -100; policy accept;\n"
+            + "".join(f"    ip daddr {pub} dnat to {ip}\n" for pub, ip in public)
+            + "  }\n  chain public_out { type nat hook postrouting priority 100; policy accept;\n"
+            + "".join(f"    ip saddr {ip} ip daddr != {{ {keep} }} snat to {pub}\n" for pub, ip in public)
+            + "  }\n"
+        )
+    return out
 
 
 def mesh_table(*chains):
@@ -358,89 +405,6 @@ def dns_forward(upstream, query, tcp=False):
         except OSError:
             continue
     return query[:2] + struct.pack("!H", 0x8182) + query[4:6] + b"\x00\x00\x00\x00" + query[12:]  # SERVFAIL
-
-
-def vyos_name(text):
-    return re.sub(r"[^A-Za-z0-9_-]", "-", text)
-
-
-def vyos_commands(mesh, nodes, pk, key, opts):
-    """Everything a VyOS router needs to be the hub `pk` -> list of `set ...` lines (pure).
-
-    Its WireGuard interface, a peer per node with the same allowed-ips a meshbone hub would
-    compute, static routes for the mesh's ranges and every subnet, and 1:1 NAT for the nodes
-    that have a public address: inbound to their mesh address, outbound from it.
-    """
-    alive, me = store.live(nodes), nodes[pk]
-    wg, wan = opts.get("wg", "wg0"), opts["wan"]
-    loc = {"key": key, "mesh": mesh, "pub": pk, "cost": {}}
-    table, _ = plan(loc, nodes, {}, {}, {})
-    port = int(me["endpoint"].rpartition(":")[2])
-    out = [
-        f"set interfaces wireguard {wg} description 'meshbone {mesh['name']}'",
-        f"set interfaces wireguard {wg} address {store.router_ip(mesh, me['id'])}/32",
-        f"set interfaces wireguard {wg} port {port}",
-        f"set interfaces wireguard {wg} private-key {key}",
-        f"set interfaces wireguard {wg} mtu 1420",
-    ]
-    for ppk, carried in sorted(table.items(), key=lambda kv: alive[kv[0]]["id"]):
-        n = alive[ppk]
-        peer = f"set interfaces wireguard {wg} peer {vyos_name(n['name'])}"
-        out += [f"{peer} public-key {ppk}", f"{peer} preshared-key {pair_psk(loc, ppk)}"]
-        out += [f"{peer} allowed-ips {p}" for p in sorted(carried)]
-        if n["endpoint"]:
-            host, _, pport = n["endpoint"].rpartition(":")
-            where = system.resolve(host, int(pport))
-            if where:
-                out += [f"{peer} address {where.rpartition(':')[0].strip('[]')}", f"{peer} port {pport}"]
-        out.append(f"{peer} persistent-keepalive 25")
-    nets = {store.mesh_net(mesh), store.cluster_net(mesh)} | {
-        IPv4Network(s) for k, n in alive.items() if k != pk for s in n["subnets"]
-    }
-    out += [f"set protocols static route {p} interface {wg}" for p in sorted(nets)]
-    for k, n in sorted(alive.items(), key=lambda kv: kv[1]["id"]):
-        if n.get("public") and k != pk:
-            rule, ip = settings.NAT_RULE_BASE + n["id"], store.router_ip(mesh, n["id"])
-            out += [
-                f"set nat destination rule {rule} description 'meshbone {n['name']}'",
-                f"set nat destination rule {rule} inbound-interface name {wan}",
-                f"set nat destination rule {rule} destination address {n['public']}",
-                f"set nat destination rule {rule} translation address {ip}",
-                f"set nat source rule {rule} description 'meshbone {n['name']}'",
-                f"set nat source rule {rule} outbound-interface name {wan}",
-                f"set nat source rule {rule} source address {ip}",
-                f"set nat source rule {rule} translation address {n['public']}",
-            ]
-    return out
-
-
-def vyos_deletes(current, opts):
-    """What to remove from a router's running configuration before our commands -> delete lines.
-    Only what is ours: the WireGuard interface's peers, static routes over it, NAT rules in our range."""
-    wg, out = opts.get("wg", "wg0"), []
-    seen = set()
-    for line in current.splitlines():
-        m = re.match(rf"set interfaces wireguard {re.escape(wg)} peer (\S+)", line)
-        if m:
-            seen.add(f"delete interfaces wireguard {wg} peer {m[1]}")
-        m = re.match(rf"set protocols static route (\S+) interface {re.escape(wg)}\b", line)
-        if m:
-            seen.add(f"delete protocols static route {m[1]} interface {wg}")
-        m = re.match(r"set nat (source|destination) rule (\d+) ", line)
-        if m and settings.NAT_RULE_BASE <= int(m[2]) < settings.NAT_RULE_BASE + 4096:
-            seen.add(f"delete nat {m[1]} rule {m[2]}")
-    out = sorted(seen)
-    return out
-
-
-def vyos_script(deletes, sets):
-    """A configuration session for VyOS's own shell: apply everything in one commit, keep it
-    across reboots, and undo it all if the commit is refused."""
-    body = "\n".join(deletes + sets)
-    return (
-        "#!/bin/vbash\nsource /opt/vyatta/etc/functions/script-template\nconfigure\n"
-        f"{body}\ncommit || {{ echo MESHBONE-COMMIT-FAILED; exit discard; exit 1; }}\nsave\nexit\necho MESHBONE-APPLIED\n"
-    )
 
 
 def stats_db():
@@ -646,13 +610,16 @@ def topology():
                 "labels": n.get("labels", []),
                 "desc": n.get("desc", ""),
                 "simple": bool(n.get("simple")),
-                "managed": n.get("driver", ""),
                 "public": n.get("public", ""),
-                "exit": bool(n.get("exit")),
+                "transit": bool(n.get("transit")),
+                "public_nets": n.get("public_nets", []),
+                "exit": store.exit_node(alive) == pk,
             }
         )
         for hpk, h in alive.items():
             if not h["endpoint"] or hpk == pk or (n["endpoint"] and pk > hpk):  # hub pairs once
+                continue
+            if n.get("transit") and h["name"] != n["via"]:  # a transit router is linked to one hub only
                 continue
             theirs = nets.get(hpk, {})
             ms = mine.get("rtt", {}).get(str(h["id"]), theirs.get("rtt", {}).get(str(n["id"])))
@@ -706,7 +673,7 @@ def software():
                 "update": nets.get(pk, {}).get("update") or {},
             }
             for pk, n in sorted(store.live(store.load()).items(), key=lambda kv: kv[1]["id"])
-            if not n.get("simple") and not n.get("driver")
+            if not n.get("simple") and not n.get("transit")
         ],
         "log": store.audit_tail(),
         "mesh": loc["mesh"]["name"],

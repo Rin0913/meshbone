@@ -4,7 +4,7 @@ import contextlib, json, os, re, shutil, socket, sqlite3, subprocess, sys, time
 from concurrent.futures import ThreadPoolExecutor
 from ipaddress import IPv4Address, IPv4Network
 
-from . import model, settings, ssh, store, updates
+from . import model, settings, store, updates
 
 
 def run(*cmd, input=None, check=True, timeout=60):
@@ -331,8 +331,8 @@ def reconcile():
             f"[Peer]\nPublicKey = {pk}\nPresharedKey = {model.pair_psk(loc, pk)}\n"
             f"AllowedIPs = {', '.join(str(p) for p in sorted(carried))}\n"
         )
-        if n["endpoint"]:
-            host, _, peer_port = n["endpoint"].rpartition(":")
+        if n["endpoint"] or n.get("transit"):
+            host, _, peer_port = (n["endpoint"] or n["transit"]).rpartition(":")
             endpoint = resolve(host, int(peer_port))  # on DNS failure keep whatever endpoint wg has
             with contextlib.suppress(ValueError, AttributeError):
                 underlay.append(IPv4Address(endpoint.rpartition(":")[0]))
@@ -359,11 +359,16 @@ def reconcile():
         and not any(u in IPv4Network(s) for u in underlay)
     }
     via_exit = store.exit_node(alive)
-    relay = [IPv4Network("0.0.0.0/0")] if hub and via_exit and via_exit != mypk else []
+    relay = [IPv4Network("0.0.0.0/0")] if hub and via_exit else []
+    # on the gateway hub: the public addresses mapped 1:1 onto nodes, and what counts as "inside"
+    public = (
+        [(n["public"], store.router_ip(mesh, n["id"])) for n in alive.values() if n.get("public")]
+        if via_exit == mypk
+        else []
+    )
+    inside = sorted(routes | {IPv4Network(f"{ip}/32") for ip in [my_ip]})
     elsewhere = sync_routes(routes, my_ip, relay)
     sync_exit(bool(me.get("public")) and via_exit in rtt)
-    if os.path.exists(f"{settings.DIR}/admin.key") and any(n.get("driver") for n in alive.values()):
-        ssh.manage_routers()
     if hub:
         record_stats(me["id"], alive, nets, rtt)
 
@@ -380,7 +385,8 @@ def reconcile():
     firewall(rules)
     apply_table(
         model.mesh_table(
-            model.policy_ruleset(mesh, alive, store.policy()), model.gateway_ruleset(mesh, me, loc.get("nat", True))
+            model.policy_ruleset(mesh, alive, store.policy()),
+            model.gateway_ruleset(mesh, me, loc.get("nat", True), public, inside),
         )
     )
     if {"primary": primary, "rtt": rtt, "elsewhere": elsewhere} != was:

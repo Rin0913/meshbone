@@ -33,9 +33,6 @@ UPDATE_SETTLE = 10  # seconds a freshly upgraded node gets before its health is 
 MESH_TABLE = 7948  # routing table (and rule priority) for packets that arrive from the mesh
 
 
-NAT_RULE_BASE = 5000  # VyOS NAT rule numbers for public addresses: base + node id
-
-
 EXIT_TABLE = 7949  # routing table (and fwmark) for a node whose internet goes out through the mesh
 
 

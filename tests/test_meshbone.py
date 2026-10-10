@@ -999,6 +999,8 @@ def fake_sub(cmd, **k):
     return types.SimpleNamespace(stdout=b"motd noise\n/tmp/tmp.Xy12\n", returncode=0)
 
 
+ssh_dirs = lambda: sorted(d for d in os.listdir(tempfile.gettempdir()) if d.startswith("meshbone-ssh-"))
+ssh_dirs_before = ssh_dirs()
 m.subprocess.run = fake_sub
 dep = lambda name, remote="u1@h1:u2@h2:10.9.9.9", **k: A(
     name=name,
@@ -1049,7 +1051,7 @@ assert (
 assert (
     up[up.index("-J") : up.index("-J") + 3] == ["-J", "u1@h1", "root@h2"] and fed == b"t0p\n" and "sudo -S" in join[-1]
 )
-assert not [d for d in os.listdir(tempfile.gettempdir()) if d.startswith("meshbone-ssh-")]  # the askpass helper is gone
+assert ssh_dirs() == ssh_dirs_before  # the askpass helper is gone
 del log[:]
 jump_ok[0] = False
 use("adm")
@@ -1208,187 +1210,111 @@ assert ran == before
 held_lock.close()
 assert not m.update_busy()
 
-# --- a managed router (VyOS) as hub and internet exit, public addresses mapped 1:1 onto nodes
-pushed = []
-
-
-def fake_router(opts, identity, command, stdin=None):
-    pushed.append((opts["ssh"], command, stdin))
-    assert "PRIVATE KEY" in identity and ("vbash" in command or "wg show" in command or "show configuration" in command)
-    if "show configuration" in command:
-        return "set interfaces wireguard wg0 peer stale public-key X\nset nat source rule 5010 translation address 1.2.3.4\nset nat source rule 10 x\nset protocols static route 10.9.0.0/16 interface wg0\nset protocols static route 10.8.0.0/16 interface eth1\n"
-    if "wg show" in command:
-        return "\n".join(f"{k}\t{int(m.time.time()) - 5}" for k in (P["c"], P["adm"]))
-    return "MESHBONE-APPLIED\n"
-
-
-m.router_run = fake_router
-real_resolve = m.resolve
-m.resolve = lambda host, port: f"203.0.113.9:{port}"  # a router wants addresses, so the admin node resolves names
+# --- a transit router: plain WireGuard to one hub, which maps public addresses 1:1 onto nodes
 use("adm")
-expect_exit(
-    lambda: m.cmd_invite(
-        A(
-            name="gw",
-            endpoint="gw.example:51820",
-            subnet=[],
-            vip=[],
-            cost=0,
-            admin=False,
-            out=None,
-            desc="",
-            label=[],
-            ip="",
-            dns=[],
-            driver="vyos",
-            manage="",
-            wan="",
-        )
-    ),
-    "--manage",
+T_ = lambda name, **k: A(
+    name=name,
+    endpoint=k.get("endpoint", ""),
+    via=k.get("via", ""),
+    net=k.get("net", []),
+    desc="",
+    label=[],
+    out=k.get("out"),
 )
+expect_exit(lambda: m.cmd_transit(T_("edge")), "needs --endpoint")
 expect_exit(
-    lambda: m.cmd_invite(
-        A(
-            name="gw",
-            endpoint="",
-            subnet=[],
-            vip=[],
-            cost=0,
-            admin=False,
-            out=None,
-            desc="",
-            label=[],
-            ip="",
-            dns=[],
-            driver="vyos",
-            manage="vyos@gw.example",
-            wan="eth0",
-        )
-    ),
-    "needs an endpoint",
+    lambda: m.cmd_transit(T_("edge", endpoint="edge.example:51820", via="c", net=["198.51.100.64/26"])), "is not a hub"
 )
+expect_exit(lambda: m.cmd_set(S("c", public="198.51.100.77")), "no network a transit router delivers")
 with quiet:
-    m.cmd_invite(
-        A(
-            name="gw",
-            endpoint="gw.example:51820",
-            subnet=[],
-            vip=[],
-            cost=0,
-            admin=False,
-            out=None,
-            desc="vultr",
-            label=[],
-            ip="",
-            dns=[],
-            driver="vyos",
-            manage="vyos@gw.example",
-            wan="eth0",
-            wg="",
-            exit=None,
+    m.cmd_transit(
+        T_(
+            "edge",
+            endpoint="edge.example:51820",
+            via="a",
+            net=["198.51.100.64/26"],
+            out=os.path.join(root, "edge.conf"),
         )
     )
-gw_pk, gw = [(k, n) for k, n in m.live(m.load()).items() if n["name"] == "gw"][0]
-assert gw["driver"] == "vyos" and gw["exit"] and gw["endpoint"] == "gw.example:51820" and gw["id"] < 255
-assert m.held_vips(mesh_, gw) == []  # a router we only configure cannot serve the map, metrics or DNS
-assert m.managed(mesh_, m.load())[gw_pk] == {"ssh": "vyos@gw.example", "wan": "eth0", "wg": "wg0"}
-priv, pub_line = m.managed_ssh_key()
-assert "OPENSSH PRIVATE KEY" in priv and pub_line.startswith("ssh-ed25519 ") and "meshbone-managed@" in pub_line
-assert m.managed_ssh_key() == (priv, pub_line)  # made once
-assert priv not in json.dumps(m.load_conf())  # and kept encrypted
-# public addresses: valid, unique, not a mesh address
-expect_exit(lambda: m.cmd_set(S("c", public="10.253.255.9")), "mesh address")
-expect_exit(lambda: m.cmd_set(S("c", public="not-an-ip")), "bad public")
+e_pk, edge = [(k, n) for k, n in m.live(m.load()).items() if n["name"] == "edge"][0]
+assert (
+    edge["transit"] == "edge.example:51820"
+    and edge["via"] == "a"
+    and edge["public_nets"] == ["198.51.100.64/26"]
+    and edge["endpoint"] == ""
+)
+assert m.exit_node(m.live(m.load())) == P["a"] and m.held_vips(mesh_, edge) == []
+text = open(os.path.join(root, "edge.conf")).read()
+assert (
+    "Endpoint = a.example:51533" in text
+    and f"AllowedIPs = {IP['a']}/32, 198.51.100.64/26" in text
+    and "ListenPort = 51820" in text
+)
+assert m.pair_psk({"key": m.kept_key(edge["id"]), "mesh": mesh_}, P["a"]) == re.search(r"PresharedKey = (\S+)", text)[1]
+use("c")
+expect_exit(lambda: m.cmd_transit(T_("edge")), "no admin key")  # the router's key lives with the admin nodes
+use("adm")
 with quiet:
     m.cmd_set(S("c", public="198.51.100.77"))
 expect_exit(lambda: m.cmd_set(S("d", public="198.51.100.77")), "already belongs")
-# the admin node has pushed the router's configuration, derived like a hub's own table
-kinds = [c for _, c, _ in pushed]
-assert any("show configuration" in c for c in kinds) and any(c == "vbash -s" for c in kinds)
-script_ = [s_ for _, c, s_ in pushed if c == "vbash -s"][-1]
-assert (
-    script_.startswith("#!/bin/vbash\nsource /opt/vyatta/etc/functions/script-template\nconfigure\n")
-    and "\ncommit ||" in script_
-    and "\nsave\n" in script_
-)
-assert "delete interfaces wireguard wg0 peer stale" in script_ and "delete nat source rule 5010" in script_
-assert (
-    "delete nat source rule 10" not in script_
-    and "delete protocols static route 10.9.0.0/16 interface wg0" in script_
-    and "eth1" not in script_
-)
-assert (
-    f"set interfaces wireguard wg0 address {m.router_ip(mesh_, gw['id'])}/32" in script_
-    and "set interfaces wireguard wg0 port 51820" in script_
-)
-assert f"set interfaces wireguard wg0 private-key {m.kept_key(gw['id'])}" in script_
-assert (
-    f"set interfaces wireguard wg0 peer c public-key {P['c']}" in script_
-    and f"peer c allowed-ips {IP['c']}/32" in script_
-    and "peer c allowed-ips 10.3.0.0/24" in script_
-)
-assert f"peer a address 203.0.113.9" in script_ and "peer a port 51533" in script_ and "peer c address" not in script_
-assert (
-    "set protocols static route 10.253.254.0/23 interface wg0" in script_
-    and "set protocols static route 10.3.0.0/24 interface wg0" in script_
-)
-idc_ = m.load()[P["c"]]["id"]
-assert (
-    f"set nat destination rule {5000 + idc_} destination address 198.51.100.77" in script_
-    and f"rule {5000 + idc_} translation address {IP['c']}" in script_
-)
-assert (
-    f"set nat source rule {5000 + idc_} source address {IP['c']}" in script_
-    and f"set nat source rule {5000 + idc_} outbound-interface name eth0" in script_
-)
-psk_line = re.search(r"peer c preshared-key (\S+)", script_)[1]
-assert psk_line == m.pair_psk({"key": m.kept_key(gw["id"]), "mesh": mesh_}, P["c"])  # the same key c will derive
-# the router's handshakes stand in for its "sees" report, and the admin node may speak for it
-sync("adm")
-rec = use("adm").load_nets()[gw_pk]
-assert rec["code"] == "managed" and sorted(rec["sees"]) == sorted([idc_, m.load()[P["adm"]]["id"]])
-sync("a")
-assert use("a").load_nets()[gw_pk]["sees"] == rec["sees"]  # the hub took the admin client's report for the router
-# routing: hubs relay the internet to the exit; a node with a public address sends its internet there
+expect_exit(lambda: m.cmd_set(S("d", public="203.0.113.5")), "no network a transit router delivers")
+expect_exit(lambda: m.cmd_set(S("c", public="10.253.255.9")), "mesh address")
+# the gateway hub peers with the router (and nobody else does), gives it the internet, and does the 1:1 NAT
+sync("a", "d")
 head_a, peers_a = wg("a")
-assert "0.0.0.0/0" in peers_a[gw_pk]["allowed"] and did(
-    "a", "ip", "route", "replace", "0.0.0.0/0", "dev", "mb0", "table", "7948"
-)
-assert not [c for c in did("a", "ip", "route", "add", "0.0.0.0/0")]  # but a hub's own internet stays where it was
-rtt[("c", m.router_ip(mesh_, gw["id"]).exploded)] = 40.0
-sync("c")
 assert (
-    "0.0.0.0/0" in wg("c")[1][gw_pk]["allowed"] and IP["adm"] + "/32" in wg("c")[1][P["a"]]["allowed"]
-)  # exit only for the internet
-assert did("c", "wg", "set", "mb0", "fwmark", "7949") and did(
-    "c", "ip", "rule", "add", "not", "fwmark", "7949", "lookup", "7949", "pref", "7950"
+    peers_a[e_pk]["Endpoint"] == "edge.example:51820"
+    and "0.0.0.0/0" in peers_a[e_pk]["allowed"]
+    and peers_a[e_pk]["PersistentKeepalive"] == "25"
 )
+assert (
+    e_pk not in wg("d")[1] and "0.0.0.0/0" in wg("d")[1][P["a"]]["allowed"]
+)  # another hub relays the internet to the gateway
+assert did("a", "ip", "route", "replace", "0.0.0.0/0", "dev", "mb0", "table", "7948") and not did(
+    "a", "ip", "route", "add", "0.0.0.0/0"
+)
+table_a = nft("a")[-1]
+assert (
+    f"ip daddr 198.51.100.77 dnat to {IP['c']}" in table_a
+    and f"ip saddr {IP['c']} ip daddr != {{" in table_a
+    and "snat to 198.51.100.77" in table_a
+)
+assert (
+    "10.253.254.0/23" in table_a.split("snat")[0].rsplit("!= {", 1)[1]
+    and "chain public_in { type nat hook prerouting" in table_a
+)
+assert "dnat" not in nft("d")[-1]
+# the node with the public address sends its internet to the gateway, and only while the gateway answers
+rtt[("c", IP["a"])] = 5.0
+sync("c")
+assert "0.0.0.0/0" in wg("c")[1][P["a"]]["allowed"] and did("c", "wg", "set", "mb0", "fwmark", "7949")
 assert did("c", "ip", "rule", "add", "lookup", "main", "suppress_prefixlength", "0", "pref", "7949")
 sync("d")
-assert "0.0.0.0/0" in wg("d")[1][gw_pk]["allowed"] and not did(
-    "d", "wg", "set", "mb0", "fwmark", "7949"
-)  # d: a hub, relays; no public address, keeps its own internet
-del rtt[("c", m.router_ip(mesh_, gw["id"]).exploded)]
+assert not did("d", "wg", "set", "mb0", "fwmark", "7949")  # d has no public address
+del rtt[("c", IP["a"])]
 m.ip_json = (
     lambda real: lambda *a: [{"priority": 7949}] if a[:2] == ("rule", "show") and a[-1] == "7949" else real(*a)
 )(m.ip_json)
 sync("c")
-assert did("c", "ip", "rule", "del", "pref", "7949") and did(
-    "c", "ip", "route", "flush", "table", "7949"
-)  # exit unreachable: internet goes the usual way
-# the page and status show it; the management key is on the page for the router's operator
+assert did("c", "ip", "rule", "del", "pref", "7949") and did("c", "ip", "route", "flush", "table", "7949")
+# the map and status know the router; a negative cost prefers a hub
 use("adm")
-page = R(pw="correct-horse")[1].decode()
-assert 'name=public value="198.51.100.77"' in page
-assert "managed (vyos)" in G("/")[1].decode() and "public 198.51.100.77" in G("/")[1].decode()
-out = m.view_managed(mesh_, m.load(), m.read_json("managed.json", {}), pub_line)
-assert "vyos@gw.example" in out and "wan eth0" in out and pub_line in out
+page = G("/")[1].decode()
+assert "transit router" in page and "internet exit" in page and "public 198.51.100.77" in page
+assert [l for l in m.topology()["links"] if l["a"] == edge["id"]] == [
+    l for l in m.topology()["links"] if l["a"] == edge["id"] and l["b"] == m.load()[P["a"]]["id"]
+]
 with quiet:
+    m.cmd_set(S("a", cost=-20))
+assert m.load()[P["a"]]["cost"] == -20
+expect_exit(lambda: m.cmd_set(S("a", cost=-20000)), "bad name")
+with quiet:
+    m.cmd_set(S("a", cost=0))
     m.cmd_set(S("c", public=""))
-    m.cmd_revoke(A(name="gw"))
-assert "gw" not in names("a") and not m.load()[P["c"]].get("public")
-m.resolve = real_resolve
+    m.cmd_revoke(A(name="edge"))
+assert "edge" not in names("a") and not m.load()[P["c"]].get("public") and m.exit_node(m.live(m.load())) is None
+sync("a")
+assert did("a", "nft", "delete", "table", "inet", "meshbone")  # nothing left to map: the table is gone
 
 # --- the original admin machine dies; the rest carries on
 shutil.move(D("adm"), D("adm.dead"))

@@ -12,7 +12,9 @@ def build_parser():
     def node_options(s):
         s.add_argument("--subnet", action="append", default=[], help="network behind the node to announce")
         s.add_argument("--vip", action="append", default=[], help="cluster IP the node holds")
-        s.add_argument("--cost", type=int, default=0, help="ms added when choosing this hub")
+        s.add_argument(
+            "--cost", type=int, default=0, help="ms added to this hub's ping when choosing a hub (may be negative)"
+        )
         s.add_argument(
             "--dns", action="append", default=[], help="extra DNS name for the node (bare: under the mesh zone)"
         )
@@ -52,16 +54,17 @@ def build_parser():
     s.add_argument("--endpoint", default="", help="public HOST:PORT; makes the new node a hub")
     node_options(s)
     s.add_argument("--admin", action="store_true", help="the new node also gets admin.key and can manage the mesh")
-    s.add_argument(
-        "--driver", choices=("vyos",), default="", help="a router we configure over ssh instead of running meshbone on"
-    )
-    s.add_argument("--manage", default="", help="ssh login of the managed router, e.g. vyos@203.0.113.9")
-    s.add_argument("--wan", default="", help="the managed router's internet-facing interface, e.g. eth0")
-    s.add_argument("--wg", default="", help="WireGuard interface name on the managed router (default wg0)")
-    s.add_argument(
-        "--no-exit", dest="exit", action="store_false", help="do not use the managed router as the internet exit"
-    )
     s.add_argument("-o", "--out")
+    s = sub.add_parser("transit")
+    s.add_argument("name")
+    s.add_argument("--endpoint", default="", help="the router's WireGuard HOST:PORT (needed the first time)")
+    s.add_argument("--via", default="", help="the hub the router is linked to (needed the first time)")
+    s.add_argument(
+        "--net", action="append", default=[], help="public network the router delivers, e.g. 203.0.113.64/26"
+    )
+    s.add_argument("--desc", default="")
+    s.add_argument("--label", action="append", default=[])
+    s.add_argument("-o", "--out", help="also write the router's WireGuard config to this file")
     s = sub.add_parser("deploy")
     s.add_argument("name")
     s.add_argument(
@@ -94,8 +97,6 @@ def build_parser():
     s.add_argument("--no-verify", dest="verify", action="store_false")
     s.add_argument("--dns", action="append", help="extra DNS names; --dns '' removes them")
     s.add_argument("--public", help="public address for the node; --public '' removes it")
-    s.add_argument("--exit", dest="exit", action="store_const", const=True, help="make this hub the internet exit")
-    s.add_argument("--no-exit", dest="exit", action="store_const", const=False)
     local_options(sub.add_parser("local"))
     s = sub.add_parser("promote")
     s.add_argument("--endpoint", required=True, help="stable public HOST:PORT of this node; '' withdraws")
@@ -141,7 +142,6 @@ def build_parser():
         "check",
         "health",
         "dnsd",
-        "managed",
     )
     for c in plain:
         sub.add_parser(c)

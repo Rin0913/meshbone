@@ -221,15 +221,11 @@ def cmd_invite(a):
             if not free:
                 sys.exit("the mesh range has no free address for this role")
             node_id = random.choice(free)
-        simple, driver = getattr(a, "simple", False), getattr(a, "driver", "") or ""
+        simple, transit = getattr(a, "simple", False), getattr(a, "transit", "") or ""
         if simple and (a.endpoint or a.subnet or a.vip or a.admin):
             sys.exit("a simple client only gets an address: no endpoint, subnets, cluster IPs or admin key")
-        if driver and not (getattr(a, "manage", "") and getattr(a, "wan", "")):
-            sys.exit(
-                "a managed router needs --manage USER@HOST (its ssh login) and --wan INTERFACE (its internet side)"
-            )
-        if driver and not os.path.exists(f"{settings.DIR}/admin.key"):
-            sys.exit("a managed router is set up from a node that holds the admin key")
+        if transit and not os.path.exists(f"{settings.DIR}/admin.key"):
+            sys.exit("a transit router is added on a node that holds the admin key, which keeps the router's key")
         nodes[pub] = store.sign(
             pub,
             store.checked(
@@ -250,29 +246,15 @@ def cmd_invite(a):
                     "dns": getattr(a, "dns", []) or [],
                     **({"public": a.public} if getattr(a, "public", "") else {}),
                     **({"simple": True} if simple else {}),
-                    **({"driver": driver, "exit": getattr(a, "exit", None) is not False} if driver else {}),
+                    **({"transit": transit, "via": a.via, "public_nets": a.net} if transit else {}),
                 },
             ),
         )
-        if simple:
+        if simple or transit:
             settings.ISSUED[a.name] = key
-            if os.path.exists(
-                f"{settings.DIR}/admin.key"
-            ):  # kept encrypted with the admin nodes, to show the config again
+            if os.path.exists(f"{settings.DIR}/admin.key"):  # kept with the admin nodes, to show the config again
                 store.conf_put(f"node_{node_id}", store.password_box().encrypt(key.encode()).decode())
-        if driver:  # the router's key and how to reach it stay with the admin nodes, who configure it
-            store.conf_put(f"node_{node_id}", store.password_box().encrypt(key.encode()).decode())
-            store.conf_put(
-                f"managed_{node_id}", json.dumps({"ssh": a.manage, "wan": a.wan, "wg": getattr(a, "wg", "") or "wg0"})
-            )
-            store.managed_ssh_key()
-    if simple:
-        return
-    if driver:
-        print(
-            f"{a.name} is a managed hub; it is configured over ssh from the admin nodes, and must accept this key:\n"
-            f"  {store.managed_ssh_key()[1]}\nsee `meshbone managed`"
-        )
+    if simple or transit:
         return
     out = a.out or f"{a.name}.mesh.json"
     cfg = {**store.state(), "mesh": mesh, "key": key}
@@ -423,11 +405,10 @@ def cmd_set(a):
             n["dns"] = a.dns
         if getattr(a, "public", None) is not None:
             n["public"] = a.public
-        if getattr(a, "exit", None) is not None:
-            n["exit"] = a.exit
+
         n["seq"] = store.next_seq(n["seq"])
         store.sign(pk, store.checked(loc["mesh"], nodes, nets, pk, n, had))
-    if n["endpoint"] and not was and getattr(a, "verify", True) and not n.get("driver"):
+    if n["endpoint"] and not was and getattr(a, "verify", True):
         confirm_hub(a.name)
 
 
@@ -545,12 +526,35 @@ def cmd_dns(a):
     print(views.view_dns(store.dns_settings(loc["mesh"]), model.dns_records(loc["mesh"], store.load())))
 
 
-def cmd_managed():
-    """Show the key managed routers must accept, and how each of them is doing."""
-    loc = store.local()
-    print(
-        views.view_managed(loc["mesh"], store.load(), store.read_json("managed.json", {}), store.managed_ssh_key()[1])
-    )
+def cmd_transit(a):
+    """Add a transit router, or print its WireGuard configuration again."""
+    if not any(n["name"] == a.name for n in store.live(store.load()).values()):
+        if not (a.endpoint and a.via and a.net):
+            sys.exit("a new transit router needs --endpoint HOST:PORT, --via HUB and at least one --net")
+        cmd_invite(
+            argparse.Namespace(
+                name=a.name,
+                endpoint="",
+                subnet=[],
+                vip=[],
+                cost=0,
+                admin=False,
+                out=None,
+                simple=False,
+                transit=a.endpoint,
+                via=a.via,
+                net=a.net,
+                desc=a.desc,
+                label=a.label,
+                ip="",
+                dns=[],
+                public="",
+            )
+        )
+    text, n, gateway = model.transit_config(a.name)
+    if a.out:
+        store.write(a.out, text)
+    print(views.view_transit(a.name, n, gateway, store.local()["mesh"], text))
 
 
 def cmd_simple(a):
@@ -696,11 +700,6 @@ def cmd_check():
     views.view_login(mesh, "s", "p", 0, "")
     for text in settings.UNITS.values():
         text.format(py="p", bin="b", port=1, net=mesh["net"], vip="v", aport=2)
-    for pk, opts in store.managed(mesh, nodes).items():
-        model.vyos_script(
-            model.vyos_deletes("", opts),
-            model.vyos_commands(mesh, nodes, pk, "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=", opts),
-        )
     cli.build_parser()
     print("ok")
 

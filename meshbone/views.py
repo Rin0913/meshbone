@@ -301,8 +301,7 @@ def view_map(mesh, topo):
             + (" · admin" if n["admin"] else "")
             + (" · simple" if n["simple"] else "")
         )
-        role += f" · managed ({n['managed']})" if n["managed"] else ""
-        role += " · exit" if n["exit"] else ""
+        role = "transit router" if n["transit"] else role + (" · internet exit" if n["exit"] else "")
         out.append(
             f"<tr><td>{role}<td><b>{esc(n['name'])}</b><td class=m>{n['ip']}<td class=m>{esc(n['endpoint'] or 'behind NAT')}"
             f"<td class=m>{esc(' '.join(n['subnets'] + ['vip ' + v for v in n['vips']]) or '-')}"
@@ -632,6 +631,43 @@ def view_simple(mesh, name, hub, hubs, text, code, stored):
     ).encode()
 
 
+def view_transit(name, transit, gateway, mesh, text):
+    """What the router's operator needs: the plain WireGuard config, and the same as VyOS commands."""
+    wg = "wg1"
+    priv = next(l.split(" = ")[1] for l in text.splitlines() if l.startswith("PrivateKey"))
+    psk = next(l.split(" = ")[1] for l in text.splitlines() if l.startswith("PresharedKey"))
+    host, _, port = gateway["endpoint"].rpartition(":")
+    lines = [
+        f"{name}: transit router linked to hub {gateway['name']}, delivering {', '.join(transit['public_nets'])}",
+        "",
+        "WireGuard config for the router (any WireGuard; the router needs no other knowledge of the mesh):",
+        "",
+        text.rstrip(),
+        "",
+        f"The same as VyOS commands (interface {wg}; adjust the name and the endpoint's port if taken):",
+        "",
+        f"set interfaces wireguard {wg} description 'meshbone {mesh['name']}'",
+        f"set interfaces wireguard {wg} address {store.router_ip(mesh, transit['id'])}/32",
+        f"set interfaces wireguard {wg} port {transit['transit'].rpartition(':')[2]}",
+        f"set interfaces wireguard {wg} private-key {priv}",
+        f"set interfaces wireguard {wg} mtu 1420",
+        f"set interfaces wireguard {wg} peer {gateway['name']} public-key {gateway['pk']}",
+        f"set interfaces wireguard {wg} peer {gateway['name']} preshared-key {psk}",
+        f"set interfaces wireguard {wg} peer {gateway['name']} address {host} ",
+        f"set interfaces wireguard {wg} peer {gateway['name']} port {port}",
+        f"set interfaces wireguard {wg} peer {gateway['name']} allowed-ips {store.router_ip(mesh, gateway['id'])}/32",
+    ]
+    lines += [f"set interfaces wireguard {wg} peer {gateway['name']} allowed-ips {p}" for p in transit["public_nets"]]
+    lines += [f"set interfaces wireguard {wg} peer {gateway['name']} persistent-keepalive 25"]
+    lines += [f"set protocols static route {p} interface {wg}" for p in transit["public_nets"]]
+    lines += [
+        "",
+        "Everything else happens on the hub: public addresses are mapped 1:1 onto nodes there, and the nodes'",
+        "internet traffic leaves through the router. Assign addresses with `meshbone set NODE --public IP`.",
+    ]
+    return "\n".join(lines)
+
+
 def view_status(mesh, nodes, notes, once, is_admin, version):
     """`meshbone status` as text."""
     lines = [
@@ -665,16 +701,4 @@ def view_dns(settings, records):
     for name, values in sorted(records.items()):
         if not name.endswith(".in-addr.arpa"):
             lines.append(f"  {name:<40} {', '.join(str(v) for v in values)}")
-    return "\n".join(lines)
-
-
-def view_managed(mesh, nodes, state_, pub):
-    lines = [f"ssh public key for managed routers (add it to their meshbone user):\n  {pub}"]
-    for pk, opts in store.managed(mesh, nodes).items():
-        n, st = store.live(nodes)[pk], state_.get(pk, {})
-        when = time.strftime("%H:%M", time.localtime(st["at"])) if st.get("at") else "never"
-        lines.append(
-            f"{n['name']:<16} {opts['ssh']:<28} wan {opts['wan']}, {opts.get('wg', 'wg0')}: configured {when}"
-            + (f"  ERROR {st['error']}" if st.get("error") else "")
-        )
     return "\n".join(lines)

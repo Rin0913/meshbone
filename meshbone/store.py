@@ -121,15 +121,24 @@ def router_ip(mesh, node_id):
 
 def held_vips(mesh, node):
     """A node's cluster IPs; every hub that runs meshbone also holds the three service addresses
-    (map, metrics, DNS). A managed hub (a router we only configure) cannot serve them."""
+    (map, metrics, DNS)."""
     service = [str(admin_vip(mesh)), str(metrics_vip(mesh)), str(dns_vip(mesh))]
-    return node["vips"] + (service if node["endpoint"] and not node.get("driver") else [])
+    return node["vips"] + (service if node["endpoint"] else [])
+
+
+def transits(alive):
+    """The routers that bring public addresses into the mesh: {pubkey: entry}, each with `transit`
+    (the router's WireGuard endpoint), `via` (the hub it is linked to) and `public_nets`."""
+    return {pk: n for pk, n in alive.items() if n.get("transit")}
 
 
 def exit_node(alive):
-    """The node that carries the internet traffic of nodes with a public address, if any."""
+    """The hub that carries the internet traffic of nodes with a public address: the one a transit
+    router is linked to. None without a transit."""
+    gateways = [n["via"] for n in transits(alive).values()]
     return next(
-        (pk for pk, n in sorted(alive.items(), key=lambda kv: kv[1]["id"]) if n.get("exit") and n["endpoint"]), None
+        (pk for pk, n in sorted(alive.items(), key=lambda kv: kv[1]["id"]) if n["endpoint"] and n["name"] in gateways),
+        None,
     )
 
 
@@ -282,15 +291,18 @@ def wellformed(pk, n):
     try:
         assert re.fullmatch(settings.KEY_RE, pk) and re.fullmatch(settings.NAME_RE, n["name"])
         assert type(n["seq"]) is int and type(n["id"]) is int and 1 <= n["id"] < 4096
-        assert type(n["cost"]) is int and 0 <= n["cost"] <= 10000
+        assert type(n["cost"]) is int and -10000 <= n["cost"] <= 10000
         assert re.fullmatch(settings.ENDPOINT_RE, n["endpoint"])
         assert canonical(n["subnets"])
         assert all(isinstance(v, str) and str(IPv4Address(v)) == v for v in n["vips"])
         assert isinstance(n.get("desc", ""), str) and len(n.get("desc", "")) <= 200 and n.get("desc", "").isprintable()
         assert type(n.get("simple", False)) is bool
         assert len(n.get("dns", [])) <= 8 and all(model.dns_name(d) == d for d in n.get("dns", []))
-        assert n.get("driver", "") in ("", "vyos") and type(n.get("exit", False)) is bool
         assert not n.get("public") or str(IPv4Address(n["public"])) == n["public"]
+        assert re.fullmatch(settings.ENDPOINT_RE, n.get("transit", "")) and re.fullmatch(
+            settings.NAME_RE, n.get("via", "x")
+        )
+        assert canonical(n.get("public_nets", [])) and (not n.get("transit") or (n["via"] and n["public_nets"]))
         assert len(n.get("labels", [])) <= 16 and all(
             isinstance(l, str) and re.fullmatch(settings.LABEL_RE, l) for l in n.get("labels", [])
         )
@@ -351,10 +363,19 @@ def checked(mesh, nodes, nets, pk, n, keep=()):
             sys.exit(f"bad public address: {e}")
         if any(IPv4Address(n["public"]) in net for net in (mesh_net(mesh), cluster_net(mesh))):
             sys.exit(f"{n['public']} is a mesh address, not a public one")
+        delivered = [IPv4Network(p) for t in transits(live(nodes)).values() for p in t["public_nets"]]
+        if not any(IPv4Address(n["public"]) in net for net in delivered):
+            sys.exit(f"{n['public']} lies in no network a transit router delivers (see `meshbone transit`)")
     else:
         n.pop("public", None)
-    if n.get("driver") and not n["endpoint"]:
-        sys.exit("a managed router is a hub: it needs an endpoint")
+    if n.get("transit"):
+        n["transit"] = norm_endpoint(n["transit"])
+        n["public_nets"] = [str(IPv4Network(p)) for p in listed(n.get("public_nets", []))]
+        gateway = next((o for o in live(nodes).values() if o["name"] == n.get("via")), None)
+        if not gateway or not gateway["endpoint"]:
+            sys.exit(f"{n.get('via')!r} is not a hub; a transit router links to one hub")
+        if n["endpoint"] or n["subnets"] or n["vips"]:
+            sys.exit("a transit router has a WireGuard endpoint and public networks, nothing else")
     if not wellformed(pk, n) or not n["id"] < mesh_net(mesh).num_addresses:
         sys.exit("bad name, endpoint, cost, description (200 printable characters) or label (letters, digits, _.:=/-)")
     others = {k: o for k, o in live(nodes).items() if k != pk}
@@ -416,7 +437,7 @@ def merge(msg, only=None):
     mesh, nodes, nets = local()["mesh"], load(), load_nets()
     theirs = msg.get("nets")
     if only:  # a client speaks for itself - and, as an admin node, for the routers it manages
-        allowed = {only} | {k for k, n in nodes.items() if n.get("driver")}
+        allowed = {only}
         theirs = {k: v for k, v in theirs.items() if k in allowed} if isinstance(theirs, dict) else {}
     conf = load_conf()
     a = lww(nodes, msg.get("nodes"), lambda pk, n: valid(mesh, pk, n))
@@ -532,7 +553,7 @@ def check_password(password):
 
 
 def kept_key(node_id):
-    """The private key of a node whose key the admin nodes keep (simple and managed nodes)."""
+    """The private key of a node whose key the admin nodes keep (simple clients, transit routers)."""
     conf = load_conf()
     record = conf.get(f"node_{node_id}") or conf[f"simple_{node_id}"]
     return password_box().decrypt(record["value"].encode()).decode()
@@ -558,33 +579,6 @@ def dns_settings(mesh):
         return {"zone": d["zone"].lower(), "upstream": d["upstream"]}
     except (KeyError, ValueError, AssertionError, TypeError):
         return {"zone": f"{mesh['name'].lower()}.internal", "upstream": ["1.1.1.1", "8.8.8.8"]}
-
-
-def managed(mesh, nodes):
-    """The nodes we configure rather than run: {pubkey: {ssh, wan, wg}} from the signed settings."""
-    out = {}
-    for pk, n in live(nodes).items():
-        if n.get("driver"):
-            with contextlib.suppress(KeyError, ValueError, TypeError):
-                out[pk] = json.loads(load_conf()[f"managed_{n['id']}"]["value"])
-    return out
-
-
-def managed_ssh_key():
-    """The ssh key admin nodes use for routers they manage -> (private key text, public line).
-    Made once per mesh, kept encrypted under the admin key; the public line goes on the routers."""
-    from cryptography.hazmat.primitives import serialization as ser
-    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
-
-    conf = load_conf()
-    if "managed_key" not in conf:
-        key = Ed25519PrivateKey.generate()
-        private = key.private_bytes(ser.Encoding.PEM, ser.PrivateFormat.OpenSSH, ser.NoEncryption()).decode()
-        public = key.public_key().public_bytes(ser.Encoding.OpenSSH, ser.PublicFormat.OpenSSH).decode()
-        conf_put("managed_key", password_box().encrypt(private.encode()).decode())
-        conf_put("managed_pub", f"{public} meshbone-managed@{local()['mesh']['name']}")
-        conf = load_conf()
-    return password_box().decrypt(conf["managed_key"]["value"].encode()).decode(), conf["managed_pub"]["value"]
 
 
 def code_sha(path=None):
