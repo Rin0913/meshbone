@@ -312,10 +312,12 @@ def view_events(mesh, events):
     return "".join(out + ["</table></div>"]).encode()
 
 
-def view_map(mesh, topo, health=(), events=()):
-    """The whole mesh at a glance: the graph, the nodes, the links, every node's health and events."""
+def view_map(mesh, topo, health=(), events=(), routes=None, zone="", cert=""):
+    """The whole mesh at a glance: the graph, the nodes, the links, the cluster IPs and the HTTPS
+    gateway, every node's health and the last few events."""
     here = next(n for n in topo["nodes"] if n["me"])
     names = {n["id"]: n["name"] for n in topo["nodes"]}
+    hubs = ", ".join(n["name"] for n in topo["nodes"] if n["hub"]) or "no hub"
     out = [
         page_head(mesh, "map", "map").replace("<title>", "<meta http-equiv=refresh content=60><title>"),
         f"<p>nodes <code>{esc(mesh['net'])}</code> &middot; cluster IPs <code>{esc(mesh['cluster_net'])}</code> &middot; "
@@ -366,8 +368,37 @@ def view_map(mesh, topo, health=(), events=()):
     )
     out.append(
         "</table></div><p>Sent and received are from the first node's side; <a href=/traffic>graphs over time</a>.</p>"
-        "<h2>health</h2><div class=scroll><table><tr><th>node<th>version<th>state<th>reported"
+        "<h2>cluster IPs</h2><p>Held by several nodes at once; whichever is alive answers.</p>"
+        "<div class=scroll><table><tr><th>address<th>name<th>service<th>held by"
     )
+    service = [
+        (
+            store.admin_vip(mesh),
+            "map",
+            f"<a href='http://{store.admin_vip(mesh)}:{settings.ADMIN_PORT}/'>this page</a>, the API, management",
+        ),
+        (
+            store.metrics_vip(mesh),
+            "metrics",
+            f"<a href='http://{store.metrics_vip(mesh)}:{settings.ADMIN_PORT}/metrics'>Prometheus /metrics</a>",
+        ),
+        (store.dns_vip(mesh), "dns", f"the mesh resolver, zone <code>{esc(zone)}</code>"),
+        (store.https_vip(mesh), "https", "the HTTPS gateway, below"),
+    ]
+    for vip, name, what in service:
+        out.append(f"<tr><td class=m>{vip}<td class=m>{name}.{esc(zone)}<td>{what}<td>every hub: {esc(hubs)}")
+    for vip in sorted({v for n in topo["nodes"] for v in n["vips"]}, key=lambda v: tuple(int(x) for x in v.split("."))):
+        holders = ", ".join(n["name"] for n in topo["nodes"] if vip in n["vips"])
+        out.append(f"<tr><td class=m>{esc(vip)}<td>-<td>declared by its holders<td>{esc(holders)}")
+    out.append(
+        f"</table></div><h2>HTTPS gateway</h2><p>TLS on <code>{store.https_vip(mesh)}</code> (every hub), each name proxied "
+        "to a service inside the mesh; HTTP/1.1, WebSockets, and HTTP/2 where the hub has python3-h2. "
+        f"Certificate: {esc(cert or 'none yet')} (the mesh CA: <a href=/ca.crt>ca.crt</a>).</p>"
+        "<div class=scroll><table><tr><th>name<th>backend"
+    )
+    for host, url in sorted((routes or {}).items()):
+        out.append(f"<tr><td><a href='https://{esc(host)}/'>https://{esc(host)}</a><td class=m>{esc(url)}")
+    out.append("</table></div><h2>health</h2><div class=scroll><table><tr><th>node<th>version<th>state<th>reported")
     for h in health:
         state = "ok" if h["ok"] else "unknown" if h["ok"] is None else "problems"
         out.append(
@@ -376,13 +407,13 @@ def view_map(mesh, topo, health=(), events=()):
             + f"<td>{time.strftime('%m-%d %H:%M', time.localtime(h['reported'])) if h['reported'] else '-'}"
         )
     out.append("</table></div><h2>events</h2><div class=scroll><table><tr><th>when<th>node<th>kind<th>what")
-    for e in events[:40]:
+    for e in events[:4]:  # the last few; the rest on their own page
         out.append(
             f"<tr><td>{time.strftime('%m-%d %H:%M:%S', time.localtime(e['t']))}<td>{esc(e['node'])}<td>{esc(e['k'])}"
             f"<td style='white-space:normal'>{esc(e['m'])}"
         )
     out.append(
-        "</table></div><p><a href=/events>more events</a> &middot; <a href=/api/health>/api/health</a> &middot; "
+        "</table></div><p><a href=/events>all events</a> &middot; <a href=/api/health>/api/health</a> &middot; "
         "<a href=/api/events>/api/events</a></p>"
         f"<h2>manage</h2><p>{admins or 'no admin node is online'}</p>"
         "<p>Changes are signed on an admin node; hubs only show the mesh.</p>"

@@ -1587,6 +1587,102 @@ out = via_proxy(b"POST /up HTTP/1.1\r\nHost: files.lab.test\r\nContent-Length: 5
 assert out.startswith(b"HTTP/1.1 201") and out.endswith(b"edcba")
 assert via_proxy(b"GET / HTTP/1.1\r\nHost: nobody.lab.test\r\n\r\n").startswith(b"HTTP/1.1 404")
 assert via_proxy(b"garbage") == b""  # not a request: nothing to answer
+
+
+# a WebSocket (any Upgrade) is piped through: the backend's 101 and every frame after it, both ways
+def ws_backend(listener):
+    c, _ = listener.accept()
+    head = b""
+    while b"\r\n\r\n" not in head:
+        head += c.recv(4096)
+    assert b"Upgrade: websocket" in head and b"X-Forwarded-Proto: https" in head and b"GET /base/sock HTTP/1.1" in head
+    c.sendall(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
+    for _ in range(2):
+        c.sendall(b"echo:" + c.recv(100))
+    c.close()
+
+
+wsl = socket.socket()
+wsl.bind(("127.0.0.1", 0))
+wsl.listen(1)
+threading.Thread(target=ws_backend, args=(wsl,), daemon=True).start()
+routes_["sock.lab.test"] = f"http://127.0.0.1:{wsl.getsockname()[1]}/base"
+a_, b_ = socket.socketpair()
+a_.settimeout(10)
+t_ = threading.Thread(target=lambda: (m.serve_one(b_, routes_, "10.253.255.9"), b_.close()))
+t_.start()
+a_.sendall(
+    b"GET /sock HTTP/1.1\r\nHost: sock.lab.test\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Key: x\r\n\r\n"
+)
+got = b""
+while b"\r\n\r\n" not in got:
+    got += a_.recv(4096)
+assert got.startswith(b"HTTP/1.1 101")
+a_.sendall(b"ping1")
+assert a_.recv(100) == b"echo:ping1"
+a_.sendall(b"ping2")
+assert a_.recv(100) == b"echo:ping2"
+assert a_.recv(100) == b""  # the backend hung up: so does the gateway
+t_.join(10)
+a_.close()
+wsl.close()
+
+# HTTP/2 when ALPN picked it: streams become backend requests, bodies flow as the window allows
+import h2.connection, h2.config, h2.events
+
+
+class AsH2:
+    def __init__(self, s):
+        self.s = s
+
+    def selected_alpn_protocol(self):
+        return "h2"
+
+    def __getattr__(self, name):
+        return getattr(self.s, name)
+
+
+a_, b_ = socket.socketpair()
+a_.settimeout(10)
+t_ = threading.Thread(target=lambda: (m.serve_one(AsH2(b_), routes_, "10.253.255.9"), b_.close()))
+t_.start()
+hc = h2.connection.H2Connection(h2.config.H2Configuration(client_side=True, header_encoding="utf-8"))
+hc.initiate_connection()
+hc.send_headers(1, [(":method", "GET"), (":path", "/two?x=1"), (":authority", "files.lab.test"), (":scheme", "https")])
+hc.end_stream(1)
+hc.send_headers(3, [(":method", "POST"), (":path", "/up"), (":authority", "files.lab.test"), (":scheme", "https")])
+hc.send_data(3, b"abcde", end_stream=True)
+a_.sendall(hc.data_to_send())
+answers, bodies, done = {}, {1: b"", 3: b""}, set()
+while done != {1, 3}:
+    for e in hc.receive_data(a_.recv(65536)):
+        if isinstance(e, h2.events.ResponseReceived):
+            answers[e.stream_id] = dict(e.headers)
+        elif isinstance(e, h2.events.DataReceived):
+            bodies[e.stream_id] += e.data
+            hc.acknowledge_received_data(e.flow_controlled_length, e.stream_id)
+        elif isinstance(e, h2.events.StreamEnded):
+            done.add(e.stream_id)
+    a_.sendall(hc.data_to_send())
+assert answers[1][":status"] == "200" and b"hello from /base/two?x=1" in bodies[1] and b"proto=https" in bodies[1]
+assert answers[3][":status"] == "201" and bodies[3] == b"edcba"
+hc.send_headers(
+    5, [(":method", "GET"), (":path", "/"), (":authority", "nobody.lab.test"), (":scheme", "https")], end_stream=True
+)
+a_.sendall(hc.data_to_send())
+while 5 not in done:
+    for e in hc.receive_data(a_.recv(65536)):
+        if isinstance(e, h2.events.ResponseReceived):
+            answers[5] = dict(e.headers)
+        elif isinstance(e, h2.events.StreamEnded):
+            done.add(5)
+assert answers[5][":status"] == "404"
+hc.close_connection()
+a_.sendall(hc.data_to_send())
+a_.close()
+t_.join(10)
+assert not t_.is_alive()
+assert m.protocols() == ["h2", "http/1.1"]
 srv.shutdown()
 dead = {"files.lab.test": "http://127.0.0.1:1/"}
 routes_ = dead

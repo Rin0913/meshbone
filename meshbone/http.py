@@ -46,6 +46,9 @@ def respond(method, path, headers, body, peer="127.0.0.1"):
                 model.topology(),
                 model.health_table(store.load(), store.load_nets()),
                 model.events_table(store.load(), store.load_nets()),
+                store.https_routes(mesh),
+                store.dns_settings(mesh)["zone"],
+                store.https_cert_info(mesh),
             )
         ),
         "/traffic": lambda: page(views.view_traffic(mesh)),

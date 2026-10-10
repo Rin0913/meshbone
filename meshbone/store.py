@@ -215,6 +215,20 @@ def https_cert_names(mesh):
     return sorted(san.value.get_values_for_type(x509.DNSName))
 
 
+def https_cert_info(mesh):
+    """Who issued the gateway's certificate and until when, for people - '' until there is one."""
+    from cryptography import x509
+    from cryptography.x509.oid import NameOID
+
+    pem = https_material(mesh)[0]
+    if not pem:
+        return ""
+    cert = x509.load_pem_x509_certificate(pem.encode())
+    issuer = next((a.value for a in cert.issuer if a.oid in (NameOID.COMMON_NAME, NameOID.ORGANIZATION_NAME)), "?")
+    until = cert.not_valid_after_utc if hasattr(cert, "not_valid_after_utc") else cert.not_valid_after  # < 42
+    return f"{issuer}, until {until.date()}"
+
+
 def issue_https_cert(mesh):
     """On an admin node: a certificate for every gateway name, signed by the mesh CA, two years."""
     from cryptography import x509

@@ -471,7 +471,7 @@ def install_packages():
         env = {**os.environ, "DEBIAN_FRONTEND": "noninteractive"}
         subprocess.run(["apt-get", "update", "-q"], env=env)
         subprocess.run(
-            ["apt-get", "install", "-y", "-q", "wireguard-tools", "python3-cryptography", "nftables"],
+            ["apt-get", "install", "-y", "-q", "wireguard-tools", "python3-cryptography", "nftables", "python3-h2"],
             env=env,
             check=True,
         )
