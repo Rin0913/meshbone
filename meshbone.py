@@ -1930,7 +1930,7 @@ def view_admin(mesh, me, nodes, csrf, note, soft, until, held):
         page_head(mesh, "manage", ""),
         f"<h1>manage</h1><p>on <b>{esc(me)}</b> &middot; "
         + (
-            f"signing with your token until {time.strftime('%H:%M', time.localtime(until))} &middot; "
+            f"signing with your token for another {max(0, until - int(time.time())) // 60 + 1} min &middot; "
             "<a href=/admin/logout>end the session</a>"
             if until
             else "this node holds the admin key &middot; <a href=/admin/login>use a token instead</a>"
