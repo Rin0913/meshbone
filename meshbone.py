@@ -29,7 +29,7 @@ Any machine
                                 this machine becomes the first node and the first admin
   meshbone join FILE [--once]   FILE is the mesh config written by `invite`;
                                 --once keeps everything in /run (gone after reboot or `leave`)
-  meshbone local [--listen-port N] [--mtu N] [--nat on|off] [--dns on|off]
+  meshbone local [--listen-port N] [--mtu N] [--nat on|off] [--resolver on|off]
                                 this machine's own network settings (also accepted by create, join and deploy)
   meshbone promote --endpoint HOST:PORT   ask to become a hub at this stable public address
   meshbone cost NAME MS         local penalty in ms for sending via hub NAME (0 = automatic)
@@ -3160,16 +3160,16 @@ def cmd_local(a):
                 loc[k] = getattr(a, k)  # 0 puts it back to automatic
         if a.nat:
             loc["nat"] = a.nat == "on"
-        if a.dns:
-            loc["dns"] = a.dns == "on"
+        if a.resolver:
+            loc["resolver"] = a.resolver == "on"
         write(f"{DIR}/node.json", json.dumps(loc))
         reconcile()
     print(
         f"listen port {loc.get('listen_port') or 'automatic'}, mtu {loc.get('mtu') or 1420}, "
-        f"gateway NAT {'on' if loc.get('nat', True) else 'off'}, mesh resolver {'on' if loc.get('dns') else 'off'}"
+        f"gateway NAT {'on' if loc.get('nat', True) else 'off'}, mesh resolver {'on' if loc.get('resolver') else 'off'}"
     )
-    if a.dns:
-        print(set_resolver(a.dns == "on"))
+    if a.resolver:
+        print(set_resolver(a.resolver == "on"))
 
 
 def cmd_promote(a):
@@ -3409,6 +3409,7 @@ def cmd_check():
     view_login(mesh, "s", "p", 0, "")
     for text in UNITS.values():
         text.format(py="p", bin="b", port=1, net=mesh["net"], vip="v", aport=2)
+    build_parser()
     print("ok")
 
 
@@ -3689,7 +3690,7 @@ def cmd_admin():
     sock.close()
 
 
-def main():
+def build_parser():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="cmd", required=True)
 
@@ -3717,7 +3718,7 @@ def main():
             "--nat", choices=("on", "off"), help="as a gateway, hide the mesh behind this node's address (default on)"
         )
         s.add_argument(
-            "--dns", choices=("on", "off"), help="resolve the mesh's names through the mesh resolver on this host"
+            "--resolver", choices=("on", "off"), help="resolve the mesh's names through the mesh resolver here"
         )
 
     s = sub.add_parser("create")
@@ -3803,6 +3804,11 @@ def main():
     plain = ("install", "sync", "serve", "admin", "status", "leave", "upgrade", "passwd", "check", "health", "dnsd")
     for c in plain:
         sub.add_parser(c)
+    return p, plain
+
+
+def main():
+    p, plain = build_parser()
     a = p.parse_args()
     if os.geteuid() != 0:
         sys.exit("meshbone must run as root")

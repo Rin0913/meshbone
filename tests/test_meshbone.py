@@ -759,11 +759,11 @@ assert (
 assert "chain mesh" not in gw and did("c", "sysctl", "-qw", "net.ipv4.ip_forward=1")
 assert ["FORWARD", "-i", "mb0", "-j", "ACCEPT"] in json.load(open(D("c") + "/fw.json"))
 use("c")
-m.cmd_local(A(listen_port=None, mtu=None, nat="off", dns=None))
+m.cmd_local(A(listen_port=None, mtu=None, nat="off", resolver=None))
 assert did("c", "nft", "delete", "table", "inet", "meshbone") and not os.path.exists(
     D("c") + "/policy.nft"
 )  # routed, not hidden
-m.cmd_local(A(listen_port=None, mtu=None, nat="on", dns=None))
+m.cmd_local(A(listen_port=None, mtu=None, nat="on", resolver=None))
 assert "masquerade" in nft("c")[-1]
 use("adm")
 expect_exit(lambda: m.cmd_policy(P_(add=["sub nets", "nodes", "deny"])), "cannot read selector")
@@ -844,6 +844,17 @@ with quiet:
     use("adm")
     m.cmd_policy(P_(clear=True))
 assert did("a", "nft", "delete", "table", "inet", "meshbone") and not os.path.exists(D("a") + "/policy.nft")
+
+# the command line itself: every subcommand's options must at least build (a duplicate option is a crash)
+p_, plain_ = m.build_parser()
+for argv in (
+    ["status"],
+    ["deploy", "x", "--remote", "u@h", "--dns", "box", "--resolver", "on"],
+    ["local", "--resolver", "off"],
+    ["dns", "--zone", "z"],
+):
+    p_.parse_args(argv)
+assert "dnsd" in plain_ and "update" not in plain_
 
 # --- DNS: every node has a name, the resolver on the hubs' cluster IP answers the zone and forwards the rest
 import struct

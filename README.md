@@ -177,7 +177,7 @@ from the directory and forwards everything else to the upstream resolvers.
 The zone defaults to `<mesh>.internal`; `meshbone dns --zone home.example
 --upstream '9.9.9.9 1.1.1.1'` changes it for the whole mesh. Simple clients
 get the resolver and the zone in their config. On a full node,
-`meshbone local --dns on` points systemd-resolved at it for the zone only.
+`meshbone local --resolver on` points systemd-resolved at it for the zone only.
 
 ## Firewall
 
