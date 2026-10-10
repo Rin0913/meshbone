@@ -2888,10 +2888,21 @@ def apply_release(sha):
         return True, ""
 
 
+def update_busy():
+    """Is an update being applied on this node right now? (The sync that apply_release runs to
+    judge a fresh version must not start a second update - it would wait on the first forever.)"""
+    try:
+        with open(f"{DIR}/update.lock", "w") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return False
+    except OSError:
+        return True
+
+
 def maybe_update():
     """Follow the published release, once per version: a version that failed here is not retried."""
     r = release()
-    if not r or r["sha"] == code_sha() or read_json("update.json", {}).get("sha") == r["sha"]:
+    if not r or r["sha"] == code_sha() or read_json("update.json", {}).get("sha") == r["sha"] or update_busy():
         return
     if os.path.exists(release_path(r["sha"])):  # otherwise gossip is still fetching it
         apply_release(r["sha"])

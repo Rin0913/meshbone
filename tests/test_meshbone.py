@@ -1177,6 +1177,19 @@ with quiet:
 sync("a")
 assert installed["adm"] == V2 and installed["a"] == V2 and use("a").release()["source"] == "rollback"
 
+# while a version is being applied, the sync it runs must not start a second update (it would wait on itself)
+use("a")
+assert not m.update_busy()
+held_lock = open(D("a") + "/update.lock", "w")
+m.fcntl.flock(held_lock, m.fcntl.LOCK_EX)
+assert m.update_busy()
+before = list(ran)
+with quiet:
+    m.cmd_sync()  # a's release (V2 from the rollback) differs from... whatever it runs: still nothing is applied
+assert ran == before
+held_lock.close()
+assert not m.update_busy()
+
 # --- the original admin machine dies; the rest carries on
 shutil.move(D("adm"), D("adm.dead"))
 use("home")
