@@ -56,6 +56,13 @@ def respond(method, path, headers, body, peer="127.0.0.1"):
         "/api/health": lambda: data(model.health_table(store.load(), store.load_nets())),
         "/api/events": lambda: data(model.events_table(store.load(), store.load_nets(), 500)),
         "/events": lambda: page(views.view_events(mesh, model.events_table(store.load(), store.load_nets(), 300))),
+        "/ca.crt": lambda: (
+            "200 OK",
+            store.ca(mesh)[0].encode(),
+            "application/x-pem-file",
+            'Content-Disposition: attachment; filename="meshbone-ca.crt"\r\n',
+        ),
+        "/api/https": lambda: data(store.https_routes(mesh)),
         "/api/dns": lambda: data(
             {
                 **store.dns_settings(mesh),

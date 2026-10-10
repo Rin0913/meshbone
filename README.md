@@ -79,7 +79,7 @@ On any machine:
 | `install` | Install packages and `/usr/local/sbin/meshbone`, nothing else |
 | `create [--endpoint HOST:PORT] [--name N] [--mesh NAME] [--net CIDR] [--cluster-net CIDR]` | Start a mesh; this machine becomes its first node and first admin |
 | `join FILE [--once]` | Join with a config written by `invite`; `--once` keeps everything in `/run` |
-| `local [--listen-port N] [--mtu N]` | This machine's own network settings |
+| `local [--listen-port N] [--mtu N] [--nat on\|off] [--resolver on\|off] [--fallback 'IP IP']` | This machine's own settings |
 | `promote --endpoint HOST:PORT` | Ask to become a hub |
 | `cost NAME MS` | Local penalty for sending through hub NAME |
 | `status`, `leave`, `upgrade` | |
@@ -94,6 +94,7 @@ On an admin node:
 | `set NAME [options]` | Change a node |
 | `approve NAME`, `revoke NAME` | Accept a `promote` request; remove a node |
 | `dns [--zone DOMAIN] [--upstream 'IP IP']` | The mesh's names, see below |
+| `https [--add NAME URL] [--del NAME] [--ca]` | The HTTPS gateway, see below |
 | `transit NAME [--endpoint HOST:PORT --via HUB --net CIDR...]` | Add a transit router, or print its configuration again |
 | `policy [--default allow\|deny] [--add FROM TO allow\|deny [--ports P] [--at N]] [--del N] [--clear]` | The firewall, see below |
 | `passwd` | Change the management page password |
@@ -277,6 +278,23 @@ on. `update --rollback` publishes the version the admin node ran before.
 
 Pin `--ref` to a tag or commit you have reviewed: whatever is at that URL will
 run as root on every node.
+
+## HTTPS gateway
+
+Every hub serves HTTPS on the fourth cluster IP (`10.253.253.4`, also
+`https.<zone>`) with a certificate from the mesh's own CA, and proxies each
+name to a backend inside the mesh:
+
+```bash
+sudo meshbone https --add files http://10.253.255.1:3923   # https://files.<zone>
+sudo meshbone https --ca > meshbone-ca.crt                 # install in browsers, once
+```
+
+`https://map.<zone>` is always there (the map, the API, the management page).
+The CA key stays under the admin key; the certificate for the gateway's names
+is issued on an admin node and reaches the hubs with the other settings, its
+key encrypted for the mesh. The CA certificate is also at `/ca.crt` on the
+map's address.
 
 ## Health and events
 

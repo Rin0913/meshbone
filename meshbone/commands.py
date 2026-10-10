@@ -1,6 +1,6 @@
 """CONTROLLER, commands: what each subcommand does. Each changes the model, then picks a view."""
 
-import argparse, base64, contextlib, hashlib, io, json, os, random, re, secrets, shlex, shutil, socket, subprocess, sys, tarfile, time, zlib, zipfile
+import argparse, base64, contextlib, hashlib, io, json, os, random, re, secrets, shlex, shutil, socket, subprocess, sys, tarfile, time, zlib, zipfile, urllib.parse
 from ipaddress import IPv4Address, IPv4Network
 
 from . import cli, model, settings, ssh, store, system, updates, views, wire
@@ -426,6 +426,15 @@ def cmd_local(a):
             loc["nat"] = a.nat == "on"
         if a.resolver:
             loc["resolver"] = a.resolver == "on"
+        if getattr(a, "fallback", None) is not None:
+            try:
+                loc["fallback"] = [str(IPv4Address(u)) for u in store.listed(a.fallback)]
+            except ValueError as e:
+                sys.exit(f"bad fallback resolver: {e}")
+            if not loc["fallback"]:
+                loc.pop("fallback")
+            st = store.read_json("state.json", {})
+            store.write(f"{settings.DIR}/state.json", json.dumps({**st, "resolver_on": None}))  # apply again
         store.write(f"{settings.DIR}/node.json", json.dumps(loc))
         system.reconcile()
     print(
@@ -506,6 +515,42 @@ def cmd_policy(a):
             system.reconcile()
         wire.gossip(flood=True)
     print(views.view_policy(pol))
+
+
+def cmd_https(a):
+    """Show or change the HTTPS gateway's names, or print the mesh CA certificate."""
+    loc = store.local()
+    mesh = loc["mesh"]
+    if a.ca:
+        print(store.ca(mesh)[0], end="")
+        return
+    if a.add or a.delete:
+        with store.locked():
+            store.admin()
+            try:
+                routes = json.loads(store.load_conf()["https_routes"]["value"])
+            except (KeyError, ValueError):
+                routes = {}
+            if a.add:
+                name, url = a.add
+                u = urllib.parse.urlsplit(url)
+                if u.scheme not in ("http", "https") or not u.hostname or not model.dns_name(name):
+                    sys.exit("usage: --add NAME http://host:port[/path] (NAME bare, under the zone, or a full name)")
+                routes[model.dns_name(name)] = url
+            if a.delete:
+                routes.pop(model.dns_name(a.delete) or a.delete, None)
+            store.conf_put("https_routes", json.dumps(routes))
+            hosts = store.issue_https_cert(mesh)
+            system.reconcile()
+        wire.gossip(flood=True)
+        print(f"certificate issued for {', '.join(hosts)}")
+    elif os.path.exists(f"{settings.DIR}/admin.key") and not store.https_material(mesh)[0]:
+        with store.locked():
+            hosts = store.issue_https_cert(mesh)
+            system.reconcile()
+        wire.gossip(flood=True)
+        print(f"certificate issued for {', '.join(hosts)}")
+    print(views.view_https(store.https_routes(mesh), store.https_vip(mesh), store.dns_settings(mesh)["zone"]))
 
 
 def cmd_dns(a):

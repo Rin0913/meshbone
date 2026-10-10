@@ -115,6 +115,123 @@ def dns_vip(mesh):
     return cluster_net(mesh).network_address + 3
 
 
+def https_vip(mesh):
+    return cluster_net(mesh).network_address + 4
+
+
+def mesh_box():
+    """Encryption every node of the mesh can open: keyed from the mesh secret. For what hubs
+    must be able to read but should not travel in clear - the gateway's TLS key."""
+    from cryptography.fernet import Fernet
+
+    return Fernet(
+        base64.urlsafe_b64encode(hashlib.sha256(b"meshbone mesh" + base64.b64decode(local()["mesh"]["psk"])).digest())
+    )
+
+
+def ca(mesh):
+    """The mesh's own certificate authority -> (certificate PEM, private key PEM). Made once, on an
+    admin node; the key is kept under the admin key, the certificate is for everyone to install."""
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization as ser
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.x509.oid import NameOID
+    import datetime
+
+    conf = load_conf()
+    if "ca_cert" not in conf:
+        key = ec.generate_private_key(ec.SECP256R1())
+        name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, f"meshbone {mesh['name']} CA")])
+        now = datetime.datetime.now(datetime.timezone.utc)
+        cert = (
+            x509.CertificateBuilder()
+            .subject_name(name)
+            .issuer_name(name)
+            .public_key(key.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(now - datetime.timedelta(days=1))
+            .not_valid_after(now + datetime.timedelta(days=3650))
+            .add_extension(x509.BasicConstraints(ca=True, path_length=0), critical=True)
+            .add_extension(x509.KeyUsage(False, False, False, False, False, True, True, False, False), critical=True)
+            .sign(key, hashes.SHA256())
+        )
+        conf_put("ca_cert", cert.public_bytes(ser.Encoding.PEM).decode())
+        conf_put(
+            "ca_key",
+            password_box()
+            .encrypt(key.private_bytes(ser.Encoding.PEM, ser.PrivateFormat.PKCS8, ser.NoEncryption()))
+            .decode(),
+        )
+        conf = load_conf()
+    key_pem = (
+        password_box().decrypt(conf["ca_key"]["value"].encode()).decode()
+        if os.path.exists(f"{settings.DIR}/admin.key")
+        else ""
+    )
+    return conf["ca_cert"]["value"], key_pem
+
+
+def https_routes(mesh):
+    """The gateway's names and their backends: {host: url}. `map` is always there."""
+    zone = dns_settings(mesh)["zone"]
+    try:
+        routes = json.loads(load_conf()["https_routes"]["value"])
+        assert isinstance(routes, dict)
+    except (KeyError, ValueError, AssertionError):
+        routes = {}
+    out = {f"map.{zone}": f"http://127.0.0.1:{settings.ADMIN_PORT}"}
+    for host, url in routes.items():
+        out[host if "." in host else f"{host}.{zone}"] = url
+    return out
+
+
+def https_material(mesh):
+    """The gateway's certificate and key -> (cert PEM, key PEM), or ('', '') until an admin issued them."""
+    conf = load_conf()
+    try:
+        return conf["https_cert"]["value"], mesh_box().decrypt(conf["https_key"]["value"].encode()).decode()
+    except (KeyError, ValueError):
+        return "", ""
+
+
+def issue_https_cert(mesh):
+    """On an admin node: a certificate for every gateway name, signed by the mesh CA, two years."""
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization as ser
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.x509.oid import NameOID
+    import datetime
+
+    ca_cert_pem, ca_key_pem = ca(mesh)
+    ca_cert = x509.load_pem_x509_certificate(ca_cert_pem.encode())
+    ca_key = ser.load_pem_private_key(ca_key_pem.encode(), None)
+    hosts = sorted(https_routes(mesh))
+    key = ec.generate_private_key(ec.SECP256R1())
+    now = datetime.datetime.now(datetime.timezone.utc)
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, hosts[0])]))
+        .issuer_name(ca_cert.subject)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - datetime.timedelta(days=1))
+        .not_valid_after(now + datetime.timedelta(days=730))
+        .add_extension(
+            x509.SubjectAlternativeName([x509.DNSName(h) for h in hosts] + [x509.IPAddress(https_vip(mesh))]),
+            critical=False,
+        )
+        .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+        .add_extension(x509.ExtendedKeyUsage([x509.ExtendedKeyUsageOID.SERVER_AUTH]), critical=False)
+        .sign(ca_key, hashes.SHA256())
+    )
+    conf_put("https_cert", cert.public_bytes(ser.Encoding.PEM).decode() + ca_cert_pem)
+    conf_put(
+        "https_key",
+        mesh_box().encrypt(key.private_bytes(ser.Encoding.PEM, ser.PrivateFormat.PKCS8, ser.NoEncryption())).decode(),
+    )
+    return hosts
+
+
 def router_ip(mesh, node_id):
     return mesh_net(mesh).network_address + node_id
 
@@ -122,7 +239,7 @@ def router_ip(mesh, node_id):
 def held_vips(mesh, node):
     """A node's cluster IPs; every hub that runs meshbone also holds the three service addresses
     (map, metrics, DNS)."""
-    service = [str(admin_vip(mesh)), str(metrics_vip(mesh)), str(dns_vip(mesh))]
+    service = [str(admin_vip(mesh)), str(metrics_vip(mesh)), str(dns_vip(mesh)), str(https_vip(mesh))]
     return node["vips"] + (service if node["endpoint"] else [])
 
 

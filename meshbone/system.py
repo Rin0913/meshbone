@@ -345,7 +345,12 @@ def reconcile():
         sync_resolver(False)
         firewall([])
         apply_table(None)
-        for name in ("meshbone-serve.socket", "meshbone-admin.socket", "meshbone-dns.service"):
+        for name in (
+            "meshbone-serve.socket",
+            "meshbone-admin.socket",
+            "meshbone-dns.service",
+            "meshbone-https.service",
+        ):
             unit("stop", name)
         return
 
@@ -412,6 +417,7 @@ def reconcile():
         rules.append(["INPUT", "-p", "udp", "--dport", str(port), "-j", "ACCEPT"])
     if hub:
         rules += [["INPUT", "-i", settings.IFACE, "-p", p, "--dport", "53", "-j", "ACCEPT"] for p in ("udp", "tcp")]
+        rules.append(["INPUT", "-i", settings.IFACE, "-p", "tcp", "--dport", str(settings.HTTPS_PORT), "-j", "ACCEPT"])
     if hub or me["subnets"]:
         rules += [["FORWARD", "-i", settings.IFACE, "-j", "ACCEPT"], ["FORWARD", "-o", settings.IFACE, "-j", "ACCEPT"]]
     firewall(rules)
@@ -453,6 +459,7 @@ def reconcile():
     unit("start", "meshbone-serve.socket")
     unit("start" if serves_admin else "stop", "meshbone-admin.socket")
     unit("start" if hub else "stop", "meshbone-dns.service")
+    unit("start" if hub else "stop", "meshbone-https.service")
 
 
 def install_packages():
@@ -529,7 +536,8 @@ def sync_resolver(on):
     own changes; the plain-file case keeps a copy of what was there. Returns what was done."""
     mesh = store.local()["mesh"]
     d = store.dns_settings(mesh)
-    servers, zone, how = [str(store.dns_vip(mesh))] + d["upstream"], d["zone"], resolver_manager()
+    fallback = store.local().get("fallback") or d["upstream"]  # a host may name its own fallbacks
+    servers, zone, how = [str(store.dns_vip(mesh))] + fallback, d["zone"], resolver_manager()
     if how == "resolved":
         if on:
             run("resolvectl", "dns", settings.IFACE, *servers, check=False)

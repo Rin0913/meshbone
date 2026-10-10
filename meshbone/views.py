@@ -763,6 +763,15 @@ def view_policy(pol):
     return "\n".join(lines + ["always allowed: answers, ping, and the mesh's own ports between nodes"])
 
 
+def view_https(routes, vip, zone):
+    lines = [
+        f"HTTPS gateway on {vip} (https.{zone}), the mesh's own certificate; install the CA from `meshbone https --ca`"
+    ]
+    for host, url in sorted(routes.items()):
+        lines.append(f"  https://{host:<36} -> {url}")
+    return "\n".join(lines)
+
+
 def view_dns(settings, records):
     lines = [f"zone {settings['zone']}, other names go to {' then '.join(settings['upstream'])}"]
     for name, values in sorted(records.items()):

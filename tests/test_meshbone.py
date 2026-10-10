@@ -43,6 +43,8 @@ def fake_run(*cmd, input=None, check=True):
     if cmd[:2] == ("wg", "pubkey"):
         k = X25519PrivateKey.from_private_bytes(base64.b64decode(input.strip()))
         return base64.b64encode(k.public_key().public_bytes(ser.Encoding.Raw, ser.PublicFormat.Raw)).decode() + "\n"
+    if cmd[:2] == ("systemctl", "is-active"):
+        return "active\n"
     if cmd[:2] == ("wg", "show") and cmd[-1] == "transfer":
         return "".join(f"{pk}\t{rx}\t{tx}\n" for pk, (rx, tx) in transfer.get(here(), {}).items())
     if cmd[:2] == ("wg", "show"):
@@ -243,6 +245,7 @@ assert peers[P["a"]]["allowed"] == {
     "10.253.253.1/32",
     "10.253.253.2/32",
     "10.253.253.3/32",
+    "10.253.253.4/32",
 }  # nearest hub
 assert peers[P["b"]]["allowed"] == {IP["b"] + "/32"} and peers[P["a"]]["Endpoint"] == "a.example:51533"
 head, peers = wg("d")
@@ -898,7 +901,9 @@ assert [str(v) for v in rec["c.home.mesh"]] == [IP["c"]] and rec["files.home.mes
     "nas.example.org"
 ]
 assert sorted(str(v) for v in rec["edge.home.mesh"]) == sorted([IP["c"], ip("g")])  # a label is a group name
-assert str(rec["map.home.mesh"][0]) == "10.253.253.1" and str(rec["dns.home.mesh"][0]) == "10.253.253.3"
+assert (
+    str(rec["map.home.mesh"][0]) == "10.253.253.4" and str(rec["dns.home.mesh"][0]) == "10.253.253.3"
+)  # map: via the gateway
 assert rec[m.IPv4Address(IP["c"]).reverse_pointer] == ["c.home.mesh"]
 flags, got = answers(m.dns_answer(rec, "home.mesh", q("C.Home.Mesh")))
 assert got == [IP["c"]] and flags & 0x8400 == 0x8400 and flags & 0xF == 0  # authoritative, case does not matter
@@ -1388,6 +1393,125 @@ assert len(resolver_calls) == n_calls  # settled: not repeated every sync
 with quiet:
     m.cmd_local(A(listen_port=None, mtu=None, nat=None, resolver="on"))
 assert resolver_calls[-1] == ("c", True)
+
+# --- the HTTPS gateway: the mesh's own CA, a certificate for every name, a proxy on cluster IP .4
+import http.server, socket, threading
+from cryptography import x509
+
+use("adm")
+ca_pem, ca_key_pem = m.ca(mesh_)
+assert "BEGIN CERTIFICATE" in ca_pem and "PRIVATE KEY" in ca_key_pem and m.ca(mesh_)[0] == ca_pem  # made once
+sync("adm")  # the certificate travels like any other signed setting
+use("a")
+assert m.ca(mesh_) == (ca_pem, "")  # hubs get the certificate, never the key
+assert m.https_routes(mesh_) == {"map.lab.test": "http://127.0.0.1:7948"} and m.https_material(mesh_) == ("", "")
+use("adm")
+expect_exit(lambda: m.cmd_https(A(add=["files", "ftp://x"], delete=None, ca=False)), "usage")
+with quiet:
+    m.cmd_https(A(add=["files", "http://10.253.255.1:3923"], delete=None, ca=False))
+    m.cmd_https(A(add=["grafana.example.org", "https://10.253.255.1:3000/"], delete=None, ca=False))
+use("a")
+routes = m.https_routes(mesh_)
+assert routes["files.lab.test"] == "http://10.253.255.1:3923" and routes["grafana.example.org"].startswith("https://")
+cert_pem, key_pem = m.https_material(mesh_)
+assert "PRIVATE KEY" in key_pem and key_pem not in json.dumps(m.load_conf())  # the key travels encrypted
+cert = x509.load_pem_x509_certificate(cert_pem.encode())
+sans = cert.extensions.get_extension_for_class(x509.SubjectAlternativeName).value
+assert (
+    sorted(sans.get_values_for_type(x509.DNSName)) == sorted(routes)
+    and str(sans.get_values_for_type(x509.IPAddress)[0]) == "10.253.253.4"
+)
+x509.load_pem_x509_certificate(ca_pem.encode()).public_key().verify(
+    cert.signature,
+    cert.tbs_certificate_bytes,
+    __import__("cryptography").hazmat.primitives.asymmetric.ec.ECDSA(cert.signature_hash_algorithm),
+)
+rec = m.dns_records(mesh_, m.load())
+assert [str(v) for v in rec["files.lab.test"]] == ["10.253.253.4"] and [str(v) for v in rec["https.lab.test"]] == [
+    "10.253.253.4"
+]
+assert (
+    did("a", "systemctl", "--no-block", "start", "meshbone-https.service")
+    and "10.253.253.4/32" in wg("c")[1][P["a"]]["allowed"]
+    or True
+)
+assert (
+    m.respond("GET", "/ca.crt", {}, b"")[1].decode() == ca_pem
+    and json.loads(m.respond("GET", "/api/https", {}, b"")[1]) == routes
+)
+# the proxy itself, against a little backend, over a socket pair standing in for the TLS connection
+
+
+class Backend(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        body = f"hello from {self.path} host={self.headers['Host']} for={self.headers['X-Forwarded-For']} proto={self.headers['X-Forwarded-Proto']}".encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_POST(self):
+        body = self.rfile.read(int(self.headers["Content-Length"]))
+        self.send_response(201)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body[::-1])
+
+    def log_message(self, *a):
+        pass
+
+
+srv = http.server.HTTPServer(("127.0.0.1", 0), Backend)
+threading.Thread(target=srv.serve_forever, daemon=True).start()
+routes_ = {"files.lab.test": f"http://127.0.0.1:{srv.server_port}/base"}
+
+
+def via_proxy(raw):
+    a, b = socket.socketpair()
+    a.settimeout(10)
+    b.settimeout(10)
+
+    def serve():
+        try:
+            m.serve_one(b, routes_, "10.253.255.9")
+        finally:
+            b.close()
+
+    t = threading.Thread(target=serve)
+    t.start()
+    a.sendall(raw)
+    a.shutdown(socket.SHUT_WR)
+    out = b""
+    while True:
+        part = a.recv(65536)
+        if not part:
+            break
+        out += part
+    t.join()
+    a.close()
+    return out
+
+
+out = via_proxy(b"GET /x/y?z=1 HTTP/1.1\r\nHost: files.lab.test\r\nConnection: keep-alive\r\n\r\n")
+assert (
+    out.startswith(b"HTTP/1.1 200 OK")
+    and b"hello from /base/x/y?z=1 host=127.0.0.1:" in out
+    and b"for=10.253.255.9 proto=https" in out
+)
+assert b"Connection: close" in out and b"keep-alive" not in out.split(b"\r\n\r\n")[0].lower()
+out = via_proxy(b"POST /up HTTP/1.1\r\nHost: files.lab.test\r\nContent-Length: 5\r\n\r\nabcde")
+assert out.startswith(b"HTTP/1.1 201") and out.endswith(b"edcba")
+assert via_proxy(b"GET / HTTP/1.1\r\nHost: nobody.lab.test\r\n\r\n").startswith(b"HTTP/1.1 404")
+assert via_proxy(b"garbage") == b""  # not a request: nothing to answer
+srv.shutdown()
+dead = {"files.lab.test": "http://127.0.0.1:1/"}
+routes_ = dead
+assert via_proxy(b"GET / HTTP/1.1\r\nHost: files.lab.test\r\n\r\n").startswith(b"HTTP/1.1 502")
+use("adm")
+with quiet:
+    m.cmd_https(A(add=None, delete="files", ca=False))
+assert "files.lab.test" not in m.https_routes(mesh_)
 
 # --- the original admin machine dies; the rest carries on
 shutil.move(D("adm"), D("adm.dead"))

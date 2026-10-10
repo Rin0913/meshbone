@@ -230,6 +230,7 @@ def policy_ruleset(mesh, alive, pol):
         "meta l4proto icmp accept",
         f"{match('saddr', members('nodes', mesh, alive))}tcp dport {{ {settings.GOSSIP_PORT}, {settings.ADMIN_PORT} }} accept",
         f"ip daddr {store.dns_vip(mesh)} meta l4proto {{ tcp, udp }} th dport 53 accept",
+        f"ip daddr {store.https_vip(mesh)} tcp dport {settings.HTTPS_PORT} accept",
     ]
     for r in pol["rules"]:
         src, dst = members(r["from"], mesh, alive), members(r["to"], mesh, alive)
@@ -332,12 +333,17 @@ def dns_records(mesh, nodes):
                 out[f"{name}.{zone}"] = []
             if name and "." not in name and store.router_ip(mesh, n["id"]) not in out[f"{name}.{zone}"]:
                 out[f"{name}.{zone}"].append(store.router_ip(mesh, n["id"]))
+    gateway = store.https_routes(mesh)  # names the gateway serves go to it, `map` included
+    for host in gateway:
+        add(host, store.https_vip(mesh))
     for name, ip in (
         ("map", store.admin_vip(mesh)),
         ("metrics", store.metrics_vip(mesh)),
         ("dns", store.dns_vip(mesh)),
+        ("https", store.https_vip(mesh)),
     ):
-        add(f"{name}.{zone}", ip)
+        if f"{name}.{zone}" not in gateway:
+            add(f"{name}.{zone}", ip)
     return out
 
 

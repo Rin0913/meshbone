@@ -2,7 +2,7 @@
 
 import argparse, os, socket, sys
 
-from . import commands, dns, http, settings
+from . import commands, dns, http, proxy, settings
 
 
 def build_parser():
@@ -39,6 +39,10 @@ def build_parser():
             "--resolver",
             choices=("on", "off"),
             help="use the mesh resolver as this host's DNS, fallbacks after it (default on)",
+        )
+        s.add_argument(
+            "--fallback",
+            help="this host's fallback resolvers after the mesh one, e.g. '9.9.9.9 1.1.1.1' ('' = the mesh's)",
         )
 
     s = sub.add_parser("create")
@@ -114,6 +118,12 @@ def build_parser():
     s.add_argument("name")
     s.add_argument("--no-verify", dest="verify", action="store_false")
     sub.add_parser("revoke").add_argument("name")
+    s = sub.add_parser("https")
+    s.add_argument(
+        "--add", nargs=2, metavar=("NAME", "URL"), help="serve NAME (bare: under the zone) by proxying to URL"
+    )
+    s.add_argument("--del", dest="delete", metavar="NAME", help="stop serving NAME")
+    s.add_argument("--ca", action="store_true", help="print the mesh CA certificate")
     s = sub.add_parser("dns")
     s.add_argument("--zone", help="domain under which every node has a name (default <mesh>.internal)")
     s.add_argument("--upstream", help="resolvers for every other name, e.g. '1.1.1.1 8.8.8.8'")
@@ -144,6 +154,7 @@ def build_parser():
         "check",
         "health",
         "dnsd",
+        "httpsd",
     )
     for c in plain:
         sub.add_parser(c)
@@ -157,5 +168,5 @@ def main():
         sys.exit("meshbone must run as root")
     if a.cmd not in ("install", "create", "join") and not settings.joined():
         sys.exit("this machine is not in a mesh yet (see `meshbone create` / `meshbone join`)")
-    fn = next(getattr(mod, f"cmd_{a.cmd}") for mod in (commands, http, dns) if hasattr(mod, f"cmd_{a.cmd}"))
+    fn = next(getattr(mod, f"cmd_{a.cmd}") for mod in (commands, http, dns, proxy) if hasattr(mod, f"cmd_{a.cmd}"))
     fn() if a.cmd in plain else fn(a)

@@ -32,7 +32,7 @@ Any machine
                                 this machine becomes the first node and the first admin
   meshbone join FILE [--once]   FILE is the mesh config written by `invite`;
                                 --once keeps everything in /run (gone after reboot or `leave`)
-  meshbone local [--listen-port N] [--mtu N] [--nat on|off] [--resolver on|off]
+  meshbone local [--listen-port N] [--mtu N] [--nat on|off] [--resolver on|off] [--fallback 'IP IP']
                                 this machine's own network settings (also accepted by create, join and deploy)
   meshbone promote --endpoint HOST:PORT   ask to become a hub at this stable public address
   meshbone cost NAME MS         local penalty in ms for sending via hub NAME (0 = automatic)
@@ -61,6 +61,10 @@ Managing (the commands below, or http://10.253.253.1:7948/admin on any node)
   meshbone transit NAME [--endpoint HOST:PORT --via HUB --net CIDR...]
                                 add a transit router (or print its config again): plain WireGuard config
                                 and VyOS commands for the router's operator
+  meshbone https [--add NAME URL] [--del NAME] [--ca]
+                                the HTTPS gateway on cluster IP .4: NAME.<zone> is served with the mesh's
+                                own certificate and proxied to URL inside the mesh; --ca prints the CA
+                                certificate to install in browsers (also http://<map>/ca.crt)
   meshbone dns [--zone DOMAIN] [--upstream 'IP IP']
                                 the mesh's names: every node is <name>.<zone> (plus --dns names and labels);
                                 the resolver is cluster IP .3 on every hub, other names go upstream
@@ -76,9 +80,9 @@ The file is laid out as model, view, controller - see the banners below.
 import sys as _sys
 import types as _types
 
-from . import cli, commands, dns, http, model, settings, ssh, store, system, updates, views, wire
+from . import cli, commands, dns, http, model, proxy, settings, ssh, store, system, updates, views, wire
 
-MODULES = (settings, store, model, system, ssh, wire, updates, dns, views, http, commands, cli)
+MODULES = (settings, store, model, system, ssh, wire, updates, dns, proxy, views, http, commands, cli)
 
 
 class _Facade(_types.ModuleType):

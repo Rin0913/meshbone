@@ -18,6 +18,7 @@ GOSSIP_PORT = 7947  # TCP, reachable only from mesh addresses
 ADMIN_PORT = 7948  # HTTP: the mesh map on every hub, plus /admin on the admin nodes
 
 
+HTTPS_PORT = 443  # the gateway, on the fourth cluster IP
 FRESH = 180  # a WireGuard peer with a handshake this recent (s) counts as reachable
 
 
@@ -125,6 +126,15 @@ Accept=yes
 MaxConnections=16
 IPAddressDeny=any
 IPAddressAllow={net} 127.0.0.0/8
+""",
+    "meshbone-https.service": """[Unit]
+Description=meshbone HTTPS gateway: the mesh's names, served with its own certificate
+After=network.target
+
+[Service]
+ExecStart={py} {bin} httpsd
+Restart=always
+RestartSec=3
 """,
     "meshbone-dns.service": """[Unit]
 Description=meshbone DNS: the mesh's names, everything else forwarded
