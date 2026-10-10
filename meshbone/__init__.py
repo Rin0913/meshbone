@@ -15,9 +15,9 @@ Roles
            key, so only admin nodes can add, change or revoke nodes - keep it
            off the exposed machines.
   subnet   a network announced into the mesh by a hub or client acting as gateway.
-  transit router  a router (VyOS, say) that owns public addresses and runs plain WireGuard
-           to one hub. That hub maps public addresses 1:1 onto nodes (`--public`) and
-           carries their internet traffic; the router only forwards.
+  external gateway  a router (VyOS, say) that owns public addresses and runs plain WireGuard
+           to one hub. That hub maps public addresses 1:1 onto nodes (`--public`), whose
+           internet traffic leaves and enters through the gateway; the router only forwards.
   cluster IP  an address several nodes hold at once (anycast): traffic goes to
            one that is alive. Every hub holds the first two: .1 is the mesh
            map, traffic graphs and JSON API, .2 the Prometheus /metrics
@@ -58,8 +58,8 @@ Managing (the commands below, or http://10.253.253.1:7948/admin on any node)
                                 a client for a phone or any device that only runs plain WireGuard:
                                 writes a standard config (and shows a QR code); run it again to re-export
   meshbone approve NAME         accept a `promote` request
-  meshbone transit NAME [--endpoint HOST:PORT --via HUB --net CIDR...]
-                                add a transit router (or print its config again): plain WireGuard config
+  meshbone gateway NAME [--endpoint HOST:PORT --via HUB --net CIDR...]
+                                add an external gateway (or print its config again): plain WireGuard config
                                 and VyOS commands for the router's operator
   meshbone https [--add NAME URL] [--del NAME] [--ca]
                                 the HTTPS gateway on cluster IP .4: NAME.<zone> is served with the mesh's

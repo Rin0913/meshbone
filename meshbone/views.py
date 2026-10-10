@@ -79,7 +79,8 @@ function draw() {
   }
   for (const n of T.nodes) {
     const [x, y] = pos[n.id], r = n.hub ? 15 : 9, linked = n.hub || T.links.some(l => l.a === n.id && l.up);
-    g.beginPath(); g.arc(x, y, r, 0, 2 * Math.PI); g.fillStyle = css(n.hub ? '--hub' : linked ? '--client' : '--bg'); g.fill();
+    g.beginPath(); if (n.role === 'gateway') g.rect(x - r, y - r, 2 * r, 2 * r); else g.arc(x, y, r, 0, 2 * Math.PI);
+    g.fillStyle = css(n.hub ? '--hub' : linked ? '--client' : '--bg'); g.fill();
     g.lineWidth = n.me ? 3 : 1.5; g.strokeStyle = css(n.me ? '--fg' : n.hub ? '--hub' : '--client'); g.stroke();
     if (n.admin) { g.beginPath(); g.arc(x, y, r + 4, 0, 2 * Math.PI); g.lineWidth = 1; g.setLineDash([2, 3]); g.strokeStyle = css('--fg'); g.stroke(); g.setLineDash([]); }
     // labels go away from the centre for clients (outer ring) and towards it for hubs (inner ring), so they meet nobody
@@ -322,6 +323,7 @@ def view_map(mesh, topo, health=(), events=()):
         "<canvas id=map></canvas><p class=key><label><input type=checkbox id=edges style='width:auto'> show hosts behind "
         "nodes (no tunnel of their own, seen talking through a hub)</label></p>"
         "<p class=key><span>large dot: hub</span><span>small dot: client</span>"
+        "<span>square: external gateway (the internet, for nodes with a public address)</span>"
         "<span>thick line: hub-to-hub, or the hub a client sends through</span><span>thin line: standby link</span>"
         "<span>faint dashed red: no link</span><span>number: ping across that link</span>"
         "<span>dotted ring: admin node</span><span>bold outline: the node answering</span>"
@@ -334,11 +336,13 @@ def view_map(mesh, topo, health=(), events=()):
         via = next((names[l["b"]] for l in mine if l["primary"] and l["a"] == n["id"]), "")
         seen_by = ", ".join(sorted(names[l["b"] if l["a"] == n["id"] else l["a"]] for l in mine if l["up"])) or "nobody"
         role = (
-            ("hub" if n["hub"] else "client")
+            "external gateway"
+            if n["role"] == "gateway"
+            else n["role"]
             + (" · admin" if n["admin"] else "")
             + (" · simple" if n["simple"] else "")
+            + (" · internet exit" if n["exit"] else "")
         )
-        role = "transit router" if n["transit"] else role + (" · internet exit" if n["exit"] else "")
         out.append(
             f"<tr><td>{role}<td><b>{esc(n['name'])}</b><td class=m>{n['ip']}<td class=m>{esc(n['endpoint'] or 'behind NAT')}"
             f"<td class=m>{esc(' '.join(n['subnets'] + ['vip ' + v for v in n['vips']]) or '-')}"
@@ -402,7 +406,7 @@ def view_api(mesh):
         (
             "/api/nodes",
             "every node: name, role, ip, endpoint, subnets, vips, labels, desc, admin. Filters: <code>?label=X</code> "
-            "(repeatable, all must match), <code>?role=hub|client</code>, <code>?name=N</code>",
+            "(repeatable, all must match), <code>?role=hub|client|gateway</code>, <code>?name=N</code>",
         ),
         ("/api/topology", "nodes plus every link with state, ping and whether it is in use (what the map draws)"),
         ("/api/policy", "the firewall policy: the default and the ordered rules"),
@@ -473,7 +477,7 @@ def view_metrics(topo, totals, health=()):
             (
                 {
                     "node": n["name"],
-                    "role": "hub" if n["hub"] else "client",
+                    "role": n["role"],
                     "ip": n["ip"],
                     "labels": ",".join(n["labels"]),
                 },
@@ -701,7 +705,7 @@ def view_transit(name, transit, gateway, mesh, text):
     where = system.resolve(host, int(port))  # VyOS wants an address, not a name
     host = where.rpartition(":")[0].strip("[]") if where else host
     lines = [
-        f"{name}: transit router linked to hub {gateway['name']}, delivering {', '.join(transit['public_nets'])}",
+        f"{name}: external gateway linked to hub {gateway['name']}, delivering {', '.join(transit['public_nets'])}",
         "",
         "WireGuard config for the router (any WireGuard; the router needs no other knowledge of the mesh):",
         "",
@@ -743,7 +747,7 @@ def view_status(mesh, nodes, notes, once, is_admin, version):
     ]
     for r in nodes:
         lines.append(
-            f"{r['role']:<6} {r['name']:<16} {r['ip']:<15} {r['endpoint'] or '(nat)':<24} "
+            f"{r['role']:<8} {r['name']:<16} {r['ip']:<15} {r['endpoint'] or '(nat)':<24} "
             f"{r['link']:<40} {' '.join(r['subnets'] + r['vips'])}"
             + (f"  cost {r['eff']}" if r["eff"] else "")
             + "".join(f" [{l}]" for l in r.get("labels", []))

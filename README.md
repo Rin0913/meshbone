@@ -22,7 +22,7 @@ routing daemon, and a public node needs exactly one forwarded UDP port.
 | **client** | A node behind NAT. It stays linked to every hub, sends through the one with the best ping, and moves to another within seconds if that hub dies. |
 | **simple client** | A phone or any device that only runs plain WireGuard. It gets a standard config (file or QR code) and uses a single hub. |
 | **admin** | Whoever has the admin key. Every directory entry is signed with it, directly on a node that stores `admin.key`, or through a short-lived token made in the browser. |
-| **transit router** | A router that owns public addresses and runs plain WireGuard to one hub. That hub maps the addresses 1:1 onto nodes and carries their internet traffic. |
+| **external gateway** | A router that owns public addresses and runs plain WireGuard to one hub. That hub maps the addresses 1:1 onto nodes, whose internet traffic then leaves and enters through the gateway. The router needs nothing but WireGuard. |
 | **subnet** | A network behind a node, announced into the mesh. |
 | **cluster IP** | An address held by several nodes at once (anycast). Every hub holds two: the mesh map and the metrics endpoint. |
 
@@ -95,7 +95,7 @@ On an admin node:
 | `approve NAME`, `revoke NAME` | Accept a `promote` request; remove a node |
 | `dns [--zone DOMAIN] [--upstream 'IP IP']` | The mesh's names, see below |
 | `https [--add NAME URL] [--del NAME] [--ca]` | The HTTPS gateway, see below |
-| `transit NAME [--endpoint HOST:PORT --via HUB --net CIDR...]` | Add a transit router, or print its configuration again |
+| `gateway NAME [--endpoint HOST:PORT --via HUB --net CIDR...]` | Add an external gateway, or print its configuration again (`transit` still works) |
 | `policy [--default allow\|deny] [--add FROM TO allow\|deny [--ports P] [--at N]] [--del N] [--clear]` | The firewall, see below |
 | `passwd` | Change the management page password |
 | `update URL [--ref REF]`, `update --file PATH`, `update --rollback` | Roll out a new version of meshbone itself, see below |
@@ -165,20 +165,20 @@ hosts in that network therefore need no route to the mesh. If their router
 does have one and you want them to see the real source addresses, turn the
 masquerade off on the gateway with `meshbone local --nat off`.
 
-## Public addresses through a transit router
+## Public addresses through an external gateway
 
 A router that owns a public prefix (a VyOS on a VPS with BGP, say) brings those
 addresses into the mesh without running anything but WireGuard:
 
 ```bash
-sudo meshbone transit edge --endpoint edge.example.net:51820 --via vpn1 --net 203.0.113.64/26
+sudo meshbone gateway edge --endpoint edge.example.net:51820 --via vpn1 --net 203.0.113.64/26
 sudo meshbone set nas --public 203.0.113.70     # 1:1: inbound to the nas, its internet out as that address
 ```
 
-`transit` prints the router's WireGuard configuration (plain, and as VyOS
+`gateway` prints the router's WireGuard configuration (plain, and as VyOS
 commands): one interface, one peer - the hub named by `--via` - with the hub's
 address and the public prefix as allowed IPs, and a static route for the
-prefix into the tunnel. Apply it on the router; run `meshbone transit edge`
+prefix into the tunnel. Apply it on the router; run `meshbone gateway edge`
 again whenever you need it back.
 
 Everything else happens on that hub: it maps each public address 1:1 onto its

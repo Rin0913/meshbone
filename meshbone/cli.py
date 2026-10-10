@@ -61,7 +61,7 @@ def build_parser():
     node_options(s)
     s.add_argument("--admin", action="store_true", help="the new node also gets admin.key and can manage the mesh")
     s.add_argument("-o", "--out")
-    s = sub.add_parser("transit")
+    s = sub.add_parser("gateway", aliases=["transit"])
     s.add_argument("name")
     s.add_argument("--endpoint", default="", help="the router's WireGuard HOST:PORT (needed the first time)")
     s.add_argument("--via", default="", help="the hub the router is linked to (needed the first time)")

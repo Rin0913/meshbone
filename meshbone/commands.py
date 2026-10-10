@@ -229,7 +229,7 @@ def cmd_invite(a):
         if simple and (a.endpoint or a.subnet or a.vip or a.admin):
             sys.exit("a simple client only gets an address: no endpoint, subnets, cluster IPs or admin key")
         if transit and not os.path.exists(f"{settings.DIR}/admin.key"):
-            sys.exit("a transit router is added on a node that holds the admin key, which keeps the router's key")
+            sys.exit("an external gateway is added on a node that holds the admin key, which keeps the router's key")
         nodes[pub] = store.sign(
             pub,
             store.checked(
@@ -577,14 +577,14 @@ def cmd_dns(a):
     print(views.view_dns(store.dns_settings(loc["mesh"]), model.dns_records(loc["mesh"], store.load())))
 
 
-def cmd_transit(a):
-    """Add a transit router, or print its WireGuard configuration again."""
+def cmd_gateway(a):
+    """Add an external gateway (a router with public addresses), or print its WireGuard configuration again."""
     known = store.named(store.load(), a.name)[1]
     if known:
         a.name = known["name"]  # as spelled when it was added
     else:
         if not (a.endpoint and a.via and a.net):
-            sys.exit("a new transit router needs --endpoint HOST:PORT, --via HUB and at least one --net")
+            sys.exit("a new external gateway needs --endpoint HOST:PORT, --via HUB and at least one --net")
         cmd_invite(
             argparse.Namespace(
                 name=a.name,
@@ -609,6 +609,9 @@ def cmd_transit(a):
     if a.out:
         store.write(a.out, text)
     print(views.view_transit(a.name, n, gateway, store.local()["mesh"], text))
+
+
+cmd_transit = cmd_gateway  # the older name
 
 
 def cmd_simple(a):

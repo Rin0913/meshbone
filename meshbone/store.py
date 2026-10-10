@@ -524,7 +524,7 @@ def checked(mesh, nodes, nets, pk, n, keep=()):
             sys.exit(f"{n['public']} is a mesh address, not a public one")
         delivered = [IPv4Network(p) for t in transits(live(nodes)).values() for p in t["public_nets"]]
         if not any(IPv4Address(n["public"]) in net for net in delivered):
-            sys.exit(f"{n['public']} lies in no network a transit router delivers (see `meshbone transit`)")
+            sys.exit(f"{n['public']} lies in no network an external gateway delivers (see `meshbone gateway`)")
     else:
         n.pop("public", None)
     if n.get("transit"):
@@ -532,9 +532,9 @@ def checked(mesh, nodes, nets, pk, n, keep=()):
         n["public_nets"] = [str(IPv4Network(p)) for p in listed(n.get("public_nets", []))]
         gateway = named(nodes, n.get("via") or "")[1]
         if not gateway or not gateway["endpoint"]:
-            sys.exit(f"{n.get('via')!r} is not a hub; a transit router links to one hub")
+            sys.exit(f"{n.get('via')!r} is not a hub; an external gateway links to one hub")
         if n["endpoint"] or n["subnets"] or n["vips"]:
-            sys.exit("a transit router has a WireGuard endpoint and public networks, nothing else")
+            sys.exit("an external gateway has a WireGuard endpoint and public networks, nothing else")
     if not wellformed(pk, n) or not n["id"] < mesh_net(mesh).num_addresses:
         sys.exit("bad name, endpoint, cost, description (200 printable characters) or label (letters, digits, _.:=/-)")
     others = {k: o for k, o in live(nodes).items() if k != pk}
@@ -712,7 +712,7 @@ def check_password(password):
 
 
 def kept_key(node_id):
-    """The private key of a node whose key the admin nodes keep (simple clients, transit routers)."""
+    """The private key of a node whose key the admin nodes keep (simple clients, external gateways)."""
     conf = load_conf()
     record = conf.get(f"node_{node_id}") or conf[f"simple_{node_id}"]
     return password_box().decrypt(record["value"].encode()).decode()

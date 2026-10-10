@@ -42,7 +42,7 @@ def plan(loc, nodes, nets, rtt, seen, previous=None):
     hub = bool(me["endpoint"])
     gateway = store.exit_node(alive) == mypk
     peers = {pk: n for pk, n in alive.items() if pk != mypk and not n.get("transit") and (hub or n["endpoint"])}
-    if gateway:  # only the gateway hub is linked to the transit routers
+    if gateway:  # only the gateway hub is linked to the external gateways
         peers.update({pk: n for pk, n in store.transits(alive).items() if n["via"] == me["name"]})
     table = {pk: [] for pk in peers}
     if not peers:
@@ -52,7 +52,7 @@ def plan(loc, nodes, nets, rtt, seen, previous=None):
         for p in store.prefixes(mesh, n):
             owners.setdefault(p, []).append(pk)
     via_exit = store.exit_node(alive)
-    if gateway:  # the internet, inbound and outbound, is behind the transit routers
+    if gateway:  # the internet, inbound and outbound, is behind the external gateways
         for pk in store.transits(alive):
             if pk in table:
                 table[pk].append(IPv4Network("0.0.0.0/0"))
@@ -60,7 +60,7 @@ def plan(loc, nodes, nets, rtt, seen, previous=None):
         table[via_exit].append(IPv4Network("0.0.0.0/0"))
     if hub:
         for p, own in owners.items():
-            own = [pk for pk in own if pk in table]  # a transit router is only the gateway's peer
+            own = [pk for pk in own if pk in table]  # an external gateway is only the gateway hub's peer
             if mypk in owners[p] or not own:
                 continue
             table[min(own, key=lambda pk: (seen.get(pk, float("inf")), pk))].append(
@@ -91,19 +91,19 @@ def plan(loc, nodes, nets, rtt, seen, previous=None):
 
 
 def transit_config(name):
-    """The WireGuard side of a transit router -> (config text, its entry, the hub it is linked to).
+    """The WireGuard side of an external gateway -> (config text, its entry, the hub it is linked to).
     The hub's addresses and the public networks are what the router may send through the tunnel."""
     loc, nodes, nets = store.admin()
     mesh, alive = loc["mesh"], store.live(nodes)
     pk, n = store.by_name(nodes, name)
     if not n.get("transit"):
-        sys.exit(f"{name} is not a transit router")
+        sys.exit(f"{name} is not an external gateway")
     gpk, gateway = store.named(alive, n["via"])
     if not gateway:
         sys.exit(f"the hub {n['via']} that {name} links to is gone; revoke the router and add it again")
     key = store.kept_key(n["id"])
     text = (
-        f"# mesh {mesh['name']}: transit router {name}, linked to hub {gateway['name']}\n[Interface]\nPrivateKey = {key}\n"
+        f"# mesh {mesh['name']}: external gateway {name}, linked to hub {gateway['name']}\n[Interface]\nPrivateKey = {key}\n"
         f"Address = {store.router_ip(mesh, n['id'])}/32\nListenPort = {n['transit'].rpartition(':')[2]}\n\n[Peer]\nPublicKey = {gpk}\n"
         f"PresharedKey = {pair_psk({'key': key, 'mesh': mesh}, gpk)}\nEndpoint = {gateway['endpoint']}\n"
         f"AllowedIPs = {', '.join([str(store.router_ip(mesh, gateway['id'])) + '/32'] + n['public_nets'])}\nPersistentKeepalive = 25\n"
@@ -254,7 +254,7 @@ def policy_ruleset(mesh, alive, pol):
 def gateway_ruleset(mesh, me, nat, public=(), inside=()):
     """What makes a node a working gateway for the networks it announces -> nftables text, or ''.
 
-    `public`, on the hub a transit router is linked to, maps public addresses 1:1 onto nodes:
+    `public`, on the hub an external gateway is linked to, maps public addresses 1:1 onto nodes:
     [(public address, node's mesh address)]. Inbound, a packet for the public address is handed
     to the node; outbound, what the node sends to the internet (not to `inside`: the mesh and
     its subnets) leaves as the public address.
@@ -292,6 +292,12 @@ def mesh_table(*chains):
     """Our own nftables table holding these chains -> text that replaces it in one step, or None if empty."""
     body = "".join(chains)
     return f"table inet meshbone\ndelete table inet meshbone\ntable inet meshbone {{\n{body}}}\n" if body else None
+
+
+def role(n):
+    """hub (dialled by the others), client (behind NAT), or gateway: an external gateway, a router
+    that some nodes' internet traffic leaves and enters through."""
+    return "gateway" if n.get("transit") else "hub" if n["endpoint"] else "client"
 
 
 def dns_name(text):
@@ -540,7 +546,7 @@ def api_nodes(query):
         n
         for n in topo
         if all(l in n["labels"] for l in want)
-        and query.get("role", ["hub" if n["hub"] else "client"])[0] == ("hub" if n["hub"] else "client")
+        and query.get("role", [n["role"]])[0] == n["role"]
         and query.get("name", [n["name"]])[0] == n["name"]
     ]
 
@@ -602,7 +608,8 @@ def rows():
         wants = nets.get(pk, {}).get("wants", "")
         yield {
             **n,
-            "role": "hub" if n["endpoint"] else "client",
+            "role": role(n),
+            "endpoint": n["endpoint"] or n.get("transit", ""),
             "ip": str(store.router_ip(loc["mesh"], n["id"])),
             "link": link,
             "eff": max(n["cost"], loc["cost"].get(n["name"], 0)),
@@ -646,9 +653,10 @@ def topology():
                 "id": n["id"],
                 "name": n["name"],
                 "hub": bool(n["endpoint"]),
+                "role": role(n),
                 "me": pk == loc["pub"],
                 "ip": str(store.router_ip(mesh, n["id"])),
-                "endpoint": n["endpoint"],
+                "endpoint": n["endpoint"] or n.get("transit", ""),
                 "subnets": n["subnets"],
                 "vips": n["vips"],
                 "admin": bool(mine.get("admin")),
@@ -664,7 +672,7 @@ def topology():
         for hpk, h in alive.items():
             if not h["endpoint"] or hpk == pk or (n["endpoint"] and pk > hpk):  # hub pairs once
                 continue
-            if n.get("transit") and h["name"] != n["via"]:  # a transit router is linked to one hub only
+            if n.get("transit") and h["name"] != n["via"]:  # an external gateway is linked to one hub only
                 continue
             theirs = nets.get(hpk, {})
             ms = mine.get("rtt", {}).get(str(h["id"]), theirs.get("rtt", {}).get(str(n["id"])))

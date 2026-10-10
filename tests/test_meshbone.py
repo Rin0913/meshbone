@@ -1241,7 +1241,7 @@ assert ran == before
 held_lock.close()
 assert not m.update_busy()
 
-# --- a transit router: plain WireGuard to one hub, which maps public addresses 1:1 onto nodes
+# --- an external gateway: plain WireGuard to one hub, which maps public addresses 1:1 onto nodes
 use("adm")
 T_ = lambda name, **k: A(
     name=name,
@@ -1252,13 +1252,13 @@ T_ = lambda name, **k: A(
     label=[],
     out=k.get("out"),
 )
-expect_exit(lambda: m.cmd_transit(T_("edge")), "needs --endpoint")
+expect_exit(lambda: m.cmd_transit(T_("edge")), "needs --endpoint")  # the older name still works
 expect_exit(
-    lambda: m.cmd_transit(T_("edge", endpoint="edge.example:51820", via="c", net=["198.51.100.64/26"])), "is not a hub"
+    lambda: m.cmd_gateway(T_("edge", endpoint="edge.example:51820", via="c", net=["198.51.100.64/26"])), "is not a hub"
 )
-expect_exit(lambda: m.cmd_set(S("c", public="198.51.100.77")), "no network a transit router delivers")
+expect_exit(lambda: m.cmd_set(S("c", public="198.51.100.77")), "no network an external gateway delivers")
 with quiet:
-    m.cmd_transit(
+    m.cmd_gateway(
         T_(
             "edge",
             endpoint="edge.example:51820",
@@ -1283,12 +1283,12 @@ assert (
 )
 assert m.pair_psk({"key": m.kept_key(edge["id"]), "mesh": mesh_}, P["a"]) == re.search(r"PresharedKey = (\S+)", text)[1]
 use("c")
-expect_exit(lambda: m.cmd_transit(T_("edge")), "no admin key")  # the router's key lives with the admin nodes
+expect_exit(lambda: m.cmd_gateway(T_("edge")), "no admin key")  # the router's key lives with the admin nodes
 use("adm")
 with quiet:
     m.cmd_set(S("c", public="198.51.100.77"))
 expect_exit(lambda: m.cmd_set(S("d", public="198.51.100.77")), "already belongs")
-expect_exit(lambda: m.cmd_set(S("d", public="203.0.113.5")), "no network a transit router delivers")
+expect_exit(lambda: m.cmd_set(S("d", public="203.0.113.5")), "no network an external gateway delivers")
 expect_exit(lambda: m.cmd_set(S("c", public="10.253.255.9")), "mesh address")
 # the gateway hub peers with the router (and nobody else does), gives it the internet, and does the 1:1 NAT
 sync("a", "d")
@@ -1331,7 +1331,7 @@ assert did("c", "ip", "rule", "del", "pref", "7949") and did("c", "ip", "route",
 # the map and status know the router; a negative cost prefers a hub
 use("adm")
 page = G("/")[1].decode()
-assert "transit router" in page and "internet exit" in page and "public 198.51.100.77" in page
+assert "external gateway" in page and "internet exit" in page and "public 198.51.100.77" in page
 assert [l for l in m.topology()["links"] if l["a"] == edge["id"]] == [
     l for l in m.topology()["links"] if l["a"] == edge["id"] and l["b"] == m.load()[P["a"]]["id"]
 ]
