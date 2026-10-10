@@ -677,6 +677,97 @@ assert b"id=login" in web("a", "GET", "/admin", cookie)[1] and not os.path.exist
     (D("a") + ".sessions/" + sid + ".json")
 )
 
+# --- firewall: groups are labels; rules are signed, and every node compiles them into the same table
+nft = lambda n: [i for d, c, i in calls if d == n and c[:3] == ("nft", "-f", "-")]
+P_ = lambda **k: A(
+    clear=k.get("clear", False),
+    default=k.get("default"),
+    add=k.get("add"),
+    ports=k.get("ports"),
+    at=k.get("at"),
+    delete=k.get("delete"),
+)
+fmt = lambda nets: ", ".join(str(n.network_address) if n.prefixlen == 32 else str(n) for n in nets)
+use("adm")
+assert m.policy_ruleset(mesh_, m.live(m.load()), m.policy()) is None and not nft("a")  # no policy: nothing installed
+expect_exit(lambda: m.cmd_policy(P_(add=["sub nets", "nodes", "deny"])), "cannot read selector")
+expect_exit(lambda: m.cmd_policy(P_(add=["subnets", "nodes", "block"])), "allow or deny")
+expect_exit(lambda: m.cmd_policy(P_(add=["subnets", "nodes", "deny"], ports="tcp/99999")), "cannot read ports")
+use("d")
+expect_exit(lambda: m.cmd_policy(P_(default="deny")), "no admin key")
+with quiet:
+    use("adm")
+    m.cmd_policy(P_(add=["subnets", "nodes", "deny"]))
+    m.cmd_policy(P_(add=["edge", "prod", "allow"], ports="tcp/22,443 udp/53", at=1))
+alive_ = m.live(m.load())
+src, dst = fmt(m.members("edge", mesh_, alive_)), fmt(m.members("prod", mesh_, alive_))
+assert (
+    IP["c"] in src and "10.253.253.10" in src and IP["a"] in dst and "10.253.253.1," in dst
+)  # a group is its nodes' addresses
+table = nft("a")[-1]
+allow, deny = (
+    f"ip saddr {{ {src} }} ip daddr {{ {dst} }} tcp dport {{ 22, 443 }} counter accept",
+    "ip saddr { 10.3.0.0/24 } ip daddr {",
+)
+assert (
+    allow in table
+    and allow.replace("tcp dport { 22, 443 }", "udp dport { 53 }") in table
+    and table.index(allow) < table.index(deny)
+)
+assert (
+    "ct state established,related accept" in table
+    and "tcp dport { 7947, 7948 } accept" in table
+    and "meta l4proto icmp accept" in table
+)
+assert 'iifname "mb0" jump mesh' in table and table.startswith("table inet meshbone\ndelete table inet meshbone\n")
+assert (
+    table == nft("c")[-1] == nft("d")[-1] and table.rstrip().count("counter drop") == 1
+)  # same everywhere; default still allow
+with quiet:
+    use("adm")
+    m.cmd_set(S("g", label=["edge"]))  # joining the group is enough: the rule now covers g as well
+assert IP_g in nft("a")[-1] if (IP_g := ip("g")) else False
+with quiet:
+    use("adm")
+    m.cmd_policy(P_(default="deny"))
+assert nft("a")[-1].rstrip().endswith("jump mesh; }\n}") and "    counter drop\n  }" in nft("a")[-1]
+assert json.loads(G("/api/policy")[1]) == {
+    "default": "deny",
+    "rules": [
+        {"from": "edge", "to": "prod", "action": "allow", "ports": "tcp/22,443 udp/53"},
+        {"from": "subnets", "to": "nodes", "action": "deny", "ports": ""},
+    ],
+}
+use("adm")
+page = R(pw="correct-horse")[1].decode()
+assert "<h2>firewall</h2>" in page and "which is <b>deny</b>" in page and "tcp/22,443 udp/53" in page
+assert (
+    b"saved"
+    not in R(
+        "POST",
+        "correct-horse",
+        form(csrf=csrf("correct-horse"), action="policy_add", src="@adm", dst="bad sel", verdict="allow"),
+    )[1]
+)
+R(
+    "POST",
+    "correct-horse",
+    form(csrf=csrf("correct-horse"), action="policy_add", src="@adm", dst="any", verdict="allow", ports="tcp/3923"),
+)
+R("POST", "correct-horse", form(csrf=csrf("correct-horse"), action="policy_del", rule=1))
+R("POST", "correct-horse", form(csrf=csrf("correct-horse"), action="policy_default", default="allow"))
+use("a")
+assert [r["from"] for r in m.policy()["rules"]] == ["subnets", "@adm"] and m.policy()["default"] == "allow"
+evil = m.state()
+evil["conf"]["policy"] = {**evil["conf"]["policy"], "value": json.dumps({"default": "allow", "rules": []})}
+use("c")
+m.handle(IP["a"], json.dumps(evil))
+assert len(m.policy()["rules"]) == 2  # a hub cannot rewrite the policy either: it is signed like everything else
+with quiet:
+    use("adm")
+    m.cmd_policy(P_(clear=True))
+assert did("a", "nft", "delete", "table", "inet", "meshbone") and not os.path.exists(D("a") + "/policy.nft")
+
 # --- deploy over ssh through jump hosts, with and without passwords (ssh stubbed)
 assert m.parse_chain("u1@h1:u2@h2:10.9.9.9") == [("u1@h1", None), ("u2@h2", None), ("10.9.9.9", None)]
 assert m.parse_chain("u1:p@ss:w0rd@h1;u2@h2;h3") == [
@@ -685,17 +776,26 @@ assert m.parse_chain("u1:p@ss:w0rd@h1;u2@h2;h3") == [
     ("h3", None),
 ] and m.parse_chain("root:pw@solo") == [("root@solo", "pw")]
 expect_exit(lambda: m.parse_chain("u@h;rm -rf /"), "--remote is")
-# as root, ssh runs as the account that set the node up, so the page uses that person's keys
-real_uid, me_now = m.os.geteuid, m.pwd.getpwuid(os.getuid()).pw_name
-m.os.geteuid = lambda: 0
-use("adm")
-assert m.ssh_user() is None
-m.cmd_local(A(listen_port=None, mtu=None, ssh_user=me_now))
+# which identity a deploy logs in with: a key handed over, a person's own ssh, or the node's own deploy key
+import getpass
+
+m.deploy_key = lambda: ("/etc/meshbone/deploy_key", "ssh-ed25519 AAAA meshbone@test")
+real_uid, me_now = m.os.geteuid, getpass.getuser()
 with m.ssh_session([("u@h", None)]) as argv:
-    assert (m.ssh_user(), argv[:4]) == (me_now, ["sudo", "-u", me_now, "ssh"]) or me_now == "root"
-m.cmd_local(A(listen_port=None, mtu=None, ssh_user="no-such-account-xyz"))
-assert m.ssh_user() is None
-m.cmd_local(A(listen_port=None, mtu=None, ssh_user=""))
+    assert argv[0] == "ssh" and "-i" not in argv  # not root: whoever runs it uses their own ssh
+m.os.geteuid = lambda: 0
+with m.ssh_session([("u@h", None)]) as argv:
+    assert argv[argv.index("-i") + 1] == "/etc/meshbone/deploy_key"  # the page or the timer: the node's key
+pasted = "-----BEGIN OPENSSH PRIVATE KEY-----\r\nabc\r\n-----END OPENSSH PRIVATE KEY-----"
+with m.ssh_session([("u@h", "pw")], pasted) as argv:
+    keyfile = argv[argv.index("-i") + 1]
+    assert open(keyfile).read() == pasted.replace("\r", "") + "\n" and oct(os.stat(keyfile).st_mode & 0o777) == "0o600"
+    assert "IdentitiesOnly=yes" in argv and argv[0] == "env" and "/etc/meshbone/deploy_key" not in argv
+assert not os.path.exists(keyfile)  # gone with the session
+os.environ["SUDO_USER"] = me_now
+with m.ssh_session([("u@h", None)]) as argv:
+    assert argv[:4] == ["sudo", "-u", me_now, "ssh"] and "-i" not in argv  # a person at a terminal: their own ssh
+os.environ.pop("SUDO_USER")
 m.os.geteuid = real_uid
 assert m.parse_chain("ssh: rks:pw@10.0.0.8") == [("rks@10.0.0.8", "pw")]
 assert m.parse_chain("ssh me@h1;h2") == [("me@h1", None), ("h2", None)]

@@ -91,6 +91,7 @@ On an admin node:
 | `simple NAME [--hub HUB] [--qr]` | Add a plain-WireGuard device, or export its config again |
 | `set NAME [options]` | Change a node |
 | `approve NAME`, `revoke NAME` | Accept a `promote` request; remove a node |
+| `policy [--default allow\|deny] [--add FROM TO allow\|deny [--ports P] [--at N]] [--del N] [--clear]` | The firewall, see below |
 | `passwd` | Change the management page password |
 | `update URL [--ref REF]`, `update --file PATH`, `update --rollback` | Roll out a new version of meshbone itself, see below |
 
@@ -114,7 +115,7 @@ Served on port 7948, reachable only from inside the mesh.
 |---|---|
 | `http://10.253.253.1:7948/` on every hub | Mesh map, node and link tables |
 | `/traffic` | Per-link traffic graphs with a time range |
-| `/api/nodes`, `/api/topology`, `/api/traffic` | Read-only JSON; `/api/nodes` filters by `label`, `role`, `name` |
+| `/api/nodes`, `/api/topology`, `/api/traffic`, `/api/policy` | Read-only JSON; `/api/nodes` filters by `label`, `role`, `name` |
 | `http://10.253.253.2:7948/metrics` on every hub | Prometheus text format |
 | `http://10.253.253.1:7948/admin` | Management page, on every node (see below) |
 
@@ -147,6 +148,48 @@ change the page password.
 A node that is already compromised when you sign in can serve a page that
 steals the key. The token protects against everything else: someone listening
 on the way, and a node compromised later.
+
+## Firewall
+
+A policy says who may open connections to whom across the mesh. Groups are
+labels, so regrouping a node is a matter of changing its labels.
+
+```bash
+sudo meshbone policy --add subnets nodes deny                    # the mesh reaches into subnets, not the other way
+sudo meshbone policy --add ops servers allow --ports 'tcp/22,443'
+sudo meshbone policy --default deny                              # anything no rule matches
+sudo meshbone policy                                             # show it
+```
+
+| Group | Stands for |
+|---|---|
+| a label, e.g. `ops` | the addresses of the nodes carrying it |
+| `@name` | one node |
+| `nodes`, `hubs`, `clients` | all nodes, the hubs, the clients |
+| `subnets` | every network announced behind a node |
+| `LABEL+net`, `@name+net` | the networks behind those nodes instead of the nodes |
+| `any`, `10.1.1.0/24` | everything; a literal address or network |
+
+Rules are tried from the top and the first match decides. The policy is signed
+like the rest of the directory, and every node compiles it into the same
+nftables table (its own table, next to whatever firewall the host already
+has). It is enforced on the node a connection is for, on the hub that relays
+it, and on the gateway of a subnet - so it also covers simple clients.
+
+Always allowed: answers to permitted connections, ping, and the mesh's own two
+ports between nodes. A policy therefore cannot lock you out of the management
+page.
+
+## Deploying over ssh
+
+`deploy` logs in to the target and has three ways to prove itself:
+
+- a password in the destination: `user:password@host`;
+- a private key for that one login: `--identity FILE`, or pasted into the page;
+- otherwise the identity of whoever is asking: at a terminal under `sudo`, your
+  own ssh (agent, keys, config). From the management page, the deploy key of the
+  node serving the page; the page shows its public line, to be added to the
+  target's `~/.ssh/authorized_keys`.
 
 ## Updating
 

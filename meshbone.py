@@ -29,9 +29,8 @@ Any machine
                                 this machine becomes the first node and the first admin
   meshbone join FILE [--once]   FILE is the mesh config written by `invite`;
                                 --once keeps everything in /run (gone after reboot or `leave`)
-  meshbone local [--listen-port N] [--mtu N] [--ssh-user NAME]
-                                this machine's own settings: network (also accepted by create, join and
-                                deploy) and the account whose ssh keys deploys from here use
+  meshbone local [--listen-port N] [--mtu N]   this machine's own network settings
+                                (also accepted by create, join and deploy)
   meshbone promote --endpoint HOST:PORT   ask to become a hub at this stable public address
   meshbone cost NAME MS         local penalty in ms for sending via hub NAME (0 = automatic)
   meshbone status | leave | upgrade
@@ -56,16 +55,20 @@ Managing (the commands below, or http://10.253.253.1:7948/admin on any node)
                                 a client for a phone or any device that only runs plain WireGuard:
                                 writes a standard config (and shows a QR code); run it again to re-export
   meshbone approve NAME         accept a `promote` request
+  meshbone policy [--default allow|deny] [--add FROM TO allow|deny [--ports P] [--at N]] [--del N] [--clear]
+                                the firewall: who may open connections to whom across the mesh. FROM and TO
+                                are groups: a label, @name, nodes, hubs, clients, subnets, LABEL+net, any,
+                                or an address. First matching rule decides.
   meshbone revoke NAME
 
 The file is laid out as model, view, controller - see the banners below.
 """
 
 
-import argparse, base64, contextlib, fcntl, hashlib, hmac, html, io, json, os, pwd, random, re
+import argparse, base64, contextlib, fcntl, hashlib, hmac, html, io, json, os, random, re
 import secrets, shlex, shutil, socket, sqlite3, subprocess, sys, tarfile, tempfile, time, urllib.parse, urllib.request, zlib
 from concurrent.futures import ThreadPoolExecutor
-from ipaddress import IPv4Address, IPv4Network
+from ipaddress import IPv4Address, IPv4Network, collapse_addresses
 
 
 VERSION = 6
@@ -394,7 +397,7 @@ def conf_signable(name, r):
 def valid_conf(mesh, name, r):
     try:
         assert re.fullmatch(r"[a-z0-9_]{1,40}", name) and type(r["seq"]) is int
-        assert isinstance(r["value"], str) and len(r["value"]) < 4096
+        assert isinstance(r["value"], str) and len(r["value"]) < 32768
         sealed(mesh, r, conf_signable(name, r))
         return True
     except Exception:
@@ -1024,6 +1027,115 @@ def software():
     }
 
 
+def policy():
+    """The mesh's firewall policy -> {"default": "allow" | "deny", "rules": [{from, to, ports, action}]}.
+    Without one, everything is allowed."""
+    try:
+        p = json.loads(load_conf()["policy"]["value"])
+        assert p["default"] in ("allow", "deny") and isinstance(p["rules"], list)
+        return p
+    except (KeyError, ValueError, AssertionError, TypeError):
+        return {"default": "allow", "rules": []}
+
+
+def parse_ports(text):
+    """'tcp/22,443 udp/53 tcp/8000-8100' -> {"tcp": ["22", "443", "8000-8100"], "udp": ["53"]}; '' -> {} (all traffic)."""
+    out = {}
+    for item in text.split():
+        proto, _, ports = item.partition("/")
+        ok = (
+            proto in ("tcp", "udp")
+            and ports
+            and all(
+                re.fullmatch(r"\d{1,5}(-\d{1,5})?", p) and all(0 < int(n) < 65536 for n in p.split("-"))
+                for p in ports.split(",")
+            )
+        )
+        if not ok:
+            sys.exit(f"cannot read ports {item!r}: write tcp/22, udp/53, tcp/80,443 or tcp/8000-8100")
+        out.setdefault(proto, []).extend(ports.split(","))
+    return out
+
+
+def members(selector, mesh, alive):
+    """The addresses a policy selector stands for -> list of networks, or None for everything.
+
+    any                 everything
+    nodes hubs clients  the addresses of all nodes / of the hubs / of the clients
+    subnets             every network announced behind a node
+    LABEL               the addresses of the nodes carrying that label - a group
+    @NAME               the addresses of one node
+    LABEL+net @NAME+net nodes+net ...   the networks behind those nodes instead
+    10.1.1.0/24         a literal address or network
+    """
+    if selector == "any":
+        return None
+    try:
+        return [IPv4Network(selector, strict=False)]
+    except ValueError:
+        pass
+    name, plus, part = selector.partition("+")
+    if name == "subnets" and not plus:
+        name, part = "nodes", "net"
+    if part not in ("", "net") or (plus and not part):
+        sys.exit(f"cannot read selector {selector!r}")
+    if name in ("nodes", "hubs", "clients"):
+        chosen = [n for n in alive.values() if name == "nodes" or (name == "hubs") == bool(n["endpoint"])]
+    elif name.startswith("@"):
+        chosen = [n for n in alive.values() if n["name"] == name[1:]]
+    elif re.fullmatch(LABEL_RE, name):
+        chosen = [n for n in alive.values() if name in n.get("labels", [])]
+    else:
+        sys.exit(f"cannot read selector {selector!r}")
+    nets = []
+    for n in chosen:
+        if part:
+            nets += [IPv4Network(s) for s in n["subnets"]]
+        else:
+            nets += [IPv4Network(f"{ip}/32") for ip in [router_ip(mesh, n["id"])] + held_vips(mesh, n)]
+    return list(collapse_addresses(nets))
+
+
+def policy_ruleset(mesh, alive, pol):
+    """The policy as an nftables table of our own -> text, or None when everything is allowed anyway.
+
+    It judges new connections that enter or leave through the mesh interface: on the node they
+    are for, on the hub that relays them, and on the gateway of a subnet. Answers to connections
+    that were allowed always pass, and so do ping and the mesh's own two ports between nodes -
+    a policy cannot cut the mesh's control traffic or the management page off.
+    """
+    if pol["default"] == "allow" and not pol["rules"]:
+        return None
+
+    def match(field, nets):
+        each = [str(n.network_address) if n.prefixlen == 32 else str(n) for n in nets or []]
+        return f"ip {field} {{ {', '.join(each)} }} " if nets is not None else ""
+
+    lines = [
+        "ct state established,related accept",
+        "meta l4proto icmp accept",
+        f"{match('saddr', members('nodes', mesh, alive))}tcp dport {{ {GOSSIP_PORT}, {ADMIN_PORT} }} accept",
+    ]
+    for r in pol["rules"]:
+        src, dst = members(r["from"], mesh, alive), members(r["to"], mesh, alive)
+        if src == [] or dst == []:
+            continue  # nobody answers to that selector right now
+        verdict = "accept" if r["action"] == "allow" else "drop"
+        for proto, ports in list(parse_ports(r.get("ports", "")).items()) or [(None, None)]:
+            dport = f"{proto} dport {{ {', '.join(ports)} }} " if proto else ""
+            lines.append(f"{match('saddr', src)}{match('daddr', dst)}{dport}counter {verdict}")
+    if pol["default"] == "deny":
+        lines.append("counter drop")
+    rules = "\n".join("    " + line for line in lines)
+    return (
+        "table inet meshbone\ndelete table inet meshbone\ntable inet meshbone {\n"
+        f"  chain mesh {{\n{rules}\n  }}\n"
+        f'  chain input {{ type filter hook input priority 0; policy accept; iifname "{IFACE}" jump mesh; }}\n'
+        f'  chain forward {{ type filter hook forward priority 0; policy accept; iifname "{IFACE}" jump mesh; '
+        f'iifname != "{IFACE}" oifname "{IFACE}" jump mesh; }}\n}}\n'
+    )
+
+
 # ==============================================================================
 # MODEL, the machine side - reading and changing this host: WireGuard, routes, firewall,
 # systemd units, ssh, and the wire protocol to other nodes.
@@ -1091,6 +1203,29 @@ def firewall(want):
             run("iptables", "-I", *rule, check=False)
     if had != want:
         write(f"{DIR}/fw.json", json.dumps(want))
+
+
+def apply_policy(text):
+    """Load the policy's nftables table, or remove it. The table is ours alone; whatever other
+    firewall the host has stays as it is, and both have to let a packet through."""
+    path = f"{DIR}/policy.nft"
+    if text is None:
+        if os.path.exists(path):
+            run("nft", "delete", "table", "inet", "meshbone", check=False)
+            os.remove(path)
+        return
+    if not shutil.which("nft"):
+        for cmd in (["apt-get", "install", "-y", "-q", "nftables"], ["dnf", "install", "-y", "nftables"]):
+            if shutil.which(cmd[0]):
+                subprocess.run(cmd, stdin=subprocess.DEVNULL, capture_output=True)
+    try:
+        in_place = os.path.exists(path) and read("policy.nft") == text.strip()
+        if in_place and run("nft", "list", "table", "inet", "meshbone", check=False):
+            return
+        run("nft", "-f", "-", input=text)
+        write(path, text)
+    except (OSError, subprocess.CalledProcessError) as e:
+        log(f"firewall policy NOT applied: {getattr(e, 'stderr', '') or e}")
 
 
 def resolve(host, port):
@@ -1223,6 +1358,7 @@ def reconcile():
     if not active:  # revoked: take everything down
         run("ip", "link", "del", IFACE, check=False)
         firewall([])
+        apply_policy(None)
         for unit in ("meshbone-serve.socket", "meshbone-admin.socket"):
             run("systemctl", "stop", unit, check=False)
         return
@@ -1273,6 +1409,7 @@ def reconcile():
     if hub or me["subnets"]:
         rules += [["FORWARD", "-i", IFACE, "-j", "ACCEPT"], ["FORWARD", "-o", IFACE, "-j", "ACCEPT"]]
     firewall(rules)
+    apply_policy(policy_ruleset(mesh, alive, policy()))
     if {"primary": primary, "rtt": rtt} != was:
         write(f"{DIR}/state.json", json.dumps({"primary": primary, "rtt": rtt}))
     run("systemctl", "start", "meshbone-serve.socket", check=False)
@@ -1395,46 +1532,56 @@ def exchange(mesh, peer, msg):
         return json.loads(s.makefile("rb").readline(8 << 20))
 
 
-def ssh_user():
-    """Whose ssh identity deploys use when meshbone runs as root: the person who typed the command
-    under sudo, else the account that set this node up (the page and the timer have no sudo user).
-    None means root's own keys."""
-    if os.geteuid() != 0:
-        return None
-    user = os.environ.get("SUDO_USER") or read_json("node.json", {}).get("ssh_user")
-    try:
-        return user if user and user != "root" and pwd.getpwnam(user) else None
-    except KeyError:
-        return None
+def deploy_key():
+    """This node's own ssh identity, for logins it starts by itself -> (private key file, public key line).
+    Made the first time it is needed; the public line is what a target has to accept."""
+    path = f"{DIR}/deploy_key"
+    if not os.path.exists(path):
+        subprocess.run(
+            ["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", f"meshbone@{socket.gethostname()}", "-f", path],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            check=True,
+        )
+    with open(path + ".pub") as f:
+        return path, f.read().strip()
 
 
 @contextlib.contextmanager
-def ssh_session(hops):
-    """Yields the argv prefix for ssh, run as ssh_user() with their keys, config and known_hosts.
-    Passwords are answered by an askpass helper, so they never appear on a command line."""
-    user = ssh_user()
-    front, ssh = (["sudo", "-u", user] if user else []), ["ssh", "-o", "StrictHostKeyChecking=accept-new"]
+def ssh_session(hops, identity=None):
+    """Yields the argv prefix for ssh, with the identity that fits who is asking:
+
+    - a private key handed over for this one deploy, if there is one;
+    - else, for a person at a terminal (sudo), their own ssh: agent, keys, config, known_hosts;
+    - else - the management page, on whichever node serves it - that node's own deploy key.
+
+    Passwords in the destination are answered by an askpass helper, so they never appear on a
+    command line. Whatever is written for the session is removed when it ends.
+    """
+    person = os.environ.get("SUDO_USER") if os.geteuid() == 0 else None
+    person = None if person == "root" else person
+    front, ssh = (["sudo", "-u", person] if person else []), ["ssh", "-o", "StrictHostKeyChecking=accept-new"]
     known = dict(sorted(((d, p) for d, p in hops if p), key=lambda kv: -len(kv[0])))
-    if not known:
-        yield front + ssh
-        return
     box = tempfile.mkdtemp(prefix="meshbone-ssh-")
     try:
-        write(
-            f"{box}/askpass",
-            "#!/usr/bin/env python3\nimport sys\nfor who, password in %r.items():\n"
-            "    if who in sys.argv[1]:\n        print(password)\n        break\n" % known,
-            0o700,
-        )
-        if user:
-            shutil.chown(box, user)
-            shutil.chown(f"{box}/askpass", user)
-        yield front + ["env", f"SSH_ASKPASS={box}/askpass", "SSH_ASKPASS_REQUIRE=force"] + ssh + [
-            "-o",
-            "NumberOfPasswordPrompts=1",
-            "-o",
-            "PreferredAuthentications=publickey,password",
-        ]
+        if identity:
+            write(f"{box}/key", identity.replace("\r\n", "\n").strip() + "\n")
+            ssh += ["-i", f"{box}/key", "-o", "IdentitiesOnly=yes"]
+        elif not person and os.geteuid() == 0:
+            ssh += ["-i", deploy_key()[0]]
+        if known:
+            write(
+                f"{box}/askpass",
+                "#!/usr/bin/env python3\nimport sys\nfor who, password in %r.items():\n"
+                "    if who in sys.argv[1]:\n        print(password)\n        break\n" % known,
+                0o700,
+            )
+            front += ["env", f"SSH_ASKPASS={box}/askpass", "SSH_ASKPASS_REQUIRE=force"]
+            ssh += ["-o", "NumberOfPasswordPrompts=1", "-o", "PreferredAuthentications=publickey,password"]
+        if person:
+            for path in [box] + [os.path.join(box, name) for name in os.listdir(box)]:
+                shutil.chown(path, person)
+        yield front + ssh
     finally:
         shutil.rmtree(box, ignore_errors=True)
 
@@ -1827,6 +1974,7 @@ def view_api(mesh):
             "(repeatable, all must match), <code>?role=hub|client</code>, <code>?name=N</code>",
         ),
         ("/api/topology", "nodes plus every link with state, ping and whether it is in use (what the map draws)"),
+        ("/api/policy", "the firewall policy: the default and the ordered rules"),
         (
             "/api/traffic",
             "per-link byte counts in buckets. <code>?from=UNIX&amp;to=UNIX</code> (default: last 6 h), "
@@ -1937,7 +2085,7 @@ def view_metrics(topo, totals):
     return ("\n".join(out) + "\n").encode()
 
 
-def view_admin(mesh, me, nodes, csrf, note, soft, until, held, ssh_as):
+def view_admin(mesh, me, nodes, csrf, note, soft, until, held, origin, pol):
     """The management page: nodes, adding one, software versions, the password."""
     out = [
         page_head(mesh, "manage", ""),
@@ -1982,10 +2130,13 @@ def view_admin(mesh, me, nodes, csrf, note, soft, until, held, ssh_as):
         "<input name=ip placeholder='address (automatic)'> <input name=subnets placeholder=subnets> "
         "<input name=labels placeholder=labels> <input class=w name=desc placeholder=description> "
         "<input class=w name=remote placeholder='install over ssh: user:password@host' autocomplete=off> "
+        "<input class=w name=identity placeholder='private key for that login (optional, used once)' autocomplete=off> "
         "<label><input type=checkbox name=simple value=1 style='width:auto'> simple client (phone, plain WireGuard)</label> "
         "<button name=action value=invite>add</button></form>"
         f"<p>With an ssh destination the node is installed and joined right away. The login starts from <b>{esc(me)}</b> "
-        f"as <b>{esc(ssh_as)}</b>, so it is that account's keys that must be accepted. Several hops are separated by "
+        "and can prove itself in three ways: a password in the destination, a private key pasted next to it, or this "
+        f"node's own key - add this line to <code>~/.ssh/authorized_keys</code> of the account on the target:</p>"
+        f"<pre>{esc(origin or 'this node creates its key the first time it is needed')}</pre><p>Several hops are separated by "
         "<code>;</code>, each with or without a password, and each is reached through the one before it. "
         "Without one you get a config file to carry over (it holds the new node's private key).</p>"
     )
@@ -2029,6 +2180,28 @@ def view_admin(mesh, me, nodes, csrf, note, soft, until, held, ssh_as):
         "<details><summary>update log of this node</summary><pre>"
         + esc("\n".join(" ".join(f"{k}={v}" for k, v in e.items()) for e in soft["log"]) or "empty")
         + "</pre></details>"
+    )
+    out.append(
+        "<h2>firewall</h2><p>Who may open connections to whom across the mesh. Rules are tried from the top and the first "
+        f"match decides; without a match the default applies, which is <b>{pol['default']}</b>. Answers, ping and the mesh's "
+        "own ports always pass.</p><div class=scroll><table><tr><th>#<th>action<th>from<th>to<th>ports<th>"
+    )
+    for i, r in enumerate(pol["rules"], 1):
+        out.append(
+            f"<tr><td>{i}<td>{esc(r['action'])}<td class=m>{esc(r['from'])}<td class=m>{esc(r['to'])}"
+            f"<td class=m>{esc(r.get('ports') or 'all traffic')}<td><form method=post>{hidden}"
+            f"<input type=hidden name=rule value={i}><button name=action value=policy_del>remove</button></form>"
+        )
+    out.append(
+        f"</table></div><form method=post class=grid style='margin-top:10px'>{hidden}"
+        "<select name=verdict><option>deny<option>allow</select> from <input name=src placeholder='group' required> "
+        "to <input name=dst placeholder='group' required> <input name=ports placeholder='tcp/22,443 udp/53 (all)'> "
+        f"<button name=action value=policy_add>add rule</button></form><form method=post class=grid style='margin-top:6px'>{hidden}"
+        "otherwise <select name=default><option>allow<option>deny</select> <button name=action value=policy_default>set default"
+        "</button></form><p>A group is a label (the nodes carrying it), <code>@name</code>, <code>nodes</code>, "
+        "<code>hubs</code>, <code>clients</code>, <code>subnets</code> (every announced network), <code>LABEL+net</code> "
+        "(the networks behind those nodes), <code>any</code>, or an address. Example: deny from <code>subnets</code> to "
+        "<code>nodes</code> lets the mesh reach into the subnets but not the other way round.</p>"
     )
     if not held:
         return "".join(out).encode()
@@ -2088,6 +2261,16 @@ def view_status(mesh, nodes, notes, once, is_admin, version):
             + (f"  [asks to be a hub at {r['wants']}]" if r["wants"] else "")
         )
     return "\n".join(lines + ["warning: " + w for w in notes])
+
+
+def view_policy(pol):
+    """The policy as text, for the terminal."""
+    lines = [f"default: {pol['default']} (for new connections no rule matches)"]
+    for i, r in enumerate(pol["rules"], 1):
+        lines.append(
+            f"{i:>3}  {r['action']:<5} from {r['from']:<18} to {r['to']:<18} {r.get('ports') or 'all traffic'}"
+        )
+    return "\n".join(lines + ["always allowed: answers, ping, and the mesh's own ports between nodes"])
 
 
 # ==============================================================================
@@ -2220,8 +2403,6 @@ def bootstrap(mesh, key, nodes, nets, a, admin_key=None, conf=None):
     set_mode(getattr(a, "once", False))
     os.makedirs(DIR, mode=0o700, exist_ok=True)
     opts = {k: getattr(a, k) for k in ("listen_port", "mtu") if getattr(a, k, None)}
-    if os.environ.get("SUDO_USER", "root") != "root":
-        opts["ssh_user"] = os.environ["SUDO_USER"]  # later deploys from this node log in as this account
     write(f"{DIR}/node.json", json.dumps({"mesh": mesh, "key": key, "pub": pub, "cost": {}, **opts}))
     if admin_key:
         write(f"{DIR}/admin.key", admin_key)
@@ -2493,7 +2674,11 @@ def cmd_deploy(a):
     cfg = f"{DIR}/{a.name}.deploy.json"
     with contextlib.redirect_stdout(io.StringIO()):
         cmd_invite(argparse.Namespace(**{**vars(a), "out": cfg}))
-    with ssh_session(hops) as base:
+    identity = getattr(a, "identity", None)
+    if identity and "PRIVATE KEY" not in identity:  # the command line gives a file, the page the key itself
+        with open(identity) as f:
+            identity = f.read()
+    with ssh_session(hops, identity) as base:
         try:
             keys_only = [] if any(p for _, p in hops) else ["-o", "BatchMode=yes"]
             jump = (
@@ -2561,6 +2746,16 @@ def cmd_deploy(a):
                 if said
                 else str(e) if isinstance(e, OSError) else f"ssh ended with status {e.returncode}"
             )
+            if "Permission denied" in why:
+                why += (
+                    ". The login offered "
+                    + (
+                        "the key you gave"
+                        if identity
+                        else "your own ssh identity" if base[0] == "sudo" else "this node's deploy key"
+                    )
+                    + "; make the target accept it, put a password in the destination, or hand over a key"
+                )
             sys.exit(f"deploy to {chain[-1]} failed: {why}; {a.name} was revoked again")
         finally:
             os.remove(cfg)
@@ -2607,15 +2802,12 @@ def cmd_set(a):
 def cmd_local(a):
     with locked():
         loc = local()
-        for k in ("listen_port", "mtu", "ssh_user"):
+        for k in ("listen_port", "mtu"):
             if getattr(a, k) is not None:
-                loc[k] = getattr(a, k)  # 0 or '' puts it back to automatic
+                loc[k] = getattr(a, k)  # 0 puts it back to automatic
         write(f"{DIR}/node.json", json.dumps(loc))
         reconcile()
-    print(
-        f"listen port {loc.get('listen_port') or 'automatic'}, mtu {loc.get('mtu') or 1420}, "
-        f"deploys over ssh as {loc.get('ssh_user') or 'root'}"
-    )
+    print(f"listen port {loc.get('listen_port') or 'automatic'}, mtu {loc.get('mtu') or 1420}")
 
 
 def cmd_promote(a):
@@ -2660,6 +2852,34 @@ def cmd_cost(a):
         loc["cost"] = {k: v for k, v in {**loc["cost"], a.name: a.value}.items() if v}
         write(f"{DIR}/node.json", json.dumps(loc))
         reconcile()
+
+
+def cmd_policy(a):
+    """Show or change the firewall policy: who may open connections to whom across the mesh."""
+    pol = policy()
+    if a.clear or a.default or a.add or a.delete is not None:
+        with locked():
+            loc, nodes, _ = admin()
+            mesh, alive = loc["mesh"], live(nodes)
+            if a.clear:
+                pol = {"default": "allow", "rules": []}
+            if a.default:
+                pol["default"] = a.default
+            if a.delete is not None:
+                if not 1 <= a.delete <= len(pol["rules"]):
+                    sys.exit(f"there is no rule {a.delete}")
+                pol["rules"].pop(a.delete - 1)
+            if a.add:
+                src, dst, action = a.add
+                if action not in ("allow", "deny"):
+                    sys.exit("a rule ends in allow or deny")
+                rule = {"from": src, "to": dst, "action": action, "ports": " ".join((a.ports or "").split())}
+                members(src, mesh, alive), members(dst, mesh, alive), parse_ports(rule["ports"])
+                pol["rules"].insert((a.at or len(pol["rules"]) + 1) - 1, rule)
+            conf_put("policy", json.dumps(pol))
+            reconcile()
+        gossip(flood=True)
+    print(view_policy(pol))
 
 
 def cmd_simple(a):
@@ -2718,6 +2938,7 @@ def cmd_leave():
     units = ["meshbone.timer", "meshbone.service", "meshbone-serve.socket", "meshbone-admin.socket"]
     run("systemctl", "disable", "--now", *units, check=False)
     firewall([])
+    apply_policy(None)
     for ifn in (IFACE, "mbvip"):
         run("ip", "link", "del", ifn, check=False)
     for path in [f"{UNIT_DIR}/{name}" for name in UNITS]:
@@ -2732,9 +2953,6 @@ def cmd_upgrade():
     """Run from the new script: replaces the installed copy and units, keeps the mesh state."""
     install_units()
     with locked():
-        loc = local()
-        if "ssh_user" not in loc and os.environ.get("SUDO_USER", "root") != "root":
-            write(f"{DIR}/node.json", json.dumps({**loc, "ssh_user": os.environ["SUDO_USER"]}))
         reconcile()
 
 
@@ -2765,7 +2983,8 @@ def cmd_check():
     view_map(mesh, topo), view_traffic(mesh), view_api(mesh), view_metrics(topo, traffic_totals())
     view_status(mesh, list(rows()), warnings(), ONCE, False, code_sha())
     if os.path.exists(f"{DIR}/admin.key"):
-        view_admin(mesh, nodes[loc["pub"]]["name"], list(rows()), "x", "", software(), None, True, "root")
+        view_admin(mesh, nodes[loc["pub"]]["name"], list(rows()), "x", "", software(), None, True, "", policy())
+    policy_ruleset(mesh, live(nodes), policy()), view_policy(policy())
     view_login(mesh, "s", "p", 0, "")
     for text in UNITS.values():
         text.format(py="p", bin="b", port=1, net=mesh["net"], vip="v", aport=2)
@@ -2832,6 +3051,19 @@ def web_update(a):
     cmd_update(argparse.Namespace(url=a.source, ref=a.ref, file=None, rollback=a.action == "rollback"))
 
 
+def web_policy(a):
+    cmd_policy(
+        argparse.Namespace(
+            clear=False,
+            default=a.default if a.action == "policy_default" else None,
+            add=[a.src, a.dst, a.verdict] if a.action == "policy_add" else None,
+            ports=a.ports,
+            at=None,
+            delete=int(a.rule) if a.action == "policy_del" else None,
+        )
+    )
+
+
 def simple_response(mesh, query, key=None):
     name, hub = query.get("name", [""])[0], query.get("hub", [None])[0]
     try:
@@ -2868,6 +3100,7 @@ def respond(method, path, headers, body, peer="127.0.0.1"):
         "/api": lambda: page(view_api(mesh)),
         "/api/nodes": lambda: data(api_nodes(query)),
         "/api/topology": lambda: data(topology()),
+        "/api/policy": lambda: data(policy()),
         "/api/traffic": lambda: data(api_traffic(query)),
         "/metrics": lambda: (
             "200 OK",
@@ -2938,6 +3171,13 @@ def respond(method, path, headers, body, peer="127.0.0.1"):
             desc=form.get("desc", ""),
             ip=form.get("ip", ""),
             remote=form.get("remote", ""),
+            identity=form.get("identity", ""),
+            default=form.get("default", ""),
+            src=form.get("src", ""),
+            dst=form.get("dst", ""),
+            verdict=form.get("verdict", ""),
+            ports=form.get("ports", ""),
+            rule=form.get("rule", "0"),
             once=False,
             listen_port=None,
             mtu=None,
@@ -2956,6 +3196,9 @@ def respond(method, path, headers, body, peer="127.0.0.1"):
             "passwd": web_passwd,
             "update": web_update,
             "rollback": web_update,
+            "policy_add": web_policy,
+            "policy_del": web_policy,
+            "policy_default": web_policy,
         }
         try:
             a.cost = int(form.get("cost") or 0)
@@ -2980,7 +3223,11 @@ def respond(method, path, headers, body, peer="127.0.0.1"):
             with contextlib.suppress(FileNotFoundError):
                 os.remove(a.out)
     me = load()[loc["pub"]]["name"]
-    return page(view_admin(mesh, me, list(rows()), csrf, note, software(), until, held, ssh_user() or "root"))
+    try:
+        origin = deploy_key()[1] if os.geteuid() == 0 else ""
+    except (OSError, subprocess.CalledProcessError):
+        origin = ""
+    return page(view_admin(mesh, me, list(rows()), csrf, note, software(), until, held, origin, policy()))
 
 
 def cmd_admin():
@@ -3056,6 +3303,7 @@ def main():
     node_options(s)
     local_options(s)
     s.add_argument("--admin", action="store_true")
+    s.add_argument("--identity", help="private key file to log in with, for this deploy only")
     s.add_argument("--once", action="store_true")
     s = sub.add_parser("join")
     s.add_argument("file")
@@ -3073,9 +3321,7 @@ def main():
     s.add_argument("--label", action="append", default=[])
     s.add_argument("--no-label", action="store_true")
     s.add_argument("--no-verify", dest="verify", action="store_false")
-    s = sub.add_parser("local")
-    local_options(s)
-    s.add_argument("--ssh-user", help="account whose ssh keys deploys from this node use ('' = root)")
+    local_options(sub.add_parser("local"))
     s = sub.add_parser("promote")
     s.add_argument("--endpoint", required=True, help="stable public HOST:PORT of this node; '' withdraws")
     s = sub.add_parser("simple")
@@ -3090,6 +3336,13 @@ def main():
     s.add_argument("name")
     s.add_argument("--no-verify", dest="verify", action="store_false")
     sub.add_parser("revoke").add_argument("name")
+    s = sub.add_parser("policy")
+    s.add_argument("--default", choices=("allow", "deny"), help="what happens to a new connection no rule matches")
+    s.add_argument("--add", nargs=3, metavar=("FROM", "TO", "ACTION"), help="add a rule; ACTION is allow or deny")
+    s.add_argument("--ports", help="limit the rule being added, e.g. 'tcp/22,443 udp/53'")
+    s.add_argument("--at", type=int, help="position for the rule being added (default: last)")
+    s.add_argument("--del", dest="delete", type=int, metavar="N", help="remove rule N")
+    s.add_argument("--clear", action="store_true", help="remove every rule and allow everything again")
     s = sub.add_parser("cost")
     s.add_argument("name")
     s.add_argument("value", type=int)
