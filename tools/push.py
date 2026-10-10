@@ -1,18 +1,17 @@
 """Upgrade meshbone on a remote node over an ssh chain:  python3 push.py 'admin@jump.example.net;10.0.0.10'"""
 
-import importlib.util, os, io, re, subprocess, sys, tarfile
+import os, io, re, subprocess, sys, tarfile
 
 sys.dont_write_bytecode = True
-SOURCE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "meshbone.py")
-spec = importlib.util.spec_from_file_location("meshbone", SOURCE)
-m = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(m)
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+import meshbone as m
+
 hops = m.parse_chain(sys.argv[1])
 chain = [d for d, _ in hops]
 with m.ssh_session(hops) as base:
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w") as tar:
-        tar.add(SOURCE, "meshbone.py")
+        tar.add(m.updates.program_file(), "meshbone.py")
     tmp = (
         subprocess.run(
             m.remote_argv(base, chain, 'umask 077 && d=$(mktemp -d) && tar -xf - -C "$d" && echo "$d"', False),

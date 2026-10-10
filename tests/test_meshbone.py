@@ -8,10 +8,8 @@ Node ids are random, so run it a few times. --units also lints the systemd units
 import base64, hashlib, json, os, shutil, sys, tempfile, types, importlib.util, subprocess, copy, io, contextlib, re, sqlite3
 
 sys.dont_write_bytecode = True
-SOURCE = os.environ.get("MESHBONE", os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "meshbone.py"))
-spec = importlib.util.spec_from_file_location("meshbone", SOURCE)
-m = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(m)
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+import meshbone as m  # one namespace over every module: reads find a name, writes patch it where it lives
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
 from cryptography.hazmat.primitives import serialization as ser
 
@@ -1030,10 +1028,10 @@ assert (
 )
 import tarfile as tf
 
-assert tf.open(fileobj=io.BytesIO(tarball)).getnames() == ["meshbone.py", "mesh.json"]
+assert tf.open(fileobj=io.BytesIO(tarball)).getnames() == ["meshbone.pyz", "mesh.json"]
 inner = m.shlex.split(m.shlex.split(join[-1])[-1])[-1]
 assert (
-    'S="sudo"; $S python3 /tmp/tmp.Xy12/meshbone.py join /tmp/tmp.Xy12/mesh.json --once --listen-port 41000; rc=$?; rm -rf /tmp/tmp.Xy12'
+    'S="sudo"; $S python3 /tmp/tmp.Xy12/meshbone.pyz join /tmp/tmp.Xy12/mesh.json --once --listen-port 41000; rc=$?; rm -rf /tmp/tmp.Xy12'
     in inner
 ), inner
 del log[:]
@@ -1096,17 +1094,31 @@ def fake_script(path, *args, timeout=0):
 
 
 m.code_sha, m.script, m.reachable, m.UPDATE_SETTLE = fake_code_sha, fake_script, lambda: True, 0
-v2 = os.path.join(root, "v2.py")
-open(v2, "w").write("print('v2')\n")
+
+
+def version_tree(text):
+    """a source tree whose program is just `text` -> its directory"""
+    d = tempfile.mkdtemp(dir=root)
+    os.makedirs(f"{d}/meshbone")
+    open(f"{d}/meshbone/cli.py", "w").write(text)
+    return d
+
+
+v2 = os.path.join(root, "v2.pyz")
+open(v2, "wb").write(m.updates.build_archive(version_tree("print('v2')\n") + "/meshbone"))
 V2 = hashlib.sha256(open(v2, "rb").read()).hexdigest()
+assert (
+    m.updates.build_archive(version_tree("print('v2')\n") + "/meshbone") == open(v2, "rb").read()
+)  # one source, one checksum
 U = lambda **k: A(url=k.get("url"), ref=k.get("ref"), file=k.get("file"), rollback=k.get("rollback", False))
 log_of = lambda n: [json.loads(l)["event"] for l in open(D(n) + "/audit.log")]
 use("a")
 expect_exit(lambda: m.cmd_update(U(file=v2)), "no admin key")  # only an admin node can publish
-broken = os.path.join(root, "broken.py")
+broken = os.path.join(root, "broken.pyz")
 open(broken, "w").write("def (:\n")
 use("adm")
-expect_exit(lambda: m.cmd_update(U(file=broken)), "not a program")
+expect_exit(lambda: m.cmd_update(U(file=broken)), "not a program")  # not an archive
+expect_exit(lambda: m.cmd_update(U(file=version_tree("def (:\n"))), "not a program")  # a tree with a syntax error
 bad_check.add("adm")
 expect_exit(lambda: m.cmd_update(U(file=v2)), "was not accepted")  # fails its own dry run: nothing is installed
 assert installed.get("adm", BASE) == BASE and ("adm", "upgrade") not in ran and log_of("adm")[-1] == "rejected"
@@ -1155,8 +1167,14 @@ assert (
 # from the page, by URL; the GitHub address becomes a raw link at the chosen ref
 seen_urls = []
 real_open = m.urllib.request.urlopen
-m.urllib.request.urlopen = lambda url, timeout=0: (seen_urls.append(url), io.BytesIO(b"print('v3')\n"))[1]
-V3 = hashlib.sha256(b"print('v3')\n").hexdigest()
+import tarfile as tf2
+
+tree3 = version_tree("print('v3')\n")
+tarball3 = io.BytesIO()
+with tf2.open(fileobj=tarball3, mode="w:gz") as tar:
+    tar.add(tree3, "r-v1.2")  # GitHub names the top directory REPO-REF
+m.urllib.request.urlopen = lambda url, timeout=0: (seen_urls.append(url), io.BytesIO(tarball3.getvalue()))[1]
+V3 = hashlib.sha256(m.updates.build_archive(tree3 + "/meshbone")).hexdigest()
 use("adm")
 body = R(
     "POST",
@@ -1164,9 +1182,7 @@ body = R(
     form(csrf=csrf("correct-horse"), action="update", source="https://github.com/o/r", ref="v1.2"),
 )[1]
 assert (
-    b"is rolling out" in body
-    and seen_urls == ["https://raw.githubusercontent.com/o/r/v1.2/meshbone.py"]
-    and installed["adm"] == V3
+    b"is rolling out" in body and seen_urls == ["https://github.com/o/r/archive/v1.2.tar.gz"] and installed["adm"] == V3
 )
 m.urllib.request.urlopen = real_open
 expect_exit(lambda: m.fetch_source("http://plain.example/x.py", None), "must be https")

@@ -1,6 +1,6 @@
 # meshbone
 
-A WireGuard mesh backbone without a controller, in one Python file.
+A WireGuard mesh backbone without a controller. One Python package, shipped as one file.
 
 Every node keeps a full, signed copy of the mesh directory and computes its own
 WireGuard configuration from it. There is no coordination server to run, no
@@ -42,7 +42,8 @@ Create the mesh on a machine you trust. It does not have to be public; keeping
 the admin key off exposed hosts is the point.
 
 ```bash
-sudo python3 meshbone.py create --name laptop
+python3 tools/build.py                       # -> dist/meshbone.pyz, the whole program as one file
+sudo python3 dist/meshbone.pyz create --name laptop
 ```
 
 Add a hub. `deploy` invites the node, copies the script over ssh, installs it
@@ -58,7 +59,7 @@ file to the machine yourself:
 
 ```bash
 sudo meshbone invite nas --subnet 192.168.50.0/24      # writes nas.mesh.json
-sudo python3 meshbone.py join nas.mesh.json            # on the new machine
+sudo python3 meshbone.pyz join nas.mesh.json           # on the new machine
 ```
 
 Add a phone:
@@ -255,7 +256,9 @@ page.
 sudo meshbone update https://github.com/OWNER/REPO --ref v1.2    # or from the management page
 ```
 
-1. The admin node fetches `meshbone.py` at that branch, tag or commit.
+1. The admin node fetches the source tree at that branch, tag or commit and builds
+   the archive from it, the same way every time, so one source has one checksum.
+   `update --file` takes a built archive or a source tree instead.
 2. The new version must pass its own dry run (`check`) against the node's real
    state and Python. Then it is installed, and the node must still be in touch
    with the mesh afterwards. If not, the previous version is put back and
@@ -315,22 +318,38 @@ node exposes on `mb0` with its own firewall.
 
 ## Code layout
 
-`meshbone.py` stays a single file because `deploy` and `update` ship exactly
-one file to a node. Inside, it is laid out as model, view, controller:
+The program is the package `meshbone/`, laid out as model, view, controller.
+`tools/build.py` zips it into `meshbone.pyz`, a runnable archive: that one file
+is what `deploy` ships, what `update` installs and what a version's checksum
+names.
 
-| Layer | Holds |
+| Module | Holds |
 |---|---|
-| **Model** | The signed directory, what nodes report, traffic history, versions, and the rules over them. A second part wraps the machine: WireGuard, routes, firewall, systemd, ssh. |
-| **View** | `view_*` functions and page assets. They format the data they are given and read or change nothing. |
-| **Controller** | `cmd_*` for the command line, `respond` for HTTP, `handle` and `gossip` for other nodes. They change the model, then pick a view. |
+| `settings` | constants, paths, the switches set once per process |
+| `store` | **model**: the signed directory, self-reports, mesh-wide settings, sessions, releases - the node's files |
+| `model` | **model**: computations over the directory - routing table, firewall and router configurations, DNS records, traffic history, data for the views |
+| `system` | **model, machine side**: this host's WireGuard, routes, firewall, systemd; `reconcile` makes them match the directory |
+| `ssh` | logins to other machines: chains with jump hosts and passwords, managed routers |
+| `wire` | the protocol between nodes: directories, traffic history, program versions |
+| `updates` | software updates: fetching, building, proving, rolling back, following the release |
+| `dns` | the resolver on the hubs' cluster IP |
+| `views` | **view**: HTML pages and assets, Prometheus text, terminal output - pure |
+| `http` | **controller, HTTP**: one request in, one response out; one gossip connection |
+| `commands` | **controller, commands**: what each subcommand does |
+| `cli` | argument parsing and dispatch |
+
+Modules refer to each other by attribute (`system.run`, `store.load`), so a test
+can replace any of them in place; `import meshbone` gives one namespace over all
+of them for that purpose.
 
 ## Development
 
 ```bash
 python3 tests/test_meshbone.py --units    # multi-node logic test with ip, wg, systemctl and ssh stubbed
+python3 tools/build.py                    # build dist/meshbone.pyz
 python3 tools/preview.py OUTDIR           # render the map and traffic pages with a made-up mesh
-python3 tools/push.py 'me@jump;10.0.0.10' # upgrade a remote node
-black . && pyflakes3 meshbone.py
+python3 tools/push.py 'me@jump;10.0.0.10' # upgrade a remote node by hand
+black . && pyflakes3 meshbone
 ```
 
 Node ids are random, so run the test several times. Nodes may run older Python

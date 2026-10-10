@@ -1,13 +1,12 @@
 """Render the map and traffic pages with a made-up mesh (3 hubs, 7 clients) to check the drawing.
 python3 preview.py OUTDIR   ->  OUTDIR/map.html, OUTDIR/traffic.html"""
 
-import importlib.util, json, math, os, random, sys, tempfile, base64, hashlib, time
+import json, math, os, random, sys, tempfile, base64, hashlib, time
 
 sys.dont_write_bytecode = True
-SOURCE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "meshbone.py")
-spec = importlib.util.spec_from_file_location("meshbone", SOURCE)
-m = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(m)
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+import meshbone as m
+
 m.DIR = tempfile.mkdtemp()
 m.run = lambda *a, **k: ""
 key = lambda s: base64.b64encode(hashlib.sha256(s.encode()).digest()).decode()
