@@ -2,7 +2,7 @@
 
 import base64, html, json, re, time, urllib.parse
 
-from . import settings, store
+from . import system, settings, store
 
 
 PAGE_STYLE = """<style>
@@ -637,6 +637,8 @@ def view_transit(name, transit, gateway, mesh, text):
     priv = next(l.split(" = ")[1] for l in text.splitlines() if l.startswith("PrivateKey"))
     psk = next(l.split(" = ")[1] for l in text.splitlines() if l.startswith("PresharedKey"))
     host, _, port = gateway["endpoint"].rpartition(":")
+    where = system.resolve(host, int(port))  # VyOS wants an address, not a name
+    host = where.rpartition(":")[0].strip("[]") if where else host
     lines = [
         f"{name}: transit router linked to hub {gateway['name']}, delivering {', '.join(transit['public_nets'])}",
         "",
@@ -644,8 +646,9 @@ def view_transit(name, transit, gateway, mesh, text):
         "",
         text.rstrip(),
         "",
-        f"The same as VyOS commands (interface {wg}; adjust the name and the endpoint's port if taken):",
+        f"The same as VyOS commands (interface {wg}; pick another name if {wg} is in use for something else):",
         "",
+        f"delete interfaces wireguard {wg}",
         f"set interfaces wireguard {wg} description 'meshbone {mesh['name']}'",
         f"set interfaces wireguard {wg} address {store.router_ip(mesh, transit['id'])}/32",
         f"set interfaces wireguard {wg} port {transit['transit'].rpartition(':')[2]}",
@@ -653,7 +656,7 @@ def view_transit(name, transit, gateway, mesh, text):
         f"set interfaces wireguard {wg} mtu 1420",
         f"set interfaces wireguard {wg} peer {gateway['name']} public-key {gateway['pk']}",
         f"set interfaces wireguard {wg} peer {gateway['name']} preshared-key {psk}",
-        f"set interfaces wireguard {wg} peer {gateway['name']} address {host} ",
+        f"set interfaces wireguard {wg} peer {gateway['name']} address {host}",
         f"set interfaces wireguard {wg} peer {gateway['name']} port {port}",
         f"set interfaces wireguard {wg} peer {gateway['name']} allowed-ips {store.router_ip(mesh, gateway['id'])}/32",
     ]
@@ -661,6 +664,9 @@ def view_transit(name, transit, gateway, mesh, text):
     lines += [f"set interfaces wireguard {wg} peer {gateway['name']} persistent-keepalive 25"]
     lines += [f"set protocols static route {p} interface {wg}" for p in transit["public_nets"]]
     lines += [
+        "",
+        f"(any older `protocols static route ... interface {wg}` lines for other networks can go: the router",
+        "only needs the public networks routed into the tunnel; commit and save afterwards)",
         "",
         "Everything else happens on the hub: public addresses are mapped 1:1 onto nodes there, and the nodes'",
         "internet traffic leaves through the router. Assign addresses with `meshbone set NODE --public IP`.",
