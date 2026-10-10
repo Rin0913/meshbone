@@ -194,6 +194,17 @@ def https_material(mesh):
         return "", ""
 
 
+def https_cert_names(mesh):
+    """The names the gateway certificate was issued for, sorted - [] until there is one."""
+    from cryptography import x509
+
+    pem = https_material(mesh)[0]
+    if not pem:
+        return []
+    san = x509.load_pem_x509_certificate(pem.encode()).extensions.get_extension_for_class(x509.SubjectAlternativeName)
+    return sorted(san.value.get_values_for_type(x509.DNSName))
+
+
 def issue_https_cert(mesh):
     """On an admin node: a certificate for every gateway name, signed by the mesh CA, two years."""
     from cryptography import x509

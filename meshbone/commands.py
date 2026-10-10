@@ -542,8 +542,10 @@ def cmd_https(a):
             system.reconcile()
         wire.gossip(flood=True)
         print(f"certificate issued for {', '.join(hosts)}")
-    elif os.path.exists(f"{settings.DIR}/admin.key") and not store.https_material(mesh)[0]:
-        with store.locked():
+    elif os.path.exists(f"{settings.DIR}/admin.key") and store.https_cert_names(mesh) != sorted(
+        store.https_routes(mesh)
+    ):
+        with store.locked():  # none yet, or the names changed (a new zone, say)
             hosts = store.issue_https_cert(mesh)
             system.reconcile()
         wire.gossip(flood=True)
@@ -568,6 +570,8 @@ def cmd_dns(a):
                 except ValueError as e:
                     sys.exit(f"bad upstream: {e}")
             store.conf_put("dns", json.dumps(d))
+            if store.https_material(loc["mesh"])[0]:
+                store.issue_https_cert(loc["mesh"])  # the gateway's names live under the zone
             system.reconcile()
         wire.gossip(flood=True)
     print(views.view_dns(store.dns_settings(loc["mesh"]), model.dns_records(loc["mesh"], store.load())))

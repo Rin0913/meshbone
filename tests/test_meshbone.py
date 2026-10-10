@@ -1461,6 +1461,19 @@ x509.load_pem_x509_certificate(ca_pem.encode()).public_key().verify(
     cert.tbs_certificate_bytes,
     __import__("cryptography").hazmat.primitives.asymmetric.ec.ECDSA(cert.signature_hash_algorithm),
 )
+use("adm")
+with quiet:
+    m.cmd_dns(A(zone="new.lab.test", upstream=None))  # the gateway's names move with the zone: a new certificate
+assert m.https_cert_names(mesh_) == ["files.new.lab.test", "grafana.example.org", "map.new.lab.test"]
+m.conf_put("https_routes", json.dumps({**json.loads(m.load_conf()["https_routes"]["value"]), "x": "http://10.1.1.1/"}))
+with quiet:
+    m.cmd_https(A(add=None, delete=None, ca=False))  # a plain look on an admin node repairs a stale certificate
+assert "x.new.lab.test" in m.https_cert_names(mesh_)
+with quiet:
+    m.cmd_https(A(add=None, delete="x", ca=False))
+    m.cmd_dns(A(zone="lab.test", upstream=None))
+assert m.https_cert_names(mesh_) == ["files.lab.test", "grafana.example.org", "map.lab.test"]
+sync("a")
 rec = m.dns_records(mesh_, m.load())
 assert [str(v) for v in rec["files.lab.test"]] == ["10.253.253.4"] and [str(v) for v in rec["https.lab.test"]] == [
     "10.253.253.4"
