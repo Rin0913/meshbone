@@ -239,8 +239,8 @@ def handshakes():
     return out
 
 
-def probe(mesh, hubs):
-    """{pubkey: rtt in ms} for the hubs that answer a ping through the tunnel."""
+def probe(mesh, peers):
+    """{pubkey: rtt in ms} for the peers that answer a ping through the tunnel."""
 
     def one(item):
         out = run(
@@ -261,7 +261,7 @@ def probe(mesh, hubs):
         return item[0], min(times) if times else None
 
     with ThreadPoolExecutor(settings.PARALLEL) as pool:
-        return {pk: rtt for pk, rtt in pool.map(one, hubs.items()) if rtt is not None}
+        return {pk: rtt for pk, rtt in pool.map(one, peers.items()) if rtt is not None}
 
 
 def record_stats(my_id, alive, nets, rtt):
@@ -305,7 +305,14 @@ def reconcile():
     attached = local_nets()
     seen = handshakes()
     was = store.read_json("state.json", {})
-    rtt = probe(mesh, {pk: n for pk, n in alive.items() if n["endpoint"] and pk != mypk}) if active else {}
+    # every node measures the hubs; a hub also measures the peers that cannot measure for themselves
+    # (simple clients and the gateway it is linked to), so that their links get a ping too
+    silent = lambda n: n.get("simple") or (n.get("transit") and n.get("via") == me["name"])  # noqa: E731
+    rtt = (
+        probe(mesh, {pk: n for pk, n in alive.items() if pk != mypk and (n["endpoint"] or hub and silent(n))})
+        if active
+        else {}
+    )
     table, primary = model.plan(loc, nodes, nets, rtt, seen, was.get("primary")) if active else ({}, None)
 
     old = nets.get(mypk, {})

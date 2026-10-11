@@ -617,8 +617,12 @@ assert (
     ph_pk not in wg("c")[1] and key not in open(D("a") + "/conf.json").read()
 )  # clients do not peer with it; hubs cannot read its key
 shakes["a"][ph_pk] = 4
+rtt[("a", str(m.router_ip(m.local()["mesh"], ph["id"])))] = 7  # a hub pings a simple client: it cannot report itself
 sync("a", "c")
 assert str(m.router_ip(m.local()["mesh"], ph["id"])) + "/32" in wg("c")[1][P["a"]]["allowed"]
+use("a")
+assert m.load_nets()[P["a"]]["rtt"][str(ph["id"])] == 7
+assert [l["ms"] for l in m.topology()["links"] if l["a"] == ph["id"] and l["b"] == m.load()[P["a"]]["id"]] == [7]
 use("a")
 link = [l for l in m.topology()["links"] if l["a"] == ph["id"] and l["b"] == m.load()[P["a"]]["id"]][0]
 assert link["up"] and link["primary"]
