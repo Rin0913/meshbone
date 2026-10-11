@@ -1916,7 +1916,7 @@ with quiet:
 del m.acme.days_left
 with quiet:
     m.cmd_https(H(letsencrypt="", cloudflare_token="cf-token"))  # no contact address is fine too
-assert fake["issued"] == 4 and m.acme_settings()["email"] == ""
+assert fake["issued"] == 5 and m.acme_settings()["email"] == ""  # the zone went back and forth: two more
 with quiet:
     m.cmd_https(H(mesh_ca=True))
 assert not m.acme_settings() and "meshbone" in m.https_cert_info(mesh_) and "map.lab.test" in m.https_cert_names(mesh_)
