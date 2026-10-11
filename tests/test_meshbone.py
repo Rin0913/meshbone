@@ -1298,6 +1298,11 @@ assert (
     and "ListenPort = 51820" in text
 )
 assert m.pair_psk({"key": m.kept_key(edge["id"]), "mesh": mesh_}, P["a"]) == re.search(r"PresharedKey = (\S+)", text)[1]
+buf = io.StringIO()
+with contextlib.redirect_stdout(buf):
+    m.cmd_gateway(T_("edge"))  # printed again: the VyOS lines route the hub and the public networks into the tunnel
+assert "set protocols static route 198.51.100.64/26 interface wg1" in buf.getvalue()
+assert f"set protocols static route {IP['a']}/32 interface wg1" in buf.getvalue()  # VyOS routes nothing by allowed-ips
 use("c")
 expect_exit(lambda: m.cmd_gateway(T_("edge")), "no admin key")  # the router's key lives with the admin nodes
 use("adm")

@@ -787,11 +787,14 @@ def view_transit(name, transit, gateway, mesh, text):
     ]
     lines += [f"set interfaces wireguard {wg} peer {gateway['name']} allowed-ips {p}" for p in transit["public_nets"]]
     lines += [f"set interfaces wireguard {wg} peer {gateway['name']} persistent-keepalive 25"]
-    lines += [f"set protocols static route {p} interface {wg}" for p in transit["public_nets"]]
+    routed = [f"{store.router_ip(mesh, gateway['id'])}/32"] + transit[
+        "public_nets"
+    ]  # VyOS routes nothing by allowed-ips
+    lines += [f"set protocols static route {p} interface {wg}" for p in routed]
     lines += [
         "",
         f"(any older `protocols static route ... interface {wg}` lines for other networks can go: the router",
-        "only needs the public networks routed into the tunnel; commit and save afterwards)",
+        "only needs the hub and the public networks routed into the tunnel; commit and save afterwards)",
         "",
         "Everything else happens on the hub: public addresses are mapped 1:1 onto nodes there, and the nodes'",
         "internet traffic leaves through the router. Assign addresses with `meshbone set NODE --public IP`.",
