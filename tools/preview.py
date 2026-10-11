@@ -44,7 +44,18 @@ nodes = {
 }
 K = {n[0]: key(n[0]) for n in spec_nodes}
 nets = {
-    K["home-hub"]: {"sees": [12, 77, 257, 300, 301, 340, 388], "rtt": {"12": 34, "77": 6}},
+    K["home-hub"]: {
+        "sees": [12, 77, 257, 300, 301, 340, 388],
+        "rtt": {"12": 34, "77": 6},
+        "edges": [  # hosts behind nodes, as seen in connection tracking
+            {"ip": "10.20.30.7", "via": "home-hub", "peer": "desktop", "bytes": 9000000},
+            {"ip": "10.20.30.7", "via": "home-hub", "peer": "macbook", "bytes": 400000},
+            {"ip": "192.168.40.2", "via": "home-hub", "peer": "desktop", "bytes": 120000},
+            {"ip": "192.168.50.12", "via": "nas", "peer": "desktop", "bytes": 300000},
+            {"ip": "192.168.50.40", "via": "nas", "peer": "macbook", "bytes": 250000},
+            {"ip": "10.0.0.9", "via": "office-gw", "peer": "roger-laptop", "bytes": 700000},
+        ],
+    },
     K["tokyo-vps"]: {"sees": [226, 257, 300, 340, 388, 402], "rtt": {"226": 34, "77": 41}},
     K["office-gw"]: {"sees": [226, 12, 257, 402], "rtt": {"226": 6, "12": 41}},
     K["desktop"]: {"rtt": {"226": 3, "12": 36, "77": 9}, "primary": 226, "admin": True},

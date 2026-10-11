@@ -30,7 +30,27 @@ const T = __DATA__, cv = document.getElementById('map'), g = cv.getContext('2d')
 const css = v => getComputedStyle(document.documentElement).getPropertyValue(v).trim();
 const KEY = 'meshbone-map-' + (T.mesh || ''), hubs = T.nodes.filter(n => n.hub), clients = T.nodes.filter(n => !n.hub);
 let saved = {}; try { saved = JSON.parse(localStorage.getItem(KEY) || '{}'); } catch (e) {}
-let pos = {}, drag = null;
+let pos = {}, drag = null;                       // drag: a node, or {host} for a host behind one
+function hostsBehind() {                         // one per host and the node it sits behind, busiest first
+  const seen = {}, out = [];
+  for (const e of T.edges) { const k = e.via + '/' + e.ip; if (!seen[k]) { seen[k] = 1; out.push({key: k, ip: e.ip, via: e.via}); } }
+  return out;
+}
+function hostPositions() {                       // fanned out on the side of their node that faces away from the
+  const byVia = {}, out = [], cx = cv.clientWidth / 2, cy = cv.clientHeight / 2;  // map's middle; a dragged one keeps its offset
+  for (const h of hostsBehind()) (byVia[h.via] = byVia[h.via] || []).push(h);
+  for (const [via, list] of Object.entries(byVia)) {
+    const owner = T.nodes.find(n => n.name === via); if (!owner || !pos[owner.id]) continue;
+    const [ox, oy] = pos[owner.id], shown = list.slice(0, 12), n = shown.length, ring = 52 + Math.min(28, n * 4);
+    const up = owner.hub ? (oy < cy - 1 ? 1 : -1) : (oy < cy - 1 ? -1 : 1);  // where the node's labels go (as drawn below)
+    const base = -up * Math.PI / 2;                                           // so the hosts take the other side
+    shown.forEach((h, i) => {
+      const a = base + (i - (n - 1) / 2) * (Math.PI * 0.8 / Math.max(n - 1, 1)), off = saved['host ' + h.key];
+      out.push({...h, owner, ring, x: ox + (off ? off[0] : ring * Math.cos(a)), y: oy + (off ? off[1] : ring * Math.sin(a))});
+    });
+  }
+  return out;
+}
 function layout(W, H) {                          // hubs on an inner ring, clients on an outer one; saved drags win
   const cx = W / 2, cy = H / 2;
   const sendsVia = n => { const l = T.links.find(l => l.a === n.id && l.primary); return l ? hubs.findIndex(h => h.id === l.b) : hubs.length; };
@@ -59,22 +79,21 @@ function draw() {
       g.fillStyle = css('--bg'); g.fillRect(mx - w / 2, my - 8, w, 16); g.fillStyle = css('--fg'); g.fillText(label, mx, my);
     }
   }
-  if (document.getElementById('edges').checked) {  // hosts behind a node, on a small ring around it
-    const byVia = {};
-    for (const e of T.edges) (byVia[e.via] = byVia[e.via] || []).push(e);
+  if (document.getElementById('edges').checked) {  // hosts behind a node: a halo around the node and its hosts, a dotted stem each
     g.font = '10px ui-monospace, monospace';
-    for (const [via, list] of Object.entries(byVia)) {
-      const owner = T.nodes.find(n => n.name === via); if (!owner || !pos[owner.id]) continue;
-      const [ox, oy] = pos[owner.id], shown = list.slice(0, 12), ring = 46 + Math.min(30, shown.length * 3);
-      shown.forEach((e, i) => {
-        const a = 2 * Math.PI * i / shown.length + 0.4, x = ox + ring * Math.cos(a), y = oy + ring * Math.sin(a);
-        const peer = T.nodes.find(n => n.name === e.peer);
-        if (peer && pos[peer.id]) { g.beginPath(); g.moveTo(x, y); g.lineTo(pos[peer.id][0], pos[peer.id][1]); g.strokeStyle = css('--muted'); g.lineWidth = 0.6; g.globalAlpha = 0.5; g.stroke(); g.globalAlpha = 1; }
-        g.beginPath(); g.moveTo(x, y); g.lineTo(ox, oy); g.strokeStyle = css('--muted'); g.lineWidth = 0.8; g.stroke();
-        g.beginPath(); g.arc(x, y, 4, 0, 2 * Math.PI); g.fillStyle = css('--bg'); g.fill(); g.strokeStyle = css('--muted'); g.lineWidth = 1; g.stroke();
-        const w = g.measureText(e.ip).width + 4, ty = y + (Math.sin(a) >= 0 ? 10 : -10);
-        g.fillStyle = css('--bg'); g.globalAlpha = 0.85; g.fillRect(x - w / 2, ty - 6, w, 12); g.globalAlpha = 1; g.fillStyle = css('--muted'); g.fillText(e.ip, x, ty);
-      });
+    const hosts = hostPositions(), haloed = {};
+    for (const h of hosts) {
+      if (haloed[h.owner.id]) continue; haloed[h.owner.id] = 1;
+      const [ox, oy] = pos[h.owner.id];
+      g.beginPath(); g.arc(ox, oy, h.ring + 14, 0, 2 * Math.PI); g.fillStyle = css('--client'); g.globalAlpha = 0.07; g.fill();
+      g.globalAlpha = 0.35; g.strokeStyle = css('--client'); g.lineWidth = 1; g.setLineDash([3, 4]); g.stroke(); g.setLineDash([]); g.globalAlpha = 1;
+    }
+    for (const h of hosts) {
+      const [ox, oy] = pos[h.owner.id];
+      g.beginPath(); g.moveTo(h.x, h.y); g.lineTo(ox, oy); g.strokeStyle = css('--muted'); g.lineWidth = 1; g.setLineDash([2, 3]); g.stroke(); g.setLineDash([]);
+      g.beginPath(); g.arc(h.x, h.y, 4, 0, 2 * Math.PI); g.fillStyle = css('--bg'); g.fill(); g.strokeStyle = css('--muted'); g.lineWidth = 1; g.stroke();
+      const w = g.measureText(h.ip).width + 4, ty = h.y + (h.y >= oy ? 10 : -10);
+      g.fillStyle = css('--bg'); g.globalAlpha = 0.85; g.fillRect(h.x - w / 2, ty - 6, w, 12); g.globalAlpha = 1; g.fillStyle = css('--muted'); g.fillText(h.ip, h.x, ty);
     }
   }
   for (const n of T.nodes) {
@@ -94,18 +113,27 @@ function draw() {
   }
 }
 function at(e) { const b = cv.getBoundingClientRect(); return [e.clientX - b.left, e.clientY - b.top]; }
-cv.onpointerdown = e => {                        // drag a node; where it lands is remembered in this browser
-  const [x, y] = at(e);
-  const hit = T.nodes.find(n => Math.hypot(pos[n.id][0] - x, pos[n.id][1] - y) < 18);
+function hitAt(x, y) {                           // a node, or a host behind one (when shown), under the pointer
+  const n = T.nodes.find(n => Math.hypot(pos[n.id][0] - x, pos[n.id][1] - y) < 18);
+  if (n) return n;
+  if (!document.getElementById('edges').checked) return null;
+  const h = hostPositions().find(h => Math.hypot(h.x - x, h.y - y) < 10);
+  return h ? {host: h} : null;
+}
+cv.onpointerdown = e => {                        // drag a node or a host; where it lands is remembered in this browser
+  const [x, y] = at(e), hit = hitAt(x, y);
   if (hit) { drag = hit; cv.setPointerCapture(e.pointerId); cv.style.cursor = 'grabbing'; }
 };
 cv.onpointermove = e => {
-  if (!drag) { const [x, y] = at(e); cv.style.cursor = T.nodes.some(n => Math.hypot(pos[n.id][0] - x, pos[n.id][1] - y) < 18) ? 'grab' : ''; return; }
-  const [x, y] = at(e); pos[drag.id] = [Math.max(10, Math.min(cv.clientWidth - 10, x)), Math.max(10, Math.min(cv.clientHeight - 10, y))]; draw();
+  if (!drag) { const [x, y] = at(e); cv.style.cursor = hitAt(x, y) ? 'grab' : ''; return; }
+  const [x, y] = at(e), X = Math.max(10, Math.min(cv.clientWidth - 10, x)), Y = Math.max(10, Math.min(cv.clientHeight - 10, y));
+  if (drag.host) { const [ox, oy] = pos[drag.host.owner.id]; saved['host ' + drag.host.key] = [X - ox, Y - oy]; }  // relative: moves with its node
+  else pos[drag.id] = [X, Y];
+  draw();
 };
 cv.onpointerup = cv.onpointercancel = e => {
   if (!drag) return;
-  saved[drag.name] = [pos[drag.id][0] / cv.clientWidth, pos[drag.id][1] / cv.clientHeight];
+  if (!drag.host) saved[drag.name] = [pos[drag.id][0] / cv.clientWidth, pos[drag.id][1] / cv.clientHeight];
   try { localStorage.setItem(KEY, JSON.stringify(saved)); } catch (x) {}
   drag = null; cv.style.cursor = '';
 };
@@ -329,7 +357,8 @@ def view_map(mesh, topo, health=(), events=(), routes=None, zone="", cert=""):
         "<span>thick line: hub-to-hub, or the hub a client sends through</span><span>thin line: standby link</span>"
         "<span>faint dashed red: no link</span><span>number: ping across that link</span>"
         "<span>dotted ring: admin node</span><span>bold outline: the node answering</span>"
-        "<span>drag a node to move it (remembered here); double-click the map to reset</span></p>",
+        "<span>small hollow dot on a dotted stem: a host behind that node, seen through it, no tunnel of its own</span>"
+        "<span>drag a node or a host to move it (remembered here); double-click the map to reset</span></p>",
         "<h2>nodes</h2><div class=scroll><table><tr><th>role<th>name<th>address<th>endpoint<th>subnets"
         "<th>sends through<th>seen by<th>labels<th>description",
     ]
