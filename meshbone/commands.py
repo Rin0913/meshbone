@@ -542,10 +542,10 @@ def cmd_https(a):
                 print(f"certificate issued for {', '.join(store.issue_https_cert(mesh))}")
             system.reconcile()
         wire.gossip(flood=True)
-    elif a.letsencrypt or a.cert or a.mesh_ca:
+    elif a.letsencrypt is not None or a.cert or a.mesh_ca:  # an empty email is allowed: no contact
         if not store.has_admin_key():
             sys.exit("the gateway's certificate is managed on a node that holds admin.key")
-        if a.letsencrypt:
+        if a.letsencrypt is not None:
             if not a.cloudflare_token:
                 sys.exit("--letsencrypt EMAIL needs --cloudflare-token TOKEN (a token that may edit the zone's DNS)")
             from cryptography.hazmat.primitives import serialization as ser

@@ -1797,7 +1797,7 @@ class FakeCA(http.server.BaseHTTPRequestHandler):
         )
         payload = json.loads(base64.urlsafe_b64decode(jws["payload"] + "==")) if jws["payload"] else None
         if self.path == "/acct":
-            assert payload["termsOfServiceAgreed"] and payload["contact"] == ["mailto:me@lab.test"]
+            assert payload["termsOfServiceAgreed"] and payload["contact"] in ([], ["mailto:me@lab.test"])
             return self.reply(201, {"status": "valid"}, extra=[("Location", b + "/acct/1")])
         if self.path == "/order":
             fake["names"] = [i["value"] for i in payload["identifiers"]]
@@ -1914,6 +1914,9 @@ assert m.https_cert_names(mesh_) == ["*.new.lab.test", "new.lab.test"] and fake[
 with quiet:
     m.cmd_dns(A(zone="lab.test", upstream=None))
 del m.acme.days_left
+with quiet:
+    m.cmd_https(H(letsencrypt="", cloudflare_token="cf-token"))  # no contact address is fine too
+assert fake["issued"] == 4 and m.acme_settings()["email"] == ""
 with quiet:
     m.cmd_https(H(mesh_ca=True))
 assert not m.acme_settings() and "meshbone" in m.https_cert_info(mesh_) and "map.lab.test" in m.https_cert_names(mesh_)
