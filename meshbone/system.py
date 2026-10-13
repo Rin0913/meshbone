@@ -61,6 +61,37 @@ def sync_vips(want):
         run("ip", "addr", "del", f"{ip}/32", "dev", "mbvip", check=False)
 
 
+def mesh_rules(on=True):
+    """What goes through the mesh table: packets arriving from the mesh, and what this host sends
+    from its own mesh addresses (its node address, the cluster IPs it holds) - answers from the
+    services on them must go back into the mesh even where the main table routes that network
+    some other way (an older tunnel, say)."""
+    mesh = store.local()["mesh"]
+    have = {
+        (r.get("iif"), f"{r['src']}/{r['srclen']}" if r.get("srclen") else None)
+        for r in ip_json("rule", "show", "pref", str(settings.MESH_TABLE))
+    }
+    wanted = (
+        [(settings.IFACE, None), (None, str(store.mesh_net(mesh))), (None, str(store.cluster_net(mesh)))] if on else []
+    )
+    for iif, src in wanted:
+        if (iif, src) not in have:
+            where = ["iif", iif] if iif else ["from", src]
+            run(
+                "ip",
+                "rule",
+                "add",
+                *where,
+                "lookup",
+                str(settings.MESH_TABLE),
+                "pref",
+                str(settings.MESH_TABLE),
+                check=False,
+            )
+    for _ in have - set(wanted):
+        run("ip", "rule", "del", "pref", str(settings.MESH_TABLE), check=False)  # one rule per call, whichever
+
+
 def sync_routes(want, src, relay=(), own=()):
     """Route exactly these prefixes into the mesh. Returns the ones this host already sends elsewhere.
 
@@ -99,19 +130,7 @@ def sync_routes(want, src, relay=(), own=()):
             run("ip", "route", "replace", str(p), *args, "table", table, check=False)
     for p in set(ours) - set(wanted):
         run("ip", "route", "del", str(p), "table", table, check=False)
-    if not ip_json("rule", "show", "pref", str(settings.MESH_TABLE)):
-        run(
-            "ip",
-            "rule",
-            "add",
-            "iif",
-            settings.IFACE,
-            "lookup",
-            str(settings.MESH_TABLE),
-            "pref",
-            str(settings.MESH_TABLE),
-            check=False,
-        )
+    mesh_rules()
 
     main, elsewhere = set(held("dev", settings.IFACE)), set()
     for p in want - main:
@@ -347,7 +366,7 @@ def reconcile():
     sync_vips(set(store.held_vips(mesh, me)) if active else set())
     if not active:  # revoked: take everything down
         run("ip", "link", "del", settings.IFACE, check=False)
-        run("ip", "rule", "del", "pref", str(settings.MESH_TABLE), check=False)
+        mesh_rules(False)
         sync_exit(False)
         sync_resolver(False)
         firewall([])

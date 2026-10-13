@@ -740,11 +740,12 @@ def cmd_leave():
         "meshbone-serve.socket",
         "meshbone-admin.socket",
         "meshbone-dns.service",
+        "meshbone-https.service",
     ]
     system.run("systemctl", "disable", "--now", *units, check=False)
     system.firewall([])
     system.apply_table(None)
-    system.run("ip", "rule", "del", "pref", str(settings.MESH_TABLE), check=False)
+    system.mesh_rules(False)
     system.sync_exit(False)
     system.sync_resolver(False)
     for ifn in (settings.IFACE, "mbvip"):
