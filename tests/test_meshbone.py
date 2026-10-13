@@ -910,6 +910,10 @@ for argv in (
     ["dns", "--zone", "z"],
 ):
     p_.parse_args(argv)
+# and every command the parser knows is one main() can find (a service's command that is missing only shows at boot)
+subs_ = next(a for a in p_._actions if a.__class__.__name__ == "_SubParsersAction").choices
+for cmd_ in set(subs_) - {"transit"}:
+    assert any(hasattr(mod, f"cmd_{cmd_}") for mod in (m.commands, m.http, m.dns, m.proxy, m.egress)), cmd_
 assert "dnsd" in plain_ and "update" not in plain_
 
 # --- DNS: every node has a name, the resolver on the hubs' cluster IP answers the zone and forwards the rest

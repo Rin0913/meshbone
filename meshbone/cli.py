@@ -2,7 +2,7 @@
 
 import argparse, os, socket, sys
 
-from . import commands, dns, http, proxy, settings
+from . import commands, dns, egress, http, proxy, settings
 
 
 def build_parser():
@@ -187,5 +187,7 @@ def main():
         sys.exit("meshbone must run as root")
     if a.cmd not in ("install", "create", "join") and not settings.joined():
         sys.exit("this machine is not in a mesh yet (see `meshbone create` / `meshbone join`)")
-    fn = next(getattr(mod, f"cmd_{a.cmd}") for mod in (commands, http, dns, proxy) if hasattr(mod, f"cmd_{a.cmd}"))
+    fn = next(
+        getattr(mod, f"cmd_{a.cmd}") for mod in (commands, http, dns, proxy, egress) if hasattr(mod, f"cmd_{a.cmd}")
+    )
     fn() if a.cmd in plain else fn(a)
