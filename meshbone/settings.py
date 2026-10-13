@@ -136,6 +136,15 @@ ExecStart={py} {bin} httpsd
 Restart=always
 RestartSec=3
 """,
+    "meshbone-proxy.service": """[Unit]
+Description=meshbone HTTP proxy: this node's connection, for the mesh
+After=network.target
+
+[Service]
+ExecStart={py} {bin} proxyd
+Restart=always
+RestartSec=3
+""",
     "meshbone-dns.service": """[Unit]
 Description=meshbone DNS: the mesh's names, everything else forwarded
 After=network.target

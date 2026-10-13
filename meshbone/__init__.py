@@ -80,9 +80,9 @@ The file is laid out as model, view, controller - see the banners below.
 import sys as _sys
 import types as _types
 
-from . import acme, cli, commands, dns, http, model, proxy, settings, ssh, store, system, updates, views, wire
+from . import acme, cli, egress, commands, dns, http, model, proxy, settings, ssh, store, system, updates, views, wire
 
-MODULES = (settings, store, model, system, ssh, wire, updates, dns, proxy, acme, views, http, commands, cli)
+MODULES = (settings, store, model, system, ssh, wire, updates, dns, proxy, acme, egress, views, http, commands, cli)
 
 
 class _Facade(_types.ModuleType):

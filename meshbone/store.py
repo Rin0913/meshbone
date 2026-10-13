@@ -279,6 +279,15 @@ def https_covers(mesh):
     return sorted(h for h in https_routes(mesh) if h not in names and "*." + h.partition(".")[2] not in names and names)
 
 
+def egress_settings():
+    """The nodes that run an HTTP proxy: {name: {user, port, salt, hash, secret}}."""
+    try:
+        cfg = json.loads(load_conf()["egress"]["value"])
+        return cfg if isinstance(cfg, dict) else {}
+    except (KeyError, ValueError):
+        return {}
+
+
 def acme_settings():
     """The ACME account for the gateway's certificate, or None when the mesh CA signs it:
     {directory, email, token, account_key} - the last two encrypted under the admin key."""

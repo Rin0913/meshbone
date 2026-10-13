@@ -1938,6 +1938,109 @@ with quiet:
 assert not m.acme_settings() and "meshbone" in m.https_cert_info(mesh_) and "map.lab.test" in m.https_cert_names(mesh_)
 ca_srv.shutdown()
 
+# --- an HTTP proxy on chosen nodes
+import base64 as b64_
+
+use("adm")
+expect_exit(lambda: m.cmd_proxy(A(name="phone", port=None, user=None, rotate=False, off=False)), "runs no meshbone")
+expect_exit(lambda: m.cmd_proxy(A(name="a", port=7948, user=None, rotate=False, off=False)), "not usable")
+buf = io.StringIO()
+with contextlib.redirect_stdout(buf):
+    m.cmd_proxy(A(name="A", port=3129, user="ops", rotate=False, off=False))  # any case: the directory's spelling wins
+cfg = m.egress_settings()
+assert list(cfg) == ["a"] and cfg["a"]["port"] == 3129 and cfg["a"]["user"] == "ops"
+pw = m.password_of(cfg["a"])
+assert pw and pw not in json.dumps(m.load_conf()) and cfg["a"]["hash"] != pw  # on the mesh: a hash and a sealed copy
+assert f"http://ops:{pw}@a.lab.test:3129" in buf.getvalue() and f"http://ops:{pw}@{IP['a']}:3129" in buf.getvalue()
+buf = io.StringIO()
+with contextlib.redirect_stdout(buf):
+    m.cmd_proxy(A(name=None, port=None, user=None, rotate=False, off=False))  # the list never shows passwords
+assert pw not in buf.getvalue() and "a.lab.test:3129" in buf.getvalue()
+sync("a")
+assert did("a", "systemctl", "--no-block", "start", "meshbone-proxy.service")
+out = json.loads(m.respond("GET", "/api/proxies", {}, b"")[1])
+assert out == [{"node": "a", "user": "ops", "url": "http://a.lab.test:3129", "address": f"http://{IP['a']}:3129"}]
+
+e = cfg["a"]
+hdr = lambda p: "Basic " + b64_.b64encode(f"ops:{p}".encode()).decode()
+assert (
+    m.accepts(e, hdr(pw)) and not m.accepts(e, hdr("nope")) and not m.accepts(e, "Basic !!") and not m.accepts(e, None)
+)
+assert not m.accepts(e, "Basic " + b64_.b64encode(f"root:{pw}".encode()).decode())
+assert m.denied("127.0.0.1") and m.denied("169.254.169.254") and m.denied("::1") and not m.denied("10.1.1.1")
+
+
+class Origin(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        body = f"origin saw {self.path} host={self.headers['Host']} proxy={self.headers.get('Proxy-Authorization')}".encode()
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *a):
+        pass
+
+
+org = http.server.HTTPServer(("127.0.0.1", 0), Origin)
+threading.Thread(target=org.serve_forever, daemon=True).start()
+real_denied = m.egress.denied
+m.egress.denied = lambda ip: False  # the test origin lives on loopback
+
+
+def through_proxy(raw, first_only=True):
+    a, b = socket.socketpair()
+    a.settimeout(10)
+    t = threading.Thread(target=lambda: (m.serve_client(b, e, "10.253.255.9"), b.close()))
+    t.start()
+    a.sendall(raw)
+    got = b""
+    while True:
+        try:
+            part = a.recv(65536)
+        except socket.timeout:
+            break
+        if not part:
+            break
+        got += part
+    t.join(15)
+    a.close()
+    return got
+
+
+port_ = org.server_port
+got = through_proxy(
+    f"GET http://127.0.0.1:{port_}/x?y=1 HTTP/1.1\r\nHost: 127.0.0.1:{port_}\r\nProxy-Authorization: {hdr(pw)}\r\n\r\n".encode()
+)
+assert (
+    b" 200 " in got[:16] and b"origin saw /x?y=1 host=127.0.0.1:" in got and b"proxy=None" in got  # (HTTP/1.0 origin)
+)  # credentials not passed on
+assert through_proxy(f"GET http://127.0.0.1:{port_}/ HTTP/1.1\r\nHost: x\r\n\r\n".encode()).startswith(b"HTTP/1.1 407")
+assert b"Proxy-Authenticate: Basic" in through_proxy(b"GET http://x/ HTTP/1.1\r\nHost: x\r\n\r\n")
+assert through_proxy(f"GET /relative HTTP/1.1\r\nProxy-Authorization: {hdr(pw)}\r\n\r\n".encode()).startswith(
+    b"HTTP/1.1 400"
+)
+tunnel = through_proxy(
+    f"CONNECT 127.0.0.1:{port_} HTTP/1.1\r\nHost: 127.0.0.1:{port_}\r\nProxy-Authorization: {hdr(pw)}\r\n\r\n"
+    f"GET /through HTTP/1.1\r\nHost: o\r\nConnection: close\r\n\r\n".encode()
+)
+assert tunnel.startswith(b"HTTP/1.1 200 Connection established") and b"origin saw /through" in tunnel
+m.egress.denied = real_denied
+refused = through_proxy(f"CONNECT 127.0.0.1:{port_} HTTP/1.1\r\nProxy-Authorization: {hdr(pw)}\r\n\r\n".encode())
+assert refused.startswith(b"HTTP/1.1 502") and b"not allowed" in refused  # the node's own services stay out of reach
+org.shutdown()
+
+# a new password, a new port, and off again
+use("adm")
+with quiet:
+    m.cmd_proxy(A(name="a", port=None, user=None, rotate=True, off=False))
+assert m.password_of(m.egress_settings()["a"]) != pw and m.egress_settings()["a"]["port"] == 3129
+with quiet:
+    m.cmd_proxy(A(name="a", port=8080, user=None, rotate=False, off=True))
+assert m.egress_settings() == {}
+sync("a")
+assert did("a", "systemctl", "--no-block", "stop", "meshbone-proxy.service")
+
 # --- the original admin machine dies; the rest carries on
 shutil.move(D("adm"), D("adm.dead"))
 use("home")

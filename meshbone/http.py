@@ -2,7 +2,7 @@
 
 import argparse, base64, contextlib, hashlib, hmac, io, json, os, re, socket, subprocess, sys, time, urllib.parse
 
-from . import commands, model, settings, store, system, views, wire
+from . import commands, egress, model, settings, store, system, views, wire
 
 
 def simple_response(mesh, query, key=None):
@@ -56,6 +56,17 @@ def respond(method, path, headers, body, peer="127.0.0.1"):
         "/api/nodes": lambda: data(model.api_nodes(query)),
         "/api/topology": lambda: data(model.topology()),
         "/api/policy": lambda: data(store.policy()),
+        "/api/proxies": lambda: data(
+            [
+                {
+                    "node": n,
+                    "user": e["user"],
+                    "url": egress.endpoint(mesh, n, e)[0],
+                    "address": egress.endpoint(mesh, n, e)[1],
+                }
+                for n, e in sorted(store.egress_settings().items())
+            ]
+        ),
         "/api/health": lambda: data(model.health_table(store.load(), store.load_nets())),
         "/api/events": lambda: data(model.events_table(store.load(), store.load_nets(), 500)),
         "/events": lambda: page(views.view_events(mesh, model.events_table(store.load(), store.load_nets(), 300))),

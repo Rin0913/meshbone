@@ -387,6 +387,7 @@ def reconcile():
             "meshbone-admin.socket",
             "meshbone-dns.service",
             "meshbone-https.service",
+            "meshbone-proxy.service",
         ):
             unit("stop", name)
         return
@@ -495,6 +496,7 @@ def reconcile():
     unit("start" if serves_admin else "stop", "meshbone-admin.socket")
     unit("start" if hub else "stop", "meshbone-dns.service")
     unit("start" if hub else "stop", "meshbone-https.service")
+    unit("start" if me["name"] in store.egress_settings() else "stop", "meshbone-proxy.service")
 
 
 def install_packages():
@@ -544,7 +546,7 @@ def install_units():
         )
     run("systemctl", "daemon-reload")
     unit(
-        "try-restart", "meshbone-dns.service", "meshbone-https.service"
+        "try-restart", "meshbone-dns.service", "meshbone-https.service", "meshbone-proxy.service"
     )  # long-running services pick up the new program
     run("systemctl", "--no-block", *(["start"] if settings.ONCE else ["enable", "--now"]), "meshbone.timer")
 

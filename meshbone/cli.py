@@ -136,6 +136,12 @@ def build_parser():
     s.add_argument("--cert", metavar="FILE", help="use this certificate chain (PEM) instead, with --key")
     s.add_argument("--key", metavar="FILE", help="the certificate's private key (PEM)")
     s.add_argument("--mesh-ca", action="store_true", help="back to a certificate from the mesh's own CA")
+    s = sub.add_parser("proxy")
+    s.add_argument("name", nargs="?", help="the node that runs the proxy (without: list them)")
+    s.add_argument("--port", type=int, help="port on the node's mesh address (default 3128)")
+    s.add_argument("--user", help="user name (default meshbone)")
+    s.add_argument("--rotate", action="store_true", help="make a new password")
+    s.add_argument("--off", action="store_true", help="switch the proxy off on this node")
     s = sub.add_parser("dns")
     s.add_argument("--zone", help="domain under which every node has a name (default <mesh>.internal)")
     s.add_argument("--upstream", help="resolvers for every other name, e.g. '1.1.1.1 8.8.8.8'")
@@ -167,6 +173,7 @@ def build_parser():
         "health",
         "dnsd",
         "httpsd",
+        "proxyd",
     )
     for c in plain:
         sub.add_parser(c)

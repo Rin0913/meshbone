@@ -94,6 +94,7 @@ On an admin node:
 | `set NAME [options]` | Change a node |
 | `approve NAME`, `revoke NAME` | Accept a `promote` request; remove a node |
 | `dns [--zone DOMAIN] [--upstream 'IP IP']` | The mesh's names, see below |
+| `proxy [NODE] [--port N] [--user U] [--rotate] [--off]` | An HTTP proxy on chosen nodes, see below |
 | `https [--add NAME URL] [--del NAME] [--ca] [--letsencrypt EMAIL --cloudflare-token T] [--cert F --key F] [--mesh-ca]` | The HTTPS gateway, see below |
 | `gateway NAME [--endpoint HOST:PORT --via HUB --net CIDR...]` | Add an external gateway, or print its configuration again (`transit` still works) |
 | `policy [--default allow\|deny] [--add FROM TO allow\|deny [--ports P] [--at N]] [--del N] [--clear]` | The firewall, see below |
@@ -216,6 +217,27 @@ NetworkManager, or the file itself; what was there is kept and put back by
 change. Simple clients get the same in their config
 (`DNS = 10.253.253.3, <zone>`); export them again after changing the zone.
 `meshbone local --resolver off` leaves a host's DNS alone.
+
+## HTTP proxy on chosen nodes
+
+A node can be the mesh's way out: it runs an HTTP/HTTPS (CONNECT) proxy on its
+mesh address, so that anything that can reach the node uses that node's own
+internet connection.
+
+```bash
+sudo meshbone proxy vpn1                 # on, port 3128, user meshbone, a random password
+sudo meshbone proxy vpn1                 # again: the endpoints and the credentials
+sudo meshbone proxy                      # which nodes run one (no passwords)
+sudo meshbone proxy vpn1 --rotate        # a new password; --port, --user, --off
+curl -x http://meshbone:PASSWORD@vpn1.<zone>:3128 https://example.org/
+```
+
+Only the node's mesh address listens, and the firewall policy applies to it
+like to anything else. The proxy refuses to connect to the node's own
+loopback and link-local addresses, so it does not open the node's local
+services. Every node holds the password's hash; the password itself is kept
+encrypted under the admin key, so it is shown on admin nodes only.
+`/api/proxies` lists the endpoints (no passwords).
 
 ## Firewall
 

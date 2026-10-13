@@ -3,7 +3,7 @@
 import argparse, base64, contextlib, hashlib, io, json, os, random, re, secrets, shlex, shutil, socket, subprocess, sys, tarfile, time, zlib, zipfile, urllib.parse
 from ipaddress import IPv4Address, IPv4Network
 
-from . import acme, cli, model, settings, ssh, store, system, updates, views, wire
+from . import acme, cli, egress, model, settings, ssh, store, system, updates, views, wire
 
 
 def verify_links():
@@ -604,6 +604,46 @@ def cmd_https(a):
             store.https_cert_info(mesh),
         )
     )
+
+
+def cmd_proxy(a):
+    """Switch an HTTP proxy on or off on a node, or show where the proxies are and how to use them."""
+    loc = store.local()
+    mesh = loc["mesh"]
+    name = store.by_name(store.load(), a.name)[1]["name"] if a.name else ""  # as the directory spells it
+    if name and (a.port or a.user or a.rotate or a.off or name not in store.egress_settings()):
+        node = store.by_name(store.load(), name)[1]
+        if node.get("simple") or node.get("transit"):
+            sys.exit(f"{name} runs no meshbone: a proxy needs a node that does")
+        with store.locked():
+            store.admin()
+            cfg = dict(store.egress_settings())
+            old = cfg.get(name)
+            if a.off:
+                cfg.pop(name, None)
+            else:
+                port = a.port or (old or {}).get("port") or 3128
+                if not 1 <= port <= 65535 or port in (settings.GOSSIP_PORT, settings.ADMIN_PORT, settings.HTTPS_PORT):
+                    sys.exit(f"port {port} is not usable")
+                password = egress.password_of(old) if old and not a.rotate else None
+                user = a.user or (old or {}).get("user") or "meshbone"
+                cfg[name] = egress.entry_for(user, port, password or egress.new_password())
+            store.conf_put("egress", json.dumps(cfg))
+            system.reconcile()
+        wire.gossip(flood=True)
+    cfg = store.egress_settings()
+    if a.off and name:
+        print(f"{name}: proxy off")
+    for n, entry in sorted(cfg.items()):
+        if name and n != name:
+            continue
+        password = egress.password_of(entry) if name else None
+        by_name, by_ip = egress.endpoint(mesh, n, entry, password)
+        print(f"{n}: {by_name}\n{'':<{len(n) + 2}}{by_ip}")
+        if name and password is None:
+            print("  (the password is shown on a node that holds admin.key)")
+    if not cfg and not a.off:
+        print("no node runs an HTTP proxy; `meshbone proxy NODE` switches one on")
 
 
 def cmd_dns(a):
