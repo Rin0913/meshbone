@@ -813,7 +813,12 @@ assert ["FORWARD", "-i", "mb0", "-j", "ACCEPT"] in json.load(open(D("c") + "/fw.
 use("c")
 m.cmd_local(A(listen_port=None, mtu=None, nat="off", resolver=None))
 routed = nft("c")[-1]  # routed, not hidden: no masquerade, but answers to mesh connections still go back
-assert "masquerade" not in routed and "chain return_path" in routed and "ct mark set 7948" in routed
+assert (
+    "masquerade" not in routed
+    and "chain return_path" in routed
+    and "ct mark set 7948" in routed
+    and "chain return_local" in routed
+)
 m.cmd_local(A(listen_port=None, mtu=None, nat="on", resolver=None))
 assert "masquerade" in nft("c")[-1]
 use("adm")

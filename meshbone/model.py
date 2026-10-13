@@ -279,6 +279,9 @@ def gateway_ruleset(mesh, me, nat, public=(), inside=()):
             f'  chain return_path {{ type filter hook prerouting priority -150; policy accept; iifname "{settings.IFACE}" '
             f"ct state new ct mark 0 ct mark set {settings.MESH_TABLE}; ct mark {settings.MESH_TABLE} "
             f"meta mark set {settings.MESH_TABLE}; }}\n"
+            # and what this host itself answers from an address of its own (a LAN address, say)
+            f"  chain return_local {{ type route hook output priority -150; policy accept; "
+            f"ct mark {settings.MESH_TABLE} meta mark set {settings.MESH_TABLE}; }}\n"
         )
     if nets and nat:
         out += (
