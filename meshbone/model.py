@@ -271,6 +271,15 @@ def gateway_ruleset(mesh, me, nat, public=(), inside=()):
         for piece in store.carve(IPv4Network(s), [store.mesh_net(mesh), store.cluster_net(mesh)])
     ]
     out = ""
+    if nets:
+        # What came in from the mesh has its answers go back into it, whatever the main table says
+        # about the other end (the older tunnel on a host may claim that network): the connection is
+        # marked as it arrives, and every packet of it carries the mark through the routing decision.
+        out += (
+            f'  chain return_path {{ type filter hook prerouting priority -150; policy accept; iifname "{settings.IFACE}" '
+            f"ct state new ct mark 0 ct mark set {settings.MESH_TABLE}; ct mark {settings.MESH_TABLE} "
+            f"meta mark set {settings.MESH_TABLE}; }}\n"
+        )
     if nets and nat:
         out += (
             f'  chain gateway {{ type nat hook postrouting priority 100; policy accept; iifname "{settings.IFACE}" '

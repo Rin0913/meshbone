@@ -280,6 +280,7 @@ assert did("d", "ip", "route", "replace", "10.3.0.0/24", "dev", "mb0", "table", 
 assert did("d", "ip", "rule", "add", "iif", "mb0", "lookup", "7948", "pref", "7948")
 assert did("d", "ip", "rule", "add", "from", "10.253.254.0/23", "lookup", "7948", "pref", "7948")  # own addresses too
 assert did("d", "ip", "rule", "add", "from", "10.253.253.0/24", "lookup", "7948", "pref", "7948")
+assert did("d", "ip", "rule", "add", "fwmark", "7948", "lookup", "7948", "pref", "7948")  # answers to mesh connections
 
 # --- preshared keys: one per link, same on both ends, unknown to third nodes
 mesh_psk = use("a").local()["mesh"]["psk"]
@@ -811,9 +812,8 @@ assert "chain mesh" not in gw and did("c", "sysctl", "-qw", "net.ipv4.ip_forward
 assert ["FORWARD", "-i", "mb0", "-j", "ACCEPT"] in json.load(open(D("c") + "/fw.json"))
 use("c")
 m.cmd_local(A(listen_port=None, mtu=None, nat="off", resolver=None))
-assert did("c", "nft", "delete", "table", "inet", "meshbone") and not os.path.exists(
-    D("c") + "/policy.nft"
-)  # routed, not hidden
+routed = nft("c")[-1]  # routed, not hidden: no masquerade, but answers to mesh connections still go back
+assert "masquerade" not in routed and "chain return_path" in routed and "ct mark set 7948" in routed
 m.cmd_local(A(listen_port=None, mtu=None, nat="on", resolver=None))
 assert "masquerade" in nft("c")[-1]
 use("adm")

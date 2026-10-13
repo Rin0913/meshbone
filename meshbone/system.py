@@ -68,15 +68,26 @@ def mesh_rules(on=True):
     some other way (an older tunnel, say)."""
     mesh = store.local()["mesh"]
     have = {
-        (r.get("iif"), f"{r['src']}/{r['srclen']}" if r.get("srclen") else None)
+        (
+            r.get("iif"),
+            f"{r['src']}/{r['srclen']}" if r.get("srclen") else None,
+            settings.MESH_TABLE if int(str(r.get("fwmark") or "0"), 16) == settings.MESH_TABLE else None,
+        )
         for r in ip_json("rule", "show", "pref", str(settings.MESH_TABLE))
     }
     wanted = (
-        [(settings.IFACE, None), (None, str(store.mesh_net(mesh))), (None, str(store.cluster_net(mesh)))] if on else []
+        [
+            (settings.IFACE, None, None),
+            (None, str(store.mesh_net(mesh)), None),
+            (None, str(store.cluster_net(mesh)), None),
+            (None, None, settings.MESH_TABLE),  # connections that came in from the mesh (see gateway_ruleset)
+        ]
+        if on
+        else []
     )
-    for iif, src in wanted:
-        if (iif, src) not in have:
-            where = ["iif", iif] if iif else ["from", src]
+    for iif, src, mark in wanted:
+        if (iif, src, mark) not in have:
+            where = ["iif", iif] if iif else ["from", src] if src else ["fwmark", str(mark)]
             run(
                 "ip",
                 "rule",
