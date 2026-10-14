@@ -1340,6 +1340,10 @@ assert (
 assert did("a", "ip", "route", "replace", "0.0.0.0/0", "dev", "mb0", "table", "7948") and not did(
     "a", "ip", "route", "add", "0.0.0.0/0"
 )
+# what arrives for the router's networks and is not mapped onto a node has nowhere to go: dropped here, not
+# sent back to the router by the relay route (that was a loop between the two, until the lifetime ran out)
+assert did("a", "ip", "route", "replace", "blackhole", "198.51.100.64/26", "table", "7948")
+assert not did("d", "ip", "route", "replace", "blackhole", "198.51.100.64/26", "table", "7948")  # only the gateway hub
 table_a = nft("a")[-1]
 assert (
     f"ip daddr 198.51.100.77 dnat to {IP['c']}" in table_a

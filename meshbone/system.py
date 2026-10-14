@@ -103,7 +103,7 @@ def mesh_rules(on=True):
         run("ip", "rule", "del", "pref", str(settings.MESH_TABLE), check=False)  # one rule per call, whichever
 
 
-def sync_routes(want, src, relay=(), own=()):
+def sync_routes(want, src, relay=(), own=(), unassigned=()):
     """Route exactly these prefixes into the mesh. Returns the ones this host already sends elsewhere.
 
     Packets that arrive *from* the mesh are looked up in a table of our own first, so relaying -
@@ -113,6 +113,11 @@ def sync_routes(want, src, relay=(), own=()):
     routes them - so that a relay route for the internet never swallows the LAN. For traffic the
     machine itself originates, the prefixes go into the main table, but only where nothing else
     claims them: a route somebody put there stays.
+
+    `unassigned` are public networks that arrive at this host (the gateway hub) from outside: what
+    is not mapped onto a node by then has nowhere to go, and a relay route for the internet would
+    hand it straight back to the router it came from - to be handed back again, until its
+    lifetime ran out. Those prefixes are black holes in the mesh table.
     """
 
     def held(*where):
@@ -134,10 +139,20 @@ def sync_routes(want, src, relay=(), own=()):
         args = host_route(p)
         if args:
             wanted[p] = args
+    for p in unassigned:
+        wanted[p] = ["blackhole"]
     ours = held("table", table)
     for p, args in wanted.items():
         have = ours.get(p)
-        if not have or have.get("dev") != args[-1] or have.get("gateway") != (args[1] if args[0] == "via" else None):
+        if args == ["blackhole"]:
+            if not have or have.get("type") != "blackhole":
+                run("ip", "route", "replace", "blackhole", str(p), "table", table, check=False)
+        elif (
+            not have
+            or have.get("type") == "blackhole"
+            or have.get("dev") != args[-1]
+            or have.get("gateway") != (args[1] if args[0] == "via" else None)
+        ):
             run("ip", "route", "replace", str(p), *args, "table", table, check=False)
     for p in set(ours) - set(wanted):
         run("ip", "route", "del", str(p), "table", table, check=False)
@@ -441,7 +456,12 @@ def reconcile():
     )
     inside = sorted(routes | {IPv4Network(f"{ip}/32") for ip in [my_ip]})
     own = {IPv4Network(l) for l in attached} | {IPv4Network(s) for s in me["subnets"]}
-    elsewhere = sync_routes(routes, my_ip, relay, own)
+    unassigned = (
+        {IPv4Network(p) for t in store.transits(alive).values() if t["via"] == me["name"] for p in t["public_nets"]}
+        if via_exit == mypk
+        else set()
+    )
+    elsewhere = sync_routes(routes, my_ip, relay, own, unassigned)
     sync_exit(bool(me.get("public")) and via_exit in rtt)
     if hub:
         record_stats(me["id"], alive, nets, rtt)
